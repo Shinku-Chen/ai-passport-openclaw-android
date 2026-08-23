@@ -396,19 +396,29 @@ class GatewayClient(
 
         val state = payload.get("state")?.asString
         // 网关 chat 事件: state=delta 时 deltaText 是增量,message.content 是全量。
-        // 用 deltaText 增量追加,避免全量重复累积;state=final 时 message.content 是全量最终结果。
+        // 用 deltaText 增量追加;到 state=final 时若全程已用 delta 累加过,就不再追加
+        // 全量 content(否则增量 + 全量 = 回复被重复),只做终结。
         val deltaText = payload.get("deltaText")?.takeIf { it.isJsonPrimitive }?.asString
-        val text = if (state == "delta" && !deltaText.isNullOrBlank()) {
-            deltaText
-        } else {
-            extractText(payload)
-        }
-        if (!text.isNullOrBlank()) collector.append(text)
-
-        // 终结判定:state==final 或 isFinal/final==true
         val isFinal = payload.get("isFinal")?.asBoolean
             ?: payload.get("final")?.asBoolean
             ?: false
+        val isDeltaStream = state == "delta" && !deltaText.isNullOrBlank()
+        if (isDeltaStream) {
+            collector.markDelta()
+            collector.append(deltaText)
+        } else if (!isFinal) {
+            // 非 delta、非 final:一次性回复(如 {reply}/{text}),追加完整文本。
+            val text = extractText(payload)
+            if (!text.isNullOrBlank()) collector.append(text)
+        } else {
+            // final:delta 已累加就到此为止;若从未用 delta(一次性 final 响应),补齐全量。
+            if (!collector.usedDelta) {
+                val text = extractText(payload)
+                if (!text.isNullOrBlank()) collector.append(text)
+            }
+        }
+
+        // 终结判定:state==final 或 isFinal/final==true
         if (state == "final" || isFinal) collector.finish()
     }
 
@@ -494,9 +504,14 @@ class GatewayClient(
         val sb = StringBuilder()
         @Volatile var finished = false
         @Volatile var runId: String? = null
+        /** 本 runId 是否用过 deltaText 增量流(用于 final 时避免全量重复)。 */
+        @Volatile var usedDelta = false
         private val lock = Any()
         fun append(text: String) {
             synchronized(lock) { if (!finished) sb.append(text) }
+        }
+        fun markDelta() {
+            synchronized(lock) { usedDelta = true }
         }
         fun finish() {
             synchronized(lock) {
