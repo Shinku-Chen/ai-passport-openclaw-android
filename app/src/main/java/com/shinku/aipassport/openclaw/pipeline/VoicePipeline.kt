@@ -160,7 +160,12 @@ class VoicePipeline(
             }
 
             override fun onInterrupted(text: String) {
-                Log.d(tag, "TTS 被打断(不回传)")
+                // TTS 被打断/未就绪时【仍回传文本上屏】,避免硬件一直"等待回复"。
+                // 声音播不了,但至少把网关回复显示到设备屏幕。
+                if (myTurn == turnId) {
+                    Log.i(tag, "TTS 未完成,仍回传文本上屏: $text")
+                    sendText(text)
+                }
             }
         })
     }

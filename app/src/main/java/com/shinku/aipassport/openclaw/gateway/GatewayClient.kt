@@ -395,27 +395,25 @@ class GatewayClient(
         if (collector.runId != null && evRunId != null && evRunId != collector.runId) return
 
         val state = payload.get("state")?.asString
-        // 网关 chat 事件: state=delta 时 deltaText 是增量,message.content 是全量。
-        // 用 deltaText 增量追加;到 state=final 时若全程已用 delta 累加过,就不再追加
-        // 全量 content(否则增量 + 全量 = 回复被重复),只做终结。
-        val deltaText = payload.get("deltaText")?.takeIf { it.isJsonPrimitive }?.asString
         val isFinal = payload.get("isFinal")?.asBoolean
             ?: payload.get("final")?.asBoolean
             ?: false
-        val isDeltaStream = state == "delta" && !deltaText.isNullOrBlank()
-        if (isDeltaStream) {
-            collector.markDelta()
-            collector.append(deltaText)
-        } else if (!isFinal) {
-            // 非 delta、非 final:一次性回复(如 {reply}/{text}),追加完整文本。
-            val text = extractText(payload)
-            if (!text.isNullOrBlank()) collector.append(text)
+
+        // 关键:网关每个 chat 帧的 message.content 都是【全量】累计文本(实测,含 delta 帧)。
+        // 因此每次都用全量 content 覆写 collector,避免 deltaText 增量 + 全量 造成的重复;
+        // 若某帧没有 message.content(纯 {reply}/{text} 一次性回复),再退到 delta/extractText。
+        val full = extractText(payload)
+        if (!full.isNullOrBlank()) {
+            collector.set(full)
         } else {
-            // final:delta 已累加就到此为止;若从未用 delta(一次性 final 响应),补齐全量。
-            if (!collector.usedDelta) {
-                val text = extractText(payload)
-                if (!text.isNullOrBlank()) collector.append(text)
+            // 无 content:退回增量/一次字段
+            val deltaText = payload.get("deltaText")?.takeIf { it.isJsonPrimitive }?.asString
+            val text = if (state == "delta" && !deltaText.isNullOrBlank()) {
+                deltaText
+            } else {
+                extractText(payload)
             }
+            if (!text.isNullOrBlank()) collector.append(text)
         }
 
         // 终结判定:state==final 或 isFinal/final==true
@@ -504,14 +502,17 @@ class GatewayClient(
         val sb = StringBuilder()
         @Volatile var finished = false
         @Volatile var runId: String? = null
-        /** 本 runId 是否用过 deltaText 增量流(用于 final 时避免全量重复)。 */
-        @Volatile var usedDelta = false
         private val lock = Any()
         fun append(text: String) {
             synchronized(lock) { if (!finished) sb.append(text) }
         }
-        fun markDelta() {
-            synchronized(lock) { usedDelta = true }
+        /** 用全量文本整体覆写(delta 帧的 message.content 也是全量,覆写避免重复)。 */
+        fun set(text: String) {
+            synchronized(lock) {
+                if (finished) return
+                sb.setLength(0)
+                sb.append(text)
+            }
         }
         fun finish() {
             synchronized(lock) {
