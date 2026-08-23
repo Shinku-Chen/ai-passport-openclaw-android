@@ -188,27 +188,42 @@ class VoiceBridgeService : Service() {
         // TEXT 帧 payload = [role:1B]['U'=用户识别/'A'=网关回复] + UTF-8 文本。
         // 固件据此区分并入对话历史,供 UP/DOWN 翻页。
         val body = text.toByteArray(Charsets.UTF_8)
-        // 固件重组器丢弃 payload_len > VB_AUDIO_CHUNK_BYTES(1024) 的帧(见固件 voice_bridge_frame.c)。
-        // 长回复超过 1024 字节会被设备端丢弃 → 设备屏不显示。故按 1024 字节分片成多条 TEXT 帧,
-        // 每条独立 append 显示(避免 UTF-8 中文字符被切半,按字节边界回退)。
-        val chunkMax = 1024
-        val payloadMax = chunkMax  // payload = role(1B) + body; 固件判 payload_len,不含帧头
+        // 固件 TEXT 帧上限 VB_FRAME_TEXT_MAX(2048,见固件 voice_bridge_frame.h)。
+        // 长回复按此分片,首片 FLAG_FIRST、中间 FLAG_MORE、末片 FLAG_LAST,固件端合并成一条显示。
+        val payloadMax = 2048   // payload = role(1B) + body;固件判 payload_len,不含帧头
         val bodyMax = payloadMax - 1
+        val totalChunks = if (body.isEmpty()) 1 else (body.size + bodyMax - 1) / bodyMax
         var off = 0
+        var chunkIdx = 0
+        if (body.isEmpty()) {
+            // 空文本:发一条空 frame(带 LAST)
+            val payload = ByteArray(1).also { it[0] = role.code.toByte() }
+            val frame = vbEncodeFrame(VbFrame.TYPE_TEXT, VbFrame.FLAG_LAST, payload)
+            Log.i(TAG, "sendTextFrame role=$role(空) 分片0/1")
+            ble.writeBytes(frame)
+            return
+        }
         while (off < body.size) {
             val end = minOf(off + bodyMax, body.size)
             // 回退到 UTF-8 边界,避免切在多字节字符中间
             var cut = end
             while (cut > off && (body[cut - 1].toInt() and 0xC0) == 0x80) cut--
+            if (cut == off) break  // 防止死循环
             val chunk = body.copyOfRange(off, cut)
             val payload = ByteArray(chunk.size + 1)
             payload[0] = role.code.toByte()
             System.arraycopy(chunk, 0, payload, 1, chunk.size)
-            val frame = vbEncodeFrame(VbFrame.TYPE_TEXT, 0, payload)
-            Log.i(TAG, "sendTextFrame role=$role text=${text.take(30)} 分片${off / bodyMax} 字节=${frame.size}")
+            val flags = when {
+                totalChunks == 1 -> VbFrame.FLAG_LAST            // 单帧即完整
+                chunkIdx == 0 -> VbFrame.FLAG_FIRST              // 首片
+                off + (cut - off) >= body.size -> VbFrame.FLAG_LAST  // 末片
+                else -> VbFrame.FLAG_MORE                        // 中间片
+            }
+            val frame = vbEncodeFrame(VbFrame.TYPE_TEXT, flags, payload)
+            Log.i(TAG, "sendTextFrame role=$role text=${text.take(30)} 分片$chunkIdx/$totalChunks 字节=${frame.size} flags=$flags")
             ble.writeBytes(frame)
-            if (cut == off) break  // 防止死循环
             off = cut
+            chunkIdx++
         }
     }
 
