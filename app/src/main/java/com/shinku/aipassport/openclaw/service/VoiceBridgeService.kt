@@ -145,7 +145,11 @@ class VoiceBridgeService : Service() {
                 override fun onConnecting() = publishStatus("正在连接设备…")
                 override fun onConnected() = publishStatus("已连接,等待加密")
                 override fun onEncrypted() = publishStatus("已加密")
-                override fun onReady() = publishStatus("就绪,长按设备 OK 说话")
+                override fun onReady() {
+                    publishStatus("就绪,长按设备 OK 说话")
+                    // 下发当前时间给设备(设备无网络时钟,靠 App 同步;右上角显示 HH:MM)
+                    sendTimeSync()
+                }
                 // 帧处理统一投递到主线程 scope:保证帧重组 + 流水线在单线程上串行,
                 // STT(startTurn)/EVENT 起停/识别顺序确定,不因 BLE 回调线程而竞态。
                 override fun onBytesReceived(bytes: ByteArray) {
@@ -180,6 +184,14 @@ class VoiceBridgeService : Service() {
         payload[0] = role.code.toByte()
         System.arraycopy(body, 0, payload, 1, body.size)
         val frame = vbEncodeFrame(VbFrame.TYPE_TEXT, 0, payload)
+        ble.writeBytes(frame)
+    }
+
+    // 下发当前时间给设备:CONTROL 帧 {"ev":"time","epoch":<秒>}。
+    private fun sendTimeSync() {
+        val json = "{\"ev\":\"time\",\"epoch\":${System.currentTimeMillis() / 1000}}"
+        val payload = json.toByteArray(Charsets.UTF_8)
+        val frame = vbEncodeFrame(VbFrame.TYPE_CONTROL, 0, payload)
         ble.writeBytes(frame)
     }
 
