@@ -165,48 +165,6 @@
         <TextView
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
-            android:text="识别模型"
-            android:textSize="16sp"
-            android:textStyle="bold"
-            android:textColor="#FFFFFF"
-            android:layout_marginTop="16dp"
-            android:layout_marginBottom="4dp" />
-
-        <TextView
-            android:id="@+id/modelStatus"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:text="(检测中…)"
-            android:textSize="13sp"
-            android:textColor="#9E9E9E"
-            android:padding="8dp"
-            android:background="@drawable/bg_input" />
-
-        <Button
-            android:id="@+id/btnDownloadLarge"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:text="下载 large 模型(1.3GB,提升识别率)" />
-
-        <Spinner
-            android:id="@+id/modelHostSpinner"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:padding="8dp"
-            android:background="@drawable/bg_input" />
-
-        <TextView
-            android:id="@+id/modelProgress"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:text=""
-            android:textSize="12sp"
-            android:textColor="#4FC3F7"
-            android:padding="4dp" />
-
-        <TextView
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
             android:text="日志"
             android:textSize="16sp"
             android:textStyle="bold"
