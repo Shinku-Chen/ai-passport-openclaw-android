@@ -305,24 +305,50 @@ class BleCentral(
         targetDevice = null
     }
 
+    /** 单次 ATT 写安全片长(MTU256-3≈253,留余量用 240)。 */
+    private val WRITE_CHUNK = 240
+
     /** 把一帧字节(已含帧头+payload)写入 RX 特征。 */
     fun writeBytes(data: ByteArray) {
         val g = gatt ?: return
         val service = g.getService(BleNus.SERVICE_UUID) ?: return
         val rx = service.getCharacteristic(BleNus.RX_UUID) ?: return
         bleHandler.post {
-            try {
-                if (Build.VERSION.SDK_INT >= 33) {
-                    g.writeCharacteristic(rx, data, BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT)
-                } else {
-                    @Suppress("DEPRECATION")
-                    rx.value = data
-                    @Suppress("DEPRECATION")
-                    g.writeCharacteristic(rx)
-                }
-            } catch (e: Exception) {
-                Log.e(tag, "写 RX 失败", e)
+            if (data.size <= WRITE_CHUNK) {
+                try { writeOne(rx, data) }
+                catch (e: Exception) { Log.e(tag, "写 RX 失败", e) }
+            } else {
+                // 超 MTU 单写限 → 分片串行写(固件帧重组器按 frame magic+len 重组)
+                writeChunked(rx, data)
             }
+        }
+    }
+
+    // 长帧分片串行写:wa 用延迟串行,避免 GATT 并发写冲突。
+    private fun writeChunked(rx: BluetoothGattCharacteristic, data: ByteArray) {
+        var off = 0
+        val pending = data.size
+        fun sendSlice() {
+            if (off >= pending) return
+            val end = minOf(off + WRITE_CHUNK, pending)
+            val slice = data.copyOfRange(off, end)
+            off = end
+            try { writeOne(rx, slice) } catch (e: Exception) { Log.e(tag, "写 RX 分片失败", e); return }
+            if (off < pending) {
+                bleHandler.postDelayed({ sendSlice() }, 30)   // 30ms 间隔发下一片
+            }
+        }
+        sendSlice()
+    }
+
+    private fun writeOne(rx: BluetoothGattCharacteristic, data: ByteArray) {
+        if (Build.VERSION.SDK_INT >= 33) {
+            gatt?.writeCharacteristic(rx, data, BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT)
+        } else {
+            @Suppress("DEPRECATION")
+            rx.value = data
+            @Suppress("DEPRECATION")
+            gatt?.writeCharacteristic(rx)
         }
     }
 

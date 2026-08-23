@@ -29,4 +29,11 @@ interface SttEngine {
 
     /** 释放资源。 */
     fun release()
+
+    /**
+     * 流式识别中间结果回调(partial,Vosk 支持)。系统引擎无此能力,默认 null。
+     * 若引擎支持,feedPcm 时不断回调实时识别文本。
+     */
+    val onPartial: ((String) -> Unit)?
+        get() = null
 }

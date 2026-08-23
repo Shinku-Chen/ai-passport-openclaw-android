@@ -25,16 +25,16 @@ object SttFactory {
     }
 
     /** 创建引擎:Vosk 模型存在 → VoskStt;否则 → SpeechRecognizerStt。 */
-    fun create(context: Context): SttEngine {
+    fun create(context: Context, onPartial: ((String) -> Unit)? = null): SttEngine {
         // 首装:把打包进 assets 的 small 模型复制到 filesDir(无模型时才复制)。
         ModelManager.ensureBundled(context)
         val modelDir = findModelDir(context)
         return if (modelDir != null) {
             Log.i(TAG, "使用 Vosk 离线识别,模型目录=${modelDir.absolutePath}")
-            VoskStt(context, modelDir)
+            VoskStt(context, modelDir, onPartial)
         } else {
             Log.i(TAG, "未找到 Vosk 模型(filesDir 下无 vosk-model 目录),降级为系统识别")
-            SpeechRecognizerStt(context)
+            SpeechRecognizerStt(context, onPartial)
         }
     }
 }

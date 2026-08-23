@@ -130,7 +130,10 @@ class VoiceBridgeService : Service() {
 
         pipeline = VoicePipeline(
             scope = scope,
-            stt = SttFactory.create(this),
+            stt = SttFactory.create(this) { partial ->
+                // 流式识别中间结果:实时回传设备屏显示(role='U'),边说边显示。
+                scope.launch { sendTextFrame('U', partial) }
+            },
             gateway = gateway,
             tts = tts,
             sendText = { role, text -> sendTextFrame(role, text) },

@@ -24,7 +24,11 @@ import java.io.File
  * 线程:识别器与 JNI 的交互(acceptWaveForm / finalResult / reset / close)
  * 统一用 [lock] 串行保护,与 VoicePipeline 在主线程投递帧的模型一致。
  */
-class VoskStt(private val context: Context, private val modelDir: File) : SttEngine {
+class VoskStt(
+    private val context: Context,
+    private val modelDir: File,
+    onPartialOverride: ((String) -> Unit)? = null,
+) : SttEngine {
 
     private val tag = "VoskStt"
 
@@ -38,6 +42,9 @@ class VoskStt(private val context: Context, private val modelDir: File) : SttEng
     private val lock = Any()
 
     private val gson = Gson()
+    private var lastPartial = ""   // 节流:partial 文本变化才回调
+
+    override val onPartial: ((String) -> Unit)? = onPartialOverride
 
     override val isAvailable: Boolean
         get() = modelDir.isDirectory
@@ -81,11 +88,29 @@ class VoskStt(private val context: Context, private val modelDir: File) : SttEng
     override fun feedPcm(pcm: ByteArray) {
         synchronized(lock) {
             try {
-                // acceptWaveForm 返回分段边界 boolean;整段结果在 endTurn 的 finalResult 取。
-                recognizer?.acceptWaveForm(pcm, pcm.size)
+                // acceptWaveForm 返回 true 表示有 partial 可取;取 getPartialResult 实时上屏。
+                val hasPartial = recognizer?.acceptWaveForm(pcm, pcm.size) ?: false
+                if (hasPartial && onPartial != null) {
+                    val partial = parsePartial(recognizer?.partialResult)
+                    if (partial.isNotEmpty() && partial != lastPartial) {
+                        lastPartial = partial
+                        onPartial(partial)
+                    }
+                }
             } catch (e: Exception) {
                 Log.w(tag, "feedPcm 异常", e)
             }
+        }
+    }
+
+    // 从 partialResult JSON {"partial":"..."} 取 partial 文本。
+    private fun parsePartial(json: String?): String {
+        if (json.isNullOrEmpty()) return ""
+        return try {
+            gson.fromJson(json, JsonObject::class.java)
+                ?.get("partial")?.asString?.trim() ?: ""
+        } catch (e: Exception) {
+            ""
         }
     }
 

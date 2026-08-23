@@ -19,7 +19,10 @@ import java.util.Locale
  * 说明:系统 SpeechRecognizer 无公开 API 接收外部 PCM,它采集本机麦克风,
  * 因此本引擎面向"用户直接对手机说话"的输入;识别优先走设备端(EXTRA_PREFER_OFFLINE)。
  */
-class SpeechRecognizerStt(private val context: Context) : SttEngine {
+class SpeechRecognizerStt(
+    private val context: Context,
+    @Suppress("UNUSED_PARAMETER") onPartialOverride: ((String) -> Unit)? = null,
+) : SttEngine {
 
     private val tag = "SpeechRecognizerStt"
     private var recognizer: SpeechRecognizer? = null
