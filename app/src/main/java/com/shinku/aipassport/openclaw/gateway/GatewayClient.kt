@@ -61,8 +61,9 @@ class GatewayClient(
         .pingInterval(30, TimeUnit.SECONDS)
         .build()
 
-    /** chat.send 会话 key,格式 agent:<agentId>:<rest>(网关卡据此解析 agentId)。 */
-    private val AgentSessionKey = "agent:passport:default"
+    /** chat.send 会话 key,格式 agent:<agentId>:<rest>(网关卡据此解析 agentId)。
+     *  用 agent:main:main —— 网关仅识别 main agent(health 显示 defaultAgentId=main,无 passport agent)。 */
+    private val AgentSessionKey = "agent:main:main"
 
     private val pendingReqs = ConcurrentHashMap<String, CompletableDeferred<JsonObject?>>()
 
@@ -344,12 +345,12 @@ class GatewayClient(
         val idempotency = UUID.randomUUID().toString()
         val params = JsonObject().apply {
             // sessionKey 必须是 agent:<agentId>:<rest> 格式,网关卡从 sessionKey 解析 agentId。
-            // agentId 与 sessionKey 前缀一致(都 passport),否则报 mismatch。
+            // agentId 与 sessionKey 前缀一致(都 main),否则报 mismatch。
             addProperty("sessionKey", AgentSessionKey)
             addProperty("message", text)
             addProperty("deliver", false)
             addProperty("idempotencyKey", idempotency)
-            addProperty("agentId", "passport")
+            addProperty("agentId", "main")
         }
         val reply = requestSync("chat.send", params)
         return reply?.get("runId")?.asString
