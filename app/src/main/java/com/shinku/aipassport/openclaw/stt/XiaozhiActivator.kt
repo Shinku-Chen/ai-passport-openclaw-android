@@ -39,6 +39,11 @@ class XiaozhiActivator(
     private val tag = "XiaozhiActivator"
     private val gson = Gson()
 
+    private companion object {
+        /** 小智 Client-Id(写死,与网页端注册的设备一致,保持稳定不变)。 */
+        const val CLIENT_ID = "1dd91545-082a-454e-a131-1c8251375c9c"
+    }
+
     private val client = OkHttpClient.Builder()
         .connectTimeout(10, TimeUnit.SECONDS)
         .readTimeout(10, TimeUnit.SECONDS)
@@ -68,8 +73,8 @@ class XiaozhiActivator(
      */
     suspend fun activateAndPoll(onCodeReady: (code: String, message: String) -> Unit): ActivationResult =
         withContext(Dispatchers.IO) {
-            // Client-Id 用 MAC 派生的稳定 UUID(同设备不变,平台才能识别/关联这台设备)。
-            val clientId = XiaozhiUtil.macToClientId(deviceMac)
+            // Client-Id 写死为固定值(与网页端注册的设备一致),保持稳定不变。
+            val clientId = CLIENT_ID
 
             // 1. OTA 拉取
             val ota = postOta(otaUrl, deviceMac, clientId) ?: return@withContext ActivationResult(false, detail = "OTA 请求失败")
