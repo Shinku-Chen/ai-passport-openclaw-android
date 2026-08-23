@@ -7,6 +7,7 @@ import com.google.gson.Gson
 import com.google.gson.reflect.TypeToken
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.update
 
 /**
  * 共享、持久化的对话历史存储(进程内单例)。
@@ -82,9 +83,10 @@ object ConversationStore {
     }
 
     private inline fun update(transform: (List<Message>) -> List<Message>) {
-        val next = transform(_messages.value)
-        _messages.value = next
-        persist(next)
+        // 用 MutableStateFlow.update(CAS)原子更新,避免跨线程并发时
+        // "读旧 value → 算新 → 写回" 的竞态覆盖(否则多 turn/语音+打字并发会乱序/丢消息)。
+        _messages.update { transform(it) }
+        persist(_messages.value)
     }
 
     private fun load(p: SharedPreferences) {
