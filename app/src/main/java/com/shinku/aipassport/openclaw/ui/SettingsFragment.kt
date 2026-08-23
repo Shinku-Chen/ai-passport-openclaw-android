@@ -59,19 +59,30 @@ class SettingsFragment : Fragment() {
     private fun saveSettings() {
         val host = binding.inputHost.text.toString().trim()
         val port = binding.inputPort.text.toString().trim()
+        val token = binding.inputToken.text.toString().trim()
         if (host.isBlank() || port.isBlank()) {
             Toast.makeText(requireContext(), "请填写网关域名和端口", Toast.LENGTH_SHORT).show()
             return
         }
-        settings.save(
-            host,
-            port,
-            binding.checkUseTls.isChecked,
-            binding.inputToken.text.toString().trim(),
-            binding.inputWsPath.text.toString().trim(),
-        )
-        log("网关设置已保存: $host:$port, WS=${settings.wsPath}")
-        Toast.makeText(requireContext(), "网关设置已保存", Toast.LENGTH_SHORT).show()
+        if (token.isBlank()) {
+            Toast.makeText(requireContext(), "请填写网关 token", Toast.LENGTH_SHORT).show()
+            return
+        }
+        // 先验证 token 有效性(调 /tools/invoke,401 = 无效):通过才保存。
+        log("校验 token 中…")
+        scope.launch {
+            // 用输入框里的值探针验证 token(不写入已保存设置,避免误存无效 token)。
+            val api = GatewayApi(settings)
+            val valid = api.verifyToken(probeToken = token)
+            if (valid) {
+                settings.save(host, port, binding.checkUseTls.isChecked, token, binding.inputWsPath.text.toString().trim())
+                log("token 有效,网关设置已保存: $host:$port")
+                Toast.makeText(requireContext(), "token 有效,已保存", Toast.LENGTH_SHORT).show()
+            } else {
+                log("token 无效或网关不可达,未保存")
+                Toast.makeText(requireContext(), "token 无效,请检查后重试", Toast.LENGTH_LONG).show()
+            }
+        }
     }
 
     private fun healthCheck() {
