@@ -24,19 +24,13 @@ object SttFactory {
         return ModelManager.currentModelDir(context)
     }
 
-    /** 从 BleCentral prefs 读取上次连接的设备蓝牙 MAC(小智 Device-Id 必须真实设备 MAC)。 */
-    private fun deviceMac(context: Context): String {
-        val p = context.getSharedPreferences("ble_central", Context.MODE_PRIVATE)
-        return p.getString("last_device_addr", "") ?: ""
-    }
-
     /** 创建引擎:小智已配置 → XiaozhiStt;否则 Vosk 模型存在 → VoskStt;否则系统识别。 */
     fun create(context: Context, onPartial: ((String) -> Unit)? = null): SttEngine {
         // 小智云端识别优先(固件编码 Opus 原样转发,识别率高、中文流式)。未配置才回退 Vosk。
         val xz = XiaozhiSettings(context)
         if (xz.enabled()) {
-            // 小智 Device-Id 头必须是真实设备蓝牙 MAC(xx:xx:xx:xx:xx:xx);否则服务器不识别。
-            val deviceId = deviceMac(context)
+            // 服务器只放行"全零 MAC"匿名通道(实测真实 MAC 被 op=8 拒)。用全零 MAC 先跑通识别链路。
+            val deviceId = "00:00:00:00:00:00"
             // 若已激活成功(用户在 xiaozhi.me 绑定过),用 OTA 下发的 ws url/token;否则用设置的地址。
             val wsUrl = if (xz.activated && xz.wsUrl.isNotBlank()) xz.wsUrl else xz.serverUrl
             val wsToken = if (xz.activated) xz.wsToken else xz.token

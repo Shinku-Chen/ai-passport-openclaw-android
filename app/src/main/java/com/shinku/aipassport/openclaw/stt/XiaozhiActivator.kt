@@ -42,6 +42,8 @@ class XiaozhiActivator(
     private companion object {
         /** 小智 Client-Id(写死,与网页端注册的设备一致,保持稳定不变)。 */
         const val CLIENT_ID = "1dd91545-082a-454e-a131-1c8251375c9c"
+        /** 小智 Device-Id(全零 MAC,服务器放行的匿名通道;真实 MAC 当前被 op=8 拒)。 */
+        const val DEVICE_MAC = "00:00:00:00:00:00"
     }
 
     private val client = OkHttpClient.Builder()
@@ -76,8 +78,8 @@ class XiaozhiActivator(
             // Client-Id 写死为固定值(与网页端注册的设备一致),保持稳定不变。
             val clientId = CLIENT_ID
 
-            // 1. OTA 拉取
-            val ota = postOta(otaUrl, deviceMac, clientId) ?: return@withContext ActivationResult(false, detail = "OTA 请求失败")
+            // 1. OTA 拉取(Device-Id 用全零 MAC 匿名通道)
+            val ota = postOta(otaUrl, DEVICE_MAC, clientId) ?: return@withContext ActivationResult(false, detail = "OTA 请求失败")
             val activation = ota.getAsJsonObject("activation")
             val wsUrl = ota.getAsJsonObject("websocket")?.get("url")?.asString
             val wsToken = ota.getAsJsonObject("websocket")?.get("token")?.asString
@@ -96,7 +98,7 @@ class XiaozhiActivator(
             onCodeReady(code ?: "", message ?: "")
 
             // 2. 轮询 activate 直到 200(用户绑定完成后)
-            val ok = pollActivate(otaUrl, deviceMac, clientId, challenge ?: "")
+            val ok = pollActivate(otaUrl, DEVICE_MAC, clientId, challenge ?: "")
             return@withContext ActivationResult(
                 activated = ok,
                 code = code,
