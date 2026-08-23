@@ -335,7 +335,7 @@ class BleCentral(
             off = end
             try { writeOne(rx, slice) } catch (e: Exception) { Log.e(tag, "写 RX 分片失败", e); return }
             if (off < pending) {
-                bleHandler.postDelayed({ sendSlice() }, 30)   // 30ms 间隔发下一片
+                bleHandler.postDelayed({ sendSlice() }, 12)   // 12ms 间隔发下一片(提速,避免回复同步慢)
             }
         }
         sendSlice()

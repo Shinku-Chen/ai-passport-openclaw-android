@@ -159,21 +159,13 @@ class VoicePipeline(
     private fun speak(reply: String) {
         val myTurn = turnId
         tts.speak(reply, object : TtsEngine.Listener {
+            // 回复已在 onTurnEnd sendText('A', reply) 立即回传设备;TTS 只负责播声音,
+            // 不再重复回传,避免设备收到重复"助手"消息。onDone/onInterrupted 仅日志。
             override fun onDone(text: String) {
-                // 合成自然结束 → 回传 TEXT 帧给固件上屏
-                if (myTurn == turnId) {
-                    Log.i(tag, "TTS 结束,回传文本: $text")
-                    sendText('A', text)
-                }
+                Log.i(tag, "TTS 结束: $text")
             }
-
             override fun onInterrupted(text: String) {
-                // TTS 被打断/未就绪时【仍回传文本上屏】,避免硬件一直"等待回复"。
-                // 声音播不了,但至少把网关回复显示到设备屏幕。
-                if (myTurn == turnId) {
-                    Log.i(tag, "TTS 未完成,仍回传文本上屏: $text")
-                    sendText('A', text)
-                }
+                Log.d(tag, "TTS 未完成: $text")
             }
         })
     }
