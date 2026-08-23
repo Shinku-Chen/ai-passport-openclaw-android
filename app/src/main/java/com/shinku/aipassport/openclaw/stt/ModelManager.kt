@@ -3,9 +3,6 @@ package com.shinku.aipassport.openclaw.stt
 import android.content.Context
 import android.util.Log
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.async
-import kotlinx.coroutines.awaitAll
-import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.withContext
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -131,8 +128,7 @@ object ModelManager {
     }
 
     /**
-     * 分块并行下载 zip 到 filesDir 临时文件,合并后解压,删临时 zip。
-     * alphacephei 单连接限速低(实测 ~26KB/s),用 Range 分块并行下载提速(多连接并发)。
+     * 普通单连接下载 zip 到 filesDir 临时文件,解压后删临时 zip。
      * onProgress(percent) / onDone(modelDir) / onError(msg) 都在主线程回调。
      */
     suspend fun downloadModel(
@@ -145,9 +141,7 @@ object ModelManager {
         val dir = context.filesDir
         if (dir == null) { onError("filesDir 不可用"); return }
         val tmpZip = File(dir, "vosk_download_tmp.zip")
-        val CHUNKS = 8
         try {
-            // 先 HEAD 拿总大小
             val total = withContext(Dispatchers.IO) {
                 val req = Request.Builder().url(url).head().build()
                 client.newCall(req).execute().use { resp ->
@@ -155,57 +149,25 @@ object ModelManager {
                     resp.body?.contentLength() ?: -1L
                 }
             }
-            if (total <= 0) { onError("无法获取文件大小"); return }
-            val chunkSize = total / CHUNKS
-
-            // 并行下载各块(写 vosk_dl_$i.tmp);用 AtomicLong 累计已下载字节,供进度
-            val downloaded = java.util.concurrent.atomic.AtomicLong(0L)
+            // 单连接串行下载(不分块)
             withContext(Dispatchers.IO) {
-                coroutineScope {
-                    val deferred = (0 until CHUNKS).map { i ->
-                        async(Dispatchers.IO) {
-                            val start = i * chunkSize
-                            val end = if (i == CHUNKS - 1) total - 1 else (i + 1) * chunkSize - 1
-                            if (start > end) return@async  // 空块
-                            val req = Request.Builder().url(url)
-                                .header("Range", "bytes=$start-$end")
-                                .build()
-                            client.newCall(req).execute().use { resp ->
-                                if (resp.code != 206 && resp.code != 200) {
-                                    throw RuntimeException("HTTP ${resp.code}")
-                                }
-                                val input = resp.body?.byteStream() ?: throw RuntimeException("无响应体")
-                                val chunkFile = File(dir, "vosk_dl_$i.tmp")
-                                FileOutputStream(chunkFile).use { fos ->
-                                    val buf = ByteArray(64 * 1024)
-                                    var read: Int
-                                    while (input.read(buf).also { read = it } != -1) {
-                                        fos.write(buf, 0, read)
-                                        downloaded.addAndGet(read.toLong())
-                                    }
-                                }
-                            }
-                            onProgressSafe(onProgress, downloaded.get().toFloat() / total)
+                val req = Request.Builder().url(url).build()
+                client.newCall(req).execute().use { resp ->
+                    if (!resp.isSuccessful) throw RuntimeException("HTTP ${resp.code}")
+                    val input = resp.body?.byteStream() ?: throw RuntimeException("无响应体")
+                    FileOutputStream(tmpZip).use { fos ->
+                        val buf = ByteArray(64 * 1024)
+                        var read: Int
+                        var downloaded = 0L
+                        while (input.read(buf).also { read = it } != -1) {
+                            fos.write(buf, 0, read)
+                            downloaded += read
+                            if (total > 0) onProgressSafe(onProgress, downloaded.toFloat() / total)
                         }
                     }
-                    deferred.awaitAll()
-                }
-                // 合并块
-                FileOutputStream(tmpZip).use { out ->
-                    val bos = BufferedOutputStream(out, 256 * 1024)
-                    for (i in 0 until CHUNKS) {
-                        val cf = File(dir, "vosk_dl_$i.tmp")
-                        if (cf.exists()) {
-                            cf.inputStream().use { it.copyTo(bos) }
-                        }
-                    }
-                    bos.flush()
                 }
                 onProgressSafe(onProgress, 1f)
             }
-
-            // 清理块文件
-            for (i in 0 until CHUNKS) { File(dir, "vosk_dl_$i.tmp").delete() }
 
             // 解压,保留 zip 内顶层目录名
             val outDir = withContext(Dispatchers.IO) { unzip(tmpZip, dir) }
@@ -214,7 +176,6 @@ object ModelManager {
         } catch (e: Exception) {
             Log.e(TAG, "下载/解压失败", e)
             tmpZip.delete()
-            for (i in 0 until CHUNKS) { File(dir, "vosk_dl_$i.tmp").delete() }
             onError(e.message ?: "下载失败")
         }
     }

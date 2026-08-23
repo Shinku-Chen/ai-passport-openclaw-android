@@ -128,6 +128,9 @@ class VoicePipeline(
             if (text.isNullOrBlank()) {
                 Log.d(tag, "未识别到语音")
                 onState("未识别到语音")
+                // 反馈硬件:未识别到语音 → 设备屏显示"无语音"
+                ConversationStore.add("agent", "无语音", ConversationStore.SOURCE_VOICE)
+                sendText('A', "无语音")
                 return@launch
             }
             Log.i(tag, "识别结果: $text")

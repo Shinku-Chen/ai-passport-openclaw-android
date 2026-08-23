@@ -149,7 +149,7 @@ class VoiceBridgeService : Service() {
                 override fun onConnected() = publishStatus("已连接,等待加密")
                 override fun onEncrypted() = publishStatus("已加密")
                 override fun onReady() {
-                    publishStatus("就绪,长按设备 OK 说话")
+                    publishStatus("已就绪,长按设备 OK 说话")
                     // 下发当前时间给设备(设备无网络时钟,靠 App 同步;右上角显示 HH:MM)。
                     // 延迟稍等,确保 MTU 协商完成(否则超长写入被 Android 拒)。
                     android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
