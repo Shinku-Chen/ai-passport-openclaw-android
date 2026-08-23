@@ -42,11 +42,10 @@ class SettingsFragment : Fragment() {
     override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
         super.onViewCreated(view, savedInstanceState)
         settings = GatewaySettings(requireContext())
-        xzSettings = XiaozhiSettings(requireContext())
+        xzSettings = XiaozhiSettings()
         loadSettings()
 
         binding.btnSave.setOnClickListener { saveSettings() }
-        binding.btnSaveXz.setOnClickListener { saveXiaozhi() }
         binding.btnActivateXz.setOnClickListener { activateXiaozhi() }
         binding.btnHealth.setOnClickListener { healthCheck() }
         binding.btnStartService.setOnClickListener { VoiceBridgeService.start(requireContext()) }
@@ -59,11 +58,8 @@ class SettingsFragment : Fragment() {
         binding.checkUseTls.isChecked = settings.useTls
         binding.inputToken.setText(settings.token)
         binding.inputWsPath.setText(settings.wsPath)
-        // 小智识别配置
-        val url = xzSettings.serverUrl
-        binding.inputXzUrl.setText(url)
-        binding.inputXzToken.setText(xzSettings.token)
-        binding.xzStatus.text = if (url.isBlank()) "未启用小智,使用 Vosk 本地识别" else "已启用小智云端识别"
+        // 小智 URL/token 写死,不在 UI 展示;只显示当前识别引擎状态
+        binding.xzStatus.text = "识别引擎:小智云端(已启用)"
     }
 
     private fun activateXiaozhi() {
@@ -90,9 +86,7 @@ class SettingsFragment : Fragment() {
             }
             binding.btnActivateXz.isEnabled = true
             if (result.activated) {
-                xzSettings.activated = true
-                xzSettings.wsUrl = result.wsUrl ?: ""
-                xzSettings.wsToken = result.wsToken ?: "test-token"
+                // URL/token 写死,激活后无需改配置
                 binding.xzActiveStatus.text = "激活成功!小智识别已可用"
                 log("小智激活成功,ws=${result.wsUrl}")
                 Toast.makeText(requireContext(), "激活成功,请重启语音桥服务", Toast.LENGTH_LONG).show()
@@ -108,20 +102,6 @@ class SettingsFragment : Fragment() {
     private fun bleCentralDeviceMac(): String {
         val p = requireContext().getSharedPreferences("ble_central", android.content.Context.MODE_PRIVATE)
         return p.getString("last_device_addr", "") ?: ""
-    }
-
-    private fun saveXiaozhi() {
-        val url = binding.inputXzUrl.text.toString().trim()
-        val token = binding.inputXzToken.text.toString().trim()
-        xzSettings.save(url, token)
-        val msg = if (url.isBlank()) {
-            "已保存:未启用小智,回退 Vosk"
-        } else {
-            "已保存小智识别。重启语音桥服务生效"
-        }
-        log(msg)
-        binding.xzStatus.text = if (url.isBlank()) "未启用小智,使用 Vosk 本地识别" else "已启用小智云端识别"
-        Toast.makeText(requireContext(), msg, Toast.LENGTH_SHORT).show()
     }
 
     private fun saveSettings() {
