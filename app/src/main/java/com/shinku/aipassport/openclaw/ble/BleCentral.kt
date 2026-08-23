@@ -85,6 +85,9 @@ class BleCentral(
          */
         private const val PAIRING_VARIANT_PASSKEY = 1
         private const val PAIRING_VARIANT_DISPLAY_PASSKEY = 4
+
+        /** 上次连接成功设备的地址(SharedPreferences key,用于启动自动重连)。 */
+        private const val KEY_LAST_DEVICE = "last_device_addr"
     }
 
     private var scanner: BluetoothLeScanner? = null
@@ -92,6 +95,18 @@ class BleCentral(
     private var gatt: BluetoothGatt? = null
     private var targetDevice: BluetoothDevice? = null
     private var running = false
+
+    /** 上次连接设备地址持久化(记住设备,App 重启后自动重连)。 */
+    private val prefs =
+        context.getSharedPreferences("ble_central", Context.MODE_PRIVATE)
+
+    /** 上次连接成功的设备地址(持久化,App 重启后用于自动重连)。 */
+    private val lastDeviceAddr: String?
+        get() = prefs.getString(KEY_LAST_DEVICE, null)
+
+    private fun rememberDevice(addr: String) {
+        prefs.edit().putString(KEY_LAST_DEVICE, addr).apply()
+    }
 
     private val scanSettings = ScanSettings.Builder()
         .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
@@ -253,6 +268,16 @@ class BleCentral(
         registerPairingReceiver()
         // 不再自动扫描:在用户于设备页点击"扫描"(ACTION_SCAN -> rescan)时才启动,
         // 避免 App 启动即高频扫描被 Android 拒绝(扫描失败 code=1 死循环)。
+        // 若记住过设备(App 重启),直接按地址重连,保证"退出重启后仍连接"。
+        val last = lastDeviceAddr
+        if (last != null) {
+            Log.i(tag, "自动重连上次设备 $last")
+            try {
+                connectTo(adapter.getRemoteDevice(last))
+            } catch (e: Exception) {
+                Log.e(tag, "自动重连失败(地址不存在?): $last", e)
+            }
+        }
     }
 
     /** 设备页触发:重新开始扫描(断开当前连接,重新发现)。 */
@@ -401,6 +426,7 @@ class BleCentral(
 
     private fun connectTo(device: BluetoothDevice) {
         targetDevice = device
+        rememberDevice(device.address)   // 记住设备地址,App 重启后可自动重连
         listener.onConnecting()
         bleHandler.post {
             Log.i(tag, "连接 ${device.address}")
