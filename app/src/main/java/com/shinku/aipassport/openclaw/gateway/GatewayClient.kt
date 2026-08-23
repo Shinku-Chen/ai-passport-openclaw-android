@@ -61,6 +61,9 @@ class GatewayClient(
         .pingInterval(30, TimeUnit.SECONDS)
         .build()
 
+    /** chat.send 会话 key,格式 agent:<agentId>:<rest>(网关卡据此解析 agentId)。 */
+    private val AgentSessionKey = "agent:main:default"
+
     private val pendingReqs = ConcurrentHashMap<String, CompletableDeferred<JsonObject?>>()
 
     /** 最近一次 RPC 错误信息(供控制台分区显示"不可用/需权限"原因)。 */
@@ -284,27 +287,41 @@ class GatewayClient(
 
     private fun sendConnect() {
         val nonce = pendingNonce ?: UUID.randomUUID().toString()
-        val scopes = "operator.read"
-        // 实测确认:client.id=openclaw-control-ui + mode=webchat + protocol=4 走 token 优先鉴权
-        // (错误 token 返回 AUTH_TOKEN_MISMATCH;正确 token 即通过,无需设备配对签名)。
-        // 不携带 device 块(control-ui 路径 token 是唯一门禁)。
+        // scopes 与设备已批准一致(admin 在前,网关卡 devices list 用此顺序)。
+        val scopes = "operator.admin,operator.read,operator.write"
+        // 实测确认:网关强制 Ed25519 设备签名鉴权,token-first(openclaw-control-ui)被拒。
+        // 必须带 device 块:client.id=openclaw-android + device{id,publicKey,signature}。
+        // device 用 DeviceIdentity 的持久化 ed25519 keypair 签名 v2 payload。
+        val signedAt = System.currentTimeMillis()
+        val devId = identity.deviceId
+        val pubKey = identity.publicKeyBase64
+        val signPayload = "v2|$devId|openclaw-android|webchat|operator|$scopes|$signedAt|${settings.token}|$nonce"
+        val signature = identity.sign(signPayload)
         val params = JsonObject().apply {
             addProperty("minProtocol", 4)
             addProperty("maxProtocol", 4)
             add("client", JsonObject().apply {
-                addProperty("id", "openclaw-control-ui")
+                addProperty("id", "openclaw-android")
                 addProperty("version", "0.1.0")
                 addProperty("platform", "android")
                 addProperty("mode", "webchat")
             })
             addProperty("role", "operator")
-            add("scopes", gson.toJsonTree(listOf("operator.read", "operator.write")))
-            add("caps", gson.toJsonTree(emptyList<String>()))
+            add("scopes", gson.toJsonTree(listOf("operator.admin", "operator.read", "operator.write")))
+            add("device", JsonObject().apply {
+                addProperty("id", devId)
+                addProperty("publicKey", pubKey)
+                addProperty("signature", signature)
+                addProperty("signedAt", signedAt)
+                addProperty("nonce", nonce)
+            })
+            add("caps", gson.toJsonTree(listOf("tool-events")))
             add("commands", gson.toJsonTree(emptyList<String>()))
             add("permissions", JsonObject())
             add("auth", JsonObject().apply {
-                // 运行时注入的网关 token(设置页 SharedPreferences);默认空 → AUTH_TOKEN_MISSING
+                // 运行时注入的网关 token(设置页 SharedPreferences)。
                 addProperty("token", settings.token)
+                addProperty("password", "")
             })
             addProperty("locale", "zh-CN")
             addProperty("userAgent", "passport-android/0.1.0")
@@ -314,8 +331,8 @@ class GatewayClient(
                 val ok = withTimeoutOrNull(10_000) { deferred.await() } != null
                 connected = ok
                 if (!ok) {
-                    Log.w(tag, "网关 connect 鉴权失败(检查 token 是否正确填写)")
-                    onStatus("网关鉴权失败:请在设置页检查 token")
+                    Log.w(tag, "网关 connect 鉴权失败(设备可能未在网关 approve)")
+                    onStatus("网关鉴权失败:请在网关主机 openclaw devices approve 设备")
                 }
             }
         }
@@ -326,7 +343,9 @@ class GatewayClient(
     private suspend fun sendChat(text: String): String? {
         val idempotency = UUID.randomUUID().toString()
         val params = JsonObject().apply {
-            addProperty("sessionKey", GatewayConfig.SESSION_KEY)
+            // sessionKey 必须是 agent:<agentId>:<rest> 格式,网关卡从 sessionKey 解析 agentId。
+            // 之前用纯 "main" 不符合,报 "agentId \"main\" does not match session key \"main\""。
+            addProperty("sessionKey", AgentSessionKey)
             addProperty("message", text)
             addProperty("deliver", false)
             addProperty("idempotencyKey", idempotency)
@@ -351,12 +370,14 @@ class GatewayClient(
 
     /** 处理下行事件(event 包),按 OpenClaw 通用结构解析文本。 */
     private fun handleReplyEvent(obj: JsonObject) {
+        Log.i(tag, "收到 event 帧: ${obj.toString()}")
         val payload = obj.getAsJsonObject("payload") ?: return
         handleReplyPayload(payload)
     }
 
     /** 处理非 event 类型下行帧(response/result/message/assistant.message)。 */
     private fun handleReplyFrame(obj: JsonObject) {
+        Log.i(tag, "收到下行帧: ${obj.toString()}")
         handleReplyPayload(obj)
     }
 
@@ -373,11 +394,18 @@ class GatewayClient(
         if (evRunId != null && collector.runId == null) collector.runId = evRunId
         if (collector.runId != null && evRunId != null && evRunId != collector.runId) return
 
-        val text = extractText(payload) ?: return
-        if (text.isNotBlank()) collector.append(text)
-
-        // 终结判定:state==final 或 isFinal/final==true 或 delta 不再出现
         val state = payload.get("state")?.asString
+        // 网关 chat 事件: state=delta 时 deltaText 是增量,message.content 是全量。
+        // 用 deltaText 增量追加,避免全量重复累积;state=final 时 message.content 是全量最终结果。
+        val deltaText = payload.get("deltaText")?.takeIf { it.isJsonPrimitive }?.asString
+        val text = if (state == "delta" && !deltaText.isNullOrBlank()) {
+            deltaText
+        } else {
+            extractText(payload)
+        }
+        if (!text.isNullOrBlank()) collector.append(text)
+
+        // 终结判定:state==final 或 isFinal/final==true
         val isFinal = payload.get("isFinal")?.asBoolean
             ?: payload.get("final")?.asBoolean
             ?: false
@@ -386,10 +414,23 @@ class GatewayClient(
 
     /** 尽量从各种结构的 JSON 里抠出文本。 */
     private fun extractText(payload: JsonObject): String? {
-        // 1. {message:{content|text}}
+        // 0. 网关 chat 事件: message.content 是数组 [{"type":"text","text":"..."}] 或原始字符串
         payload.getAsJsonObject("message")?.let { m ->
-            m.get("content")?.takeIf { it.isJsonPrimitive }?.asString
-                ?.takeIf { it.isNotBlank() }?.let { return it }
+            val content = m.get("content")
+            if (content != null) {
+                if (content.isJsonArray) {
+                    // content 数组: 取各 text 块拼起来(或取首个 text)
+                    content.asJsonArray.mapNotNull { el ->
+                        if (el.isJsonObject) {
+                            val obj = el.asJsonObject
+                            val t = obj.get("text")?.takeIf { it.isJsonPrimitive }?.asString
+                            if (!t.isNullOrBlank()) t else null
+                        } else null
+                    }.joinToString("").takeIf { it.isNotBlank() }?.let { return it }
+                } else if (content.isJsonPrimitive) {
+                    content.asString.takeIf { it.isNotBlank() }?.let { return it }
+                }
+            }
             m.get("text")?.takeIf { it.isJsonPrimitive }?.asString
                 ?.takeIf { it.isNotBlank() }?.let { return it }
         }
@@ -399,13 +440,21 @@ class GatewayClient(
                 val first = choices[0]
                 if (first.isJsonObject) {
                     first.asJsonObject.getAsJsonObject("message")
-                        ?.get("content")?.takeIf { it.isJsonPrimitive }?.asString
-                        ?.takeIf { it.isNotBlank() }?.let { return it }
+                        ?.let { m ->
+                            val c = m.get("content")
+                            if (c != null && c.isJsonArray) {
+                                c.asJsonArray.mapNotNull { el ->
+                                    if (el.isJsonObject) el.asJsonObject.get("text")?.takeIf { it.isJsonPrimitive }?.asString else null
+                                }.joinToString("").takeIf { it.isNotBlank() }?.let { return it }
+                            } else if (c != null && c.isJsonPrimitive) {
+                                c.asString.takeIf { it.isNotBlank() }?.let { return it }
+                            }
+                        }
                 }
             }
         }
         // 3. 顶层文本字段
-        listOf("text", "content", "reply", "response", "answer").forEach { k ->
+        listOf("text", "content", "reply", "response", "answer", "deltaText").forEach { k ->
             payload.get(k)?.takeIf { it.isJsonPrimitive }?.asString
                 ?.takeIf { it.isNotBlank() }?.let { return it }
         }

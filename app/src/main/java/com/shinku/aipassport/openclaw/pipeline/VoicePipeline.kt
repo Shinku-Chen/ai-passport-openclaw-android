@@ -82,8 +82,14 @@ class VoicePipeline(
 
     private fun handleEvent(payload: ByteArray) {
         val ev = try {
-            gson.fromJson(String(payload, Charsets.UTF_8), JsonObject::class.java)
-                ?.get("ev")?.asString
+            val str = String(payload, Charsets.UTF_8)
+            val obj = gson.fromJson(str, JsonObject::class.java)
+            if (obj != null) {
+                obj.get("ev")?.takeIf { it.isJsonPrimitive }?.asString
+            } else {
+                // payload 可能是纯字符串事件(如 "turn_start"),兼容非 JsonObject
+                str.trim().trim('"').takeIf { it.isNotEmpty() }
+            }
         } catch (e: Exception) {
             Log.e(tag, "EVENT 解析失败", e)
             return
