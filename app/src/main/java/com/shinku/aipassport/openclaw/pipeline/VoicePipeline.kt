@@ -31,7 +31,8 @@ class VoicePipeline(
     private val stt: SttEngine,
     private val gateway: GatewayClient,
     private val tts: TtsEngine,
-    private val sendText: (String) -> Unit,
+    /** 回传 TEXT 帧给固件上屏。role: 'U'=用户语音识别文本,'A'=网关回复。 */
+    private val sendText: (role: Char, text: String) -> Unit,
     private val onState: (String) -> Unit,
 ) {
     private val tag = "VoicePipeline"
@@ -133,17 +134,23 @@ class VoicePipeline(
             onState("识别: $text")
             // 硬件语音也写入共享对话历史:让对话 Tab 能看到语音这一条
             ConversationStore.add("user", text, ConversationStore.SOURCE_VOICE)
+            // 识别文本先回传设备屏(role='U' 用户),让用户立即看到自己说的内容
+            sendText('U', text)
 
             val reply = gateway.chat(text)
             if (myTurn != turnId) return@launch
             if (reply.isNullOrBlank()) {
                 Log.w(tag, "网关无回复")
                 onState("网关无回复")
+                ConversationStore.add("agent", "(网关无回复)", ConversationStore.SOURCE_VOICE)
+                sendText('A', "(网关无回复)")
                 return@launch
             }
             Log.i(tag, "网关回复: $reply")
             onState("回复: $reply")
             ConversationStore.add("agent", reply, ConversationStore.SOURCE_VOICE)
+            // 网关回复立即回传设备屏(role='A'),不阻塞 TTS
+            sendText('A', reply)
             speak(reply)
         }
     }
@@ -155,7 +162,7 @@ class VoicePipeline(
                 // 合成自然结束 → 回传 TEXT 帧给固件上屏
                 if (myTurn == turnId) {
                     Log.i(tag, "TTS 结束,回传文本: $text")
-                    sendText(text)
+                    sendText('A', text)
                 }
             }
 
@@ -164,7 +171,7 @@ class VoicePipeline(
                 // 声音播不了,但至少把网关回复显示到设备屏幕。
                 if (myTurn == turnId) {
                     Log.i(tag, "TTS 未完成,仍回传文本上屏: $text")
-                    sendText(text)
+                    sendText('A', text)
                 }
             }
         })

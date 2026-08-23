@@ -133,7 +133,7 @@ class VoiceBridgeService : Service() {
             stt = SttFactory.create(this),
             gateway = gateway,
             tts = tts,
-            sendText = { text -> sendTextFrame(text) },
+            sendText = { role, text -> sendTextFrame(role, text) },
             onState = { status -> publishStatus(status) },
         )
 
@@ -172,8 +172,13 @@ class VoiceBridgeService : Service() {
 
     // ---- 数据出口 ----
 
-    private fun sendTextFrame(text: String) {
-        val payload = text.toByteArray(Charsets.UTF_8)
+    private fun sendTextFrame(role: Char, text: String) {
+        // TEXT 帧 payload = [role:1B]['U'=用户识别/'A'=网关回复] + UTF-8 文本。
+        // 固件据此区分并入对话历史,供 UP/DOWN 翻页。
+        val body = text.toByteArray(Charsets.UTF_8)
+        val payload = ByteArray(body.size + 1)
+        payload[0] = role.code.toByte()
+        System.arraycopy(body, 0, payload, 1, body.size)
         val frame = vbEncodeFrame(VbFrame.TYPE_TEXT, 0, payload)
         ble.writeBytes(frame)
     }
