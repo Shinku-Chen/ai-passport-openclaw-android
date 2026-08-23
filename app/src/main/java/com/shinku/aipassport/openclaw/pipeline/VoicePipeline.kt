@@ -131,8 +131,7 @@ class VoicePipeline(
                 return@launch
             }
             Log.i(tag, "识别结果: $text")
-            onState("识别: $text")
-            // 硬件语音也写入共享对话历史:让对话 Tab 能看到语音这一条
+            // 识别结果仅在对话列表 + 设备屏展示,不污染顶部状态栏(状态栏只显示流程状态)
             ConversationStore.add("user", text, ConversationStore.SOURCE_VOICE)
             // 识别文本先回传设备屏(role='U' 用户),让用户立即看到自己说的内容
             sendText('U', text)
@@ -141,13 +140,12 @@ class VoicePipeline(
             if (myTurn != turnId) return@launch
             if (reply.isNullOrBlank()) {
                 Log.w(tag, "网关无回复")
-                onState("网关无回复")
                 ConversationStore.add("agent", "(网关无回复)", ConversationStore.SOURCE_VOICE)
                 sendText('A', "(网关无回复)")
                 return@launch
             }
             Log.i(tag, "网关回复: $reply")
-            onState("回复: $reply")
+            // 回复仅在对话列表 + 设备屏展示,不污染顶部状态栏
             ConversationStore.add("agent", reply, ConversationStore.SOURCE_VOICE)
             // 网关回复立即回传设备屏(role='A'),不阻塞 TTS
             sendText('A', reply)
