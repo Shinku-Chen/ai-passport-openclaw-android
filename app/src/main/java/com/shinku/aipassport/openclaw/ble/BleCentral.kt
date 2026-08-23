@@ -114,7 +114,9 @@ class BleCentral(
         override fun onScanFailed(errorCode: Int) {
             Log.e(tag, "扫描失败 code=$errorCode")
             listener.onError("BLE 扫描失败(code=$errorCode)")
-            if (running) scheduleReconnect()
+            // 扫描失败(常因 Android 限制扫描频率)不立即高频重试,退避后再扫一次。
+            // 若持续失败则不自动重连,等用户在设备页再点"扫描"。
+            if (running) scheduleReconnect(backoffMs = 8_000L)
         }
     }
 
@@ -178,7 +180,8 @@ class BleCentral(
                     gatt?.close()
                     gatt = null
                     listener.onDisconnected()
-                    if (running) scheduleReconnect()
+                    // 断开后不立即高频重连,退避后再扫,避免 Android 扫描限流
+                    if (running) scheduleReconnect(backoffMs = 8_000L)
                 }
             }
         }
@@ -248,7 +251,8 @@ class BleCentral(
         scanner = adapter.bluetoothLeScanner
         running = true
         registerPairingReceiver()
-        startScan()
+        // 不再自动扫描:在用户于设备页点击"扫描"(ACTION_SCAN -> rescan)时才启动,
+        // 避免 App 启动即高频扫描被 Android 拒绝(扫描失败 code=1 死循环)。
     }
 
     /** 设备页触发:重新开始扫描(断开当前连接,重新发现)。 */
@@ -450,9 +454,9 @@ class BleCentral(
         g.writeDescriptor(cccd)
     }
 
-    private fun scheduleReconnect() {
+    private fun scheduleReconnect(backoffMs: Long = 2_000L) {
         bleHandler.removeCallbacksAndMessages(null)
-        bleHandler.postDelayed({ if (running) startScan() }, 2000L)
+        bleHandler.postDelayed({ if (running) startScan() }, backoffMs)
     }
 
     private fun hasBlePermissions(): Boolean {
