@@ -10,6 +10,7 @@ import com.shinku.aipassport.openclaw.databinding.FragmentSettingsBinding
 import com.shinku.aipassport.openclaw.gateway.GatewayApi
 import com.shinku.aipassport.openclaw.gateway.GatewaySettings
 import com.shinku.aipassport.openclaw.service.VoiceBridgeService
+import com.shinku.aipassport.openclaw.stt.ModelManager
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -46,6 +47,55 @@ class SettingsFragment : Fragment() {
         binding.btnHealth.setOnClickListener { healthCheck() }
         binding.btnStartService.setOnClickListener { VoiceBridgeService.start(requireContext()) }
         binding.btnStopService.setOnClickListener { VoiceBridgeService.stop(requireContext()) }
+
+        binding.btnDownloadSmall.setOnClickListener {
+            downloadModel("small", ModelManager.SMALL_URL)
+        }
+        binding.btnDownloadLarge.setOnClickListener {
+            downloadModel("large", ModelManager.LARGE_URL)
+        }
+        refreshModelStatus()
+    }
+
+    private fun refreshModelStatus() {
+        val dir = ModelManager.currentModelDir(requireContext())
+        if (dir != null) {
+            binding.modelStatus.text = "当前识别模型:\n${dir.name}"
+        } else {
+            binding.modelStatus.text = "当前识别模型:\n未下载,降级系统识别"
+        }
+    }
+
+    private fun downloadModel(label: String, url: String) {
+        // 禁用按钮防并发;进度显示
+        binding.btnDownloadSmall.isEnabled = false
+        binding.btnDownloadLarge.isEnabled = false
+        binding.modelProgress.text = "下载 $label 模型中…"
+        log("开始下载 $label 模型…")
+        scope.launch {
+            ModelManager.downloadModel(
+                context = requireContext(),
+                url = url,
+                onProgress = { pct ->
+                    binding.modelProgress.text = "下载 $label 模型 ${(pct * 100).toInt()}%"
+                },
+                onDone = { modelDir ->
+                    binding.modelProgress.text = "下载 $label 模型完成"
+                    log("下载 $label 模型完成: ${modelDir.name}")
+                    binding.btnDownloadSmall.isEnabled = true
+                    binding.btnDownloadLarge.isEnabled = true
+                    refreshModelStatus()
+                    Toast.makeText(requireContext(), "模型已就绪,请点「停止服务」再「启动服务」生效", Toast.LENGTH_LONG).show()
+                },
+                onError = { msg ->
+                    binding.modelProgress.text = "下载 $label 模型失败"
+                    log("下载 $label 模型失败: $msg")
+                    binding.btnDownloadSmall.isEnabled = true
+                    binding.btnDownloadLarge.isEnabled = true
+                    Toast.makeText(requireContext(), "下载 $label 模型失败: $msg", Toast.LENGTH_LONG).show()
+                },
+            )
+        }
     }
 
     private fun loadSettings() {

@@ -17,13 +17,11 @@ object SttFactory {
     private const val TAG = "SttFactory"
 
     /**
-     * 在 filesDir 下寻找名字含 "vosk-model" 的模型目录。
-     * 找不到返回 null。多个时按名称排序取第一个,保证确定性。
+     * 找到用于识别的模型目录(优先大模型,其次目录体积最大)。
+     * 找不到返回 null(降级系统识别)。
      */
     fun findModelDir(context: Context): File? {
-        val candidates = context.filesDir?.listFiles { f -> f.isDirectory && f.name.contains("vosk-model") }
-        if (candidates.isNullOrEmpty()) return null
-        return candidates.sortedBy { it.name }.first()
+        return ModelManager.currentModelDir(context)
     }
 
     /** 创建引擎:Vosk 模型存在 → VoskStt;否则 → SpeechRecognizerStt。 */
