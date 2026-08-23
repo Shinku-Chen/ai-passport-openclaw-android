@@ -100,6 +100,16 @@ class GatewayClient(
     /** 网关是否已鉴权可对话。 */
     fun isConnected(): Boolean = connected
 
+    /**
+     * 打断当前在途的网关回复收集(barge:回复中用户再次按 PTT 说话)。
+     * 完成旧 activeCollector,让旧轮 chat 尽快返回(null),释放单例 activeCollector,
+     * 避免新一轮 chat.send 与之冲突导致回复错配/发送失败。
+     */
+    fun interruptCurrent() {
+        activeCollector?.finish()
+        activeCollector = null
+    }
+
     /** 设备是否已配对(有 deviceToken)。 */
     fun isPaired(): Boolean = identity.deviceToken.isNotBlank()
 

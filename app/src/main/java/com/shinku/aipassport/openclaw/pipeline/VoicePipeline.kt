@@ -110,11 +110,14 @@ class VoicePipeline(
     // ---- turn 起止 ----
 
     private fun onTurnStart() {
-        // barge:打断正在进行的 TTS / 识别 / 网关等待
+        // barge:打断正在进行的 TTS / 识别 / 网关等待。
+        // 若上一轮网关回复还在收集中(activeCollector 被旧轮占用),先中断它,释放单例
+        // 收集器,避免新一轮 chat.send 与其冲突导致发送失败/回复错配。
         turnId++
         turnActive = true
         tts.stop()
         stt.barge()
+        gateway.interruptCurrent()
         stt.startTurn()
         onState("录音中…")
     }
@@ -140,7 +143,13 @@ class VoicePipeline(
             // 识别文本先回传设备屏(role='U' 用户),让用户立即看到自己说的内容
             sendText('U', text)
 
-            val reply = gateway.chat(text)
+            // 网关请求可能因网络/超时/异常失败;必须兜底回传 role='A',否则设备卡"接收中"。
+            val reply = try {
+                gateway.chat(text)
+            } catch (e: Exception) {
+                Log.e(tag, "gateway.chat 异常", e)
+                null
+            }
             if (myTurn != turnId) return@launch
             if (reply.isNullOrBlank()) {
                 Log.w(tag, "网关无回复")
