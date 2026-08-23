@@ -147,8 +147,11 @@ class VoiceBridgeService : Service() {
                 override fun onEncrypted() = publishStatus("已加密")
                 override fun onReady() {
                     publishStatus("就绪,长按设备 OK 说话")
-                    // 下发当前时间给设备(设备无网络时钟,靠 App 同步;右上角显示 HH:MM)
-                    sendTimeSync()
+                    // 下发当前时间给设备(设备无网络时钟,靠 App 同步;右上角显示 HH:MM)。
+                    // 延迟稍等,确保 MTU 协商完成(否则超长写入被 Android 拒)。
+                    android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
+                        sendTimeSync()
+                    }, 800)
                 }
                 // 帧处理统一投递到主线程 scope:保证帧重组 + 流水线在单线程上串行,
                 // STT(startTurn)/EVENT 起停/识别顺序确定,不因 BLE 回调线程而竞态。
