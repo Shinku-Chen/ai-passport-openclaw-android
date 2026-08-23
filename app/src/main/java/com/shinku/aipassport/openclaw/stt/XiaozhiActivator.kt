@@ -13,6 +13,7 @@ import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
+import java.util.UUID
 import java.util.concurrent.TimeUnit
 import javax.crypto.Mac
 import javax.crypto.spec.SecretKeySpec
@@ -40,11 +41,12 @@ class XiaozhiActivator(
     private val gson = Gson()
 
     private companion object {
-        /** 小智 Client-Id(写死,与网页端注册的设备一致,保持稳定不变)。 */
-        const val CLIENT_ID = "1dd91545-082a-454e-a131-1c8251375c9c"
         /** 小智 Device-Id(全零 MAC,服务器放行的匿名通道;真实 MAC 当前被 op=8 拒)。 */
         const val DEVICE_MAC = "00:00:00:00:00:00"
     }
+
+    /** 小智 Client-Id:每次 App 启动随机生成(进程内稳定,重启换新)。 */
+    private val clientId: String = UUID.randomUUID().toString()
 
     private val client = OkHttpClient.Builder()
         .connectTimeout(10, TimeUnit.SECONDS)
@@ -75,8 +77,8 @@ class XiaozhiActivator(
      */
     suspend fun activateAndPoll(onCodeReady: (code: String, message: String) -> Unit): ActivationResult =
         withContext(Dispatchers.IO) {
-            // Client-Id 写死为固定值(与网页端注册的设备一致),保持稳定不变。
-            val clientId = CLIENT_ID
+            // Client-Id 每次 App 启动随机生成(进程内稳定,重启换新)。
+            val clientId = this@XiaozhiActivator.clientId
 
             // 1. OTA 拉取(Device-Id 用全零 MAC 匿名通道)
             val ota = postOta(otaUrl, DEVICE_MAC, clientId) ?: return@withContext ActivationResult(false, detail = "OTA 请求失败")

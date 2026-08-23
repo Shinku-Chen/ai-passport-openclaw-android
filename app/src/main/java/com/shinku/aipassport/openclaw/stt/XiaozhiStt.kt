@@ -12,6 +12,7 @@ import okhttp3.Request
 import okhttp3.Response
 import okhttp3.WebSocket
 import okhttp3.WebSocketListener
+import java.util.UUID
 import java.util.concurrent.TimeUnit
 
 /**
@@ -40,10 +41,8 @@ class XiaozhiStt(
     private val tag = "XiaozhiStt"
     private val gson = Gson()
 
-    private companion object {
-        /** 小智 Client-Id(写死,与网页端注册的设备一致,保持稳定不变)。 */
-        const val CLIENT_ID = "1dd91545-082a-454e-a131-1c8251375c9c"
-    }
+    /** 小智 Client-Id:每次 App 启动随机生成(同一进程内稳定,重启换新),避免旧会话占位被拒。 */
+    private val clientId: String = UUID.randomUUID().toString()
 
     private val client = OkHttpClient.Builder()
         .connectTimeout(8, TimeUnit.SECONDS)
@@ -198,11 +197,11 @@ class XiaozhiStt(
         val req = Request.Builder()
             .url(serverUrl)
             // 小智：必须先带 Device-Id/Client-Id/Protocol-Version 握手头 + 发 hello,否则立即 close
-            // Client-Id 写死为固定值(与网页端注册的设备一致),保持稳定不变。
+            // Client-Id 每次 App 启动随机生成(进程内稳定,重启换新)。
             .addHeader("Authorization", token.ifBlank { "test-token" })
             .addHeader("Protocol-Version", "1")
             .addHeader("Device-Id", deviceId)
-            .addHeader("Client-Id", CLIENT_ID)
+            .addHeader("Client-Id", clientId)
             .build()
         val socket = client.newWebSocket(req, object : WebSocketListener() {
             override fun onOpen(webSocket: WebSocket, response: Response) {
