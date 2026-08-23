@@ -1,0 +1,135 @@
+package com.shinku.aipassport.openclaw.gateway
+
+import com.google.gson.JsonArray
+import com.google.gson.JsonParser
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import java.util.concurrent.TimeUnit
+
+/**
+ * OpenClaw 网关 REST 层:健康/Agent/模型/技能/概览/用量/通知等端点。
+ *
+ * 端点形状以实测为准(该网关 /v1/chat/completions、/agent/message 为 404,
+ * /tools/invoke 需 Bearer token)。这里按 OpenClaw 常见 REST 端点尽力对接:
+ *   GET {base}/health          -> 探活(已实测 200)
+ *   GET {base}/agents          -> Agent 列表(尽力解析)
+ *   GET {base}/models          -> 模型列表
+ *   GET {base}/skills          -> 技能列表
+ *   GET {base}/overview        -> 概览
+ *   GET {base}/usage           -> 用量
+ *   GET {base}/notifications   -> 通知列表(手机同步过来的通知展示)
+ * token 来自 GatewaySettings,放在 Authorization: Bearer。401/404 视为端点不可用。
+ */
+class GatewayApi(
+    private val settings: GatewaySettings,
+) {
+    private val client = OkHttpClient.Builder()
+        .connectTimeout(8, TimeUnit.SECONDS)
+        .readTimeout(12, TimeUnit.SECONDS)
+        .build()
+
+    data class ApiResult(val ok: Boolean, val body: String, val code: Int)
+
+    /** 通用 GET;token 存在则带 Bearer。 */
+    private fun get(path: String): ApiResult {
+        val url = GatewayConfig.baseUrl(settings) + path
+        val builder = Request.Builder().url(url).get()
+        if (settings.token.isNotBlank()) {
+            builder.header("Authorization", "Bearer ${settings.token}")
+        }
+        return try {
+            client.newCall(builder.build()).execute().use { resp ->
+                ApiResult(
+                    ok = resp.isSuccessful,
+                    body = resp.body?.string().orEmpty(),
+                    code = resp.code,
+                )
+            }
+        } catch (e: Exception) {
+            ApiResult(ok = false, body = "请求失败: ${e.message}", code = 0)
+        }
+    }
+
+    suspend fun health(): ApiResult = withContext(Dispatchers.IO) { get("/health") }
+
+    suspend fun agents(): ApiResult = withContext(Dispatchers.IO) { get("/agents") }
+
+    suspend fun models(): ApiResult = withContext(Dispatchers.IO) { get("/models") }
+
+    suspend fun skills(): ApiResult = withContext(Dispatchers.IO) { get("/skills") }
+
+    suspend fun overview(): ApiResult = withContext(Dispatchers.IO) { get("/overview") }
+
+    suspend fun usage(): ApiResult = withContext(Dispatchers.IO) { get("/usage") }
+
+    suspend fun notifications(): ApiResult = withContext(Dispatchers.IO) { get("/notifications") }
+
+    /** 尽力把 agents 响应解析成 id/name 列表;失败返回空表。 */
+    fun parseAgents(body: String): List<AgentSummary> {
+        if (body.isBlank()) return emptyList()
+        return try {
+            val el = JsonParser.parseString(body)
+            val arr: JsonArray = when {
+                el.isJsonArray -> el.asJsonArray
+                el.isJsonObject && el.asJsonObject.has("agents") ->
+                    el.asJsonObject.get("agents").asJsonArray
+                el.isJsonObject && el.asJsonObject.has("result") &&
+                    el.asJsonObject.get("result").isJsonArray ->
+                    el.asJsonObject.get("result").asJsonArray
+                else -> return emptyList()
+            }
+            arr.mapNotNull { o ->
+                val obj = o.asJsonObject
+                val id = obj.get("id")?.asString
+                    ?: obj.get("key")?.asString
+                    ?: obj.get("agentId")?.asString
+                if (id == null) null else AgentSummary(
+                    id = id,
+                    name = obj.get("name")?.asString ?: id,
+                    status = obj.get("status")?.asString ?: "unknown",
+                )
+            }
+        } catch (e: Exception) {
+            emptyList()
+        }
+    }
+
+    /** 尽力把 notifications 响应解析成列表;失败返回空表。 */
+    fun parseNotifications(body: String): List<NotificationItem> {
+        if (body.isBlank()) return emptyList()
+        return try {
+            val el = JsonParser.parseString(body)
+            val arr: JsonArray = when {
+                el.isJsonArray -> el.asJsonArray
+                el.isJsonObject && el.asJsonObject.has("notifications") ->
+                    el.asJsonObject.get("notifications").asJsonArray
+                else -> return emptyList()
+            }
+            arr.mapNotNull { o ->
+                val obj = o.asJsonObject
+                val text = obj.get("title")?.asString
+                    ?: obj.get("text")?.asString
+                    ?: obj.get("body")?.asString
+                    ?: obj.get("message")?.asString
+                if (text == null) null else NotificationItem(
+                    title = text,
+                    detail = obj.get("detail")?.asString
+                        ?: obj.get("app")?.asString
+                        ?: obj.get("source")?.asString
+                        ?: "",
+                    time = obj.get("time")?.asString
+                        ?: obj.get("timestamp")?.asString
+                        ?: "",
+                )
+            }
+        } catch (e: Exception) {
+            emptyList()
+        }
+    }
+
+    data class AgentSummary(val id: String, val name: String, val status: String)
+
+    data class NotificationItem(val title: String, val detail: String, val time: String)
+}

@@ -38,6 +38,7 @@ dependencies {
     implementation("androidx.core:core-ktx:1.13.1")
     implementation("androidx.appcompat:appcompat:1.7.0")
     implementation("androidx.activity:activity-ktx:1.9.2")
+    implementation("androidx.recyclerview:recyclerview:1.3.2")
     implementation("com.google.android.material:material:1.12.0")
     implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.8.6")
     implementation("androidx.lifecycle:lifecycle-service:2.8.6")
@@ -45,12 +46,12 @@ dependencies {
     // WebSocket 连 OpenClaw gateway
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
 
-    // 离线 ASR:Vosk(消费设备经 BLE 送来的 PCM)
-    implementation("com.alphacephei:vosk-android:0.3.47")
-
     // JSON
     implementation("com.google.code.gson:gson:2.11.0")
 
     // 协程
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.9.0")
+
+    // ed25519 设备身份签名(OpenClaw 网关 connect 鉴权需要;minSdk 26 需第三方实现)
+    implementation("org.bouncycastle:bcprov-jdk18on:1.78.1")
 }
