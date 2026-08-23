@@ -30,16 +30,25 @@ class GatewaySettings(context: Context) {
         get() = prefs.getString(KEY_TOKEN, "") ?: ""
         set(value) = prefs.edit().putString(KEY_TOKEN, value.trim()).apply()
 
+    /** WebSocket 对话路径(OpenClaw 网关,实测 /message/messages/ws、/ws 均接受升级)。可配置。 */
+    var wsPath: String
+        get() = prefs.getString(KEY_WS_PATH, "/message/messages/ws") ?: "/message/messages/ws"
+        set(value) {
+            val v = value.trim().ifBlank { "/message/messages/ws" }
+            prefs.edit().putString(KEY_WS_PATH, if (v.startsWith("/")) v else "/$v").apply()
+        }
+
     /** 域名+端口是否已配置。 */
     fun isConfigured(): Boolean = host.isNotBlank() && port.isNotBlank()
 
-    fun save(host: String, port: String, useTls: Boolean, token: String) {
+    fun save(host: String, port: String, useTls: Boolean, token: String, wsPath: String? = null) {
         prefs.edit()
             .putString(KEY_HOST, host.trim())
             .putString(KEY_PORT, port.trim())
             .putBoolean(KEY_USE_TLS, useTls)
             .putString(KEY_TOKEN, token.trim())
             .apply()
+        if (wsPath != null) this.wsPath = wsPath
     }
 
     companion object {
@@ -47,5 +56,6 @@ class GatewaySettings(context: Context) {
         private const val KEY_PORT = "gateway_port"
         private const val KEY_USE_TLS = "gateway_use_tls"
         private const val KEY_TOKEN = "gateway_token"
+        private const val KEY_WS_PATH = "gateway_ws_path"
     }
 }

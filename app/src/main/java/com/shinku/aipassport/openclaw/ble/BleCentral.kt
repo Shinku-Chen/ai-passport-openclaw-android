@@ -2,6 +2,7 @@ package com.shinku.aipassport.openclaw.ble
 
 import android.Manifest
 import android.annotation.SuppressLint
+import android.app.AlertDialog
 import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothDevice
 import android.bluetooth.BluetoothGatt
@@ -23,23 +24,32 @@ import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Handler
 import android.os.HandlerThread
+import android.os.Looper
 import android.os.ParcelUuid
+import android.text.InputFilter
+import android.text.InputType
 import android.util.Log
+import android.widget.EditText
 import androidx.core.content.ContextCompat
 
 /**
- * BLE 中央端:扫描 Passport-* 设备 → 连接 → 加密配对(固定 passkey)→ 发现 NUS →
+ * BLE 中央端:扫描 Passport-* 设备 → 连接 → 加密配对(用户输入固件屏幕随机密码)→ 发现 NUS →
  * 订阅 TX 通知 → 把帧字节写入 RX。所有 GATT 操作在专用 HandlerThread 上串行执行。
  *
- * 配对:固件为 LE SC + MITM + bonding,IO 能力 DISP_ONLY 且自动注入固定 passkey
- * (固件 voice_bridge.c static_passkey)。中央端收到 PIN 输入请求时自动填入该 passkey,
- * 收到 PASSKEY_CONFIRMATION 时自动确认。
+ * 配对:固件为 LE SC + MITM + bonding,配对时生成随机 6 位密码并在小屏显示。中央端收到
+ * PIN / PASSKEY / DISPLAY_PASSKEY 输入请求时弹出输入框,用户按固件屏幕显示的密码输入后
+ * setPin + setPairingConfirmation 完成匹配;收到 PASSKEY_CONFIRMATION 时自动确认。
  */
 @SuppressLint("MissingPermission")
 class BleCentral(
     private val context: Context,
-    private val staticPasskey: String,
     private val listener: Listener,
+    /**
+     * 配对输入框宿主:返回可弹 AlertDialog 的 Activity 上下文。
+     * Service 上下文中窗口 token 缺失,AlertDialog 无法弹出;由宿主(如 AppActivity)
+     * 提供当前前台 Activity,App 不在前台时返回 null(跳过弹框,配对超时)。
+     */
+    private val pairingDialogContext: () -> Context? = { null },
 ) {
 
     interface Listener {
@@ -56,6 +66,26 @@ class BleCentral(
     private val tag = "BleCentral"
     private val bleHandlerThread = HandlerThread("ble-central").apply { start() }
     private val bleHandler = Handler(bleHandlerThread.looper)
+
+    /** 弹配对输入框必须 post 到主线程 */
+    private val mainHandler = Handler(Looper.getMainLooper())
+
+    /** 固件屏幕展示的配对码固定为 6 位数字 */
+    private val pairingPinRegex = Regex("\\d{6}")
+
+    /** 正在展示的配对码输入框;配对请求可能重发,避免对话框堆叠 */
+    private var pairingDialog: AlertDialog? = null
+
+    companion object {
+        /**
+         * EXTRA_PAIRING_VARIANT 取值(@hide 常量,需自行定义,值与 AOSP
+         * android.bluetooth.BluetoothDevice 一致):
+         *  PIN=0 / PASSKEY=1 / PASSKEY_CONFIRMATION=2 / CONSENT=3 /
+         *  DISPLAY_PASSKEY=4 / DISPLAY_PIN=5。公开常量仅 PIN 与 PASSKEY_CONFIRMATION。
+         */
+        private const val PAIRING_VARIANT_PASSKEY = 1
+        private const val PAIRING_VARIANT_DISPLAY_PASSKEY = 4
+    }
 
     private var scanner: BluetoothLeScanner? = null
     private var adapter: BluetoothAdapter? = null
@@ -118,16 +148,16 @@ class BleCentral(
                         BluetoothDevice.PAIRING_VARIANT_PIN
                     )
                     when (variant) {
-                        BluetoothDevice.PAIRING_VARIANT_PIN -> {
-                            device.setPin(staticPasskey.toByteArray())
+                        // 固件无键盘,由中央端输入其小屏显示的 6 位随机密码
+                        BluetoothDevice.PAIRING_VARIANT_PIN,
+                        PAIRING_VARIANT_PASSKEY,
+                        PAIRING_VARIANT_DISPLAY_PASSKEY,
+                        -> requestPairingPin(device, showHint = variant != BluetoothDevice.PAIRING_VARIANT_PIN)
+
+                        // 两侧显示相同 6 位码(中央端/对端各自动确认),无需人工输入
+                        BluetoothDevice.PAIRING_VARIANT_PASSKEY_CONFIRMATION -> {
                             device.setPairingConfirmation(true)
                         }
-                        BluetoothDevice.PAIRING_VARIANT_PASSKEY_CONFIRMATION,
-                        BluetoothDevice.PAIRING_VARIANT_CONSENT -> {
-                            device.setPairingConfirmation(true)
-                        }
-                        // PAIRING_VARIANT_PASSKEY / DISPLAY_PASSKEY:对端展示 passkey,
-                        // 本机无需输入(固件侧自动注入固定值)。
                         else -> Unit
                     }
                 }
@@ -221,6 +251,16 @@ class BleCentral(
         startScan()
     }
 
+    /** 设备页触发:重新开始扫描(断开当前连接,重新发现)。 */
+    fun rescan() {
+        bleHandler.removeCallbacksAndMessages(null)
+        try { gatt?.disconnect() } catch (_: Exception) {}
+        try { gatt?.close() } catch (_: Exception) {}
+        gatt = null
+        targetDevice = null
+        if (running) startScan()
+    }
+
     fun stop() {
         running = false
         bleHandler.removeCallbacksAndMessages(null)
@@ -278,6 +318,69 @@ class BleCentral(
         }
     }
 
+    /**
+     * 配对请求:弹输入框让用户输入固件小屏显示的 6 位密码。
+     * 广播在系统回调线程,必须 post 到主线程弹 UI;确认成功后 setPin + setPairingConfirmation。
+     */
+    private fun requestPairingPin(device: BluetoothDevice, showHint: Boolean) {
+        Log.i(tag, "配对请求:需用户输入 6 位密码(showHint=$showHint)")
+        mainHandler.post {
+            val host = pairingDialogContext() ?: run {
+                // App 不在前台,弹不了输入框;等配对超时或下次配对请求再弹
+                Log.w(tag, "无可用 Activity 上下文,跳过配对弹框")
+                return@post
+            }
+            showPairingPinDialog(host, device, showHint)
+        }
+    }
+
+    /** 主线程弹 AlertDialog 输入框;输入非法(非 6 位数字)提示重输,不关闭对话框。 */
+    private fun showPairingPinDialog(host: Context, device: BluetoothDevice, showHint: Boolean) {
+        if (pairingDialog?.isShowing == true) return // 配对请求可能重发,避免对话框堆叠
+        val input = EditText(host).apply {
+            inputType = InputType.TYPE_CLASS_NUMBER
+            filters = arrayOf(InputFilter.LengthFilter(6))
+            hint = "6 位数字密码"
+        }
+        val inputContainer = android.widget.FrameLayout(host).apply {
+            val pad = (resources.displayMetrics.density * 16).toInt()
+            setPadding(pad, pad, pad, pad)
+            addView(input)
+        }
+        val title = if (showHint) "请在设备屏幕上查看密码并输入" else "请输入配对密码"
+        // 确定按钮先不绑定:用 setOnShowListener 延后挂接,输入非法时保持对话框
+        val dialog = AlertDialog.Builder(host)
+            .setTitle(title)
+            .setView(inputContainer)
+            .setPositiveButton("确定", null)
+            .setNegativeButton("取消") { _, _ -> pairingDialog = null }
+            .setOnCancelListener { pairingDialog = null }
+            .create()
+        dialog.setOnShowListener {
+            dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
+                val pin = input.text?.toString()?.trim() ?: ""
+                if (pairingPinRegex.matches(pin)) {
+                    pairingDialog = null
+                    dialog.dismiss()
+                    bleHandler.post {
+                        try {
+                            device.setPin(pin.toByteArray())
+                            device.setPairingConfirmation(true)
+                        } catch (e: Exception) {
+                            Log.e(tag, "setPin/setPairingConfirmation 失败", e)
+                            listener.onError("配对码提交失败:${e.message}")
+                        }
+                    }
+                } else {
+                    // 输入无效(非 6 位数字)→ 保持对话框,提示重输
+                    input.error = "请输入 6 位数字密码"
+                }
+            }
+        }
+        pairingDialog = dialog
+        dialog.show()
+    }
+
     private fun registerPairingReceiver() {
         val filter = IntentFilter().apply {
             addAction(BluetoothDevice.ACTION_PAIRING_REQUEST)
@@ -298,7 +401,7 @@ class BleCentral(
         bleHandler.post {
             Log.i(tag, "连接 ${device.address}")
             gatt = device.connectGatt(
-                context, false, gattCallback, BluetoothDevice.TRANSPORT_LE, bleHandler
+                context, false, gattCallback, BluetoothDevice.TRANSPORT_LE
             )
         }
     }

@@ -1,0 +1,88 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:orientation="vertical"
+    android:background="#0F1220">
+
+    <TextView
+        android:id="@+id/overviewTitle"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="Agent / 概览"
+        android:textSize="18sp"
+        android:textStyle="bold"
+        android:textColor="#FFFFFF"
+        android:padding="16dp" />
+
+    <androidx.recyclerview.widget.RecyclerView
+        android:id="@+id/agentList"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:paddingHorizontal="8dp"
+        android:nestedScrollingEnabled="false" />
+
+    <TextView
+        android:id="@+id/labelModels"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="模型"
+        android:textSize="15sp"
+        android:textStyle="bold"
+        android:textColor="#4FC3F7"
+        android:padding="12dp" />
+
+    <TextView
+        android:id="@+id/textModels"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="未加载"
+        android:textSize="13sp"
+        android:textColor="#DDDDDD"
+        android:paddingHorizontal="12dp" />
+
+    <TextView
+        android:id="@+id/labelSkills"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="技能"
+        android:textSize="15sp"
+        android:textStyle="bold"
+        android:textColor="#4FC3F7"
+        android:padding="12dp" />
+
+    <TextView
+        android:id="@+id/textSkills"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="未加载"
+        android:textSize="13sp"
+        android:textColor="#DDDDDD"
+        android:paddingHorizontal="12dp" />
+
+    <TextView
+        android:id="@+id/labelUsage"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="用量 / 概览"
+        android:textSize="15sp"
+        android:textStyle="bold"
+        android:textColor="#4FC3F7"
+        android:padding="12dp" />
+
+    <TextView
+        android:id="@+id/textUsage"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="未加载"
+        android:textSize="13sp"
+        android:textColor="#DDDDDD"
+        android:paddingHorizontal="12dp" />
+
+    <Button
+        android:id="@+id/btnRefreshOverview"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="刷新概览"
+        android:layout_margin="12dp" />
+</LinearLayout>

@@ -13,6 +13,7 @@ import android.os.IBinder
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
+import com.shinku.aipassport.openclaw.AppActivity
 import com.shinku.aipassport.openclaw.MainActivity
 import com.shinku.aipassport.openclaw.R
 import com.shinku.aipassport.openclaw.ble.BleCentral
@@ -22,7 +23,7 @@ import com.shinku.aipassport.openclaw.pipeline.VoicePipeline
 import com.shinku.aipassport.openclaw.protocol.VbFrame
 import com.shinku.aipassport.openclaw.protocol.VbFrameReassembler
 import com.shinku.aipassport.openclaw.protocol.vbEncodeFrame
-import com.shinku.aipassport.openclaw.stt.SpeechRecognizerStt
+import com.shinku.aipassport.openclaw.stt.SttFactory
 import com.shinku.aipassport.openclaw.tts.TtsEngine
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -44,13 +45,15 @@ class VoiceBridgeService : Service() {
         private const val CHANNEL_ID = "voice_bridge"
         private const val NOTIF_ID = 1
 
-        /** 固件固定 passkey(与固件 voice_bridge.c static_passkey=123456 一致) */
-        private const val STATIC_PASSKEY = "123456"
-
         const val ACTION_START = "com.shinku.aipassport.openclaw.action.START"
         const val ACTION_STOP = "com.shinku.aipassport.openclaw.action.STOP"
 
-        /** 状态广播(供 MainActivity 展示) */
+        /** 设备页:重新扫描/连接 */
+        const val ACTION_SCAN = "com.shinku.aipassport.openclaw.action.SCAN"
+        /** 设备页:断开当前设备 */
+        const val ACTION_DISCONNECT = "com.shinku.aipassport.openclaw.action.DISCONNECT"
+
+        /** 状态广播(供 UI 展示) */
         const val ACTION_STATUS = "com.shinku.aipassport.openclaw.action.STATUS"
         const val EXTRA_STATUS = "status"
 
@@ -81,10 +84,16 @@ class VoiceBridgeService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         // 前台服务被系统杀死后 START_STICKY 重启(intent 为 null)也要拉起桥
-        if (intent?.action == ACTION_STOP) {
-            stopSelf()
-        } else {
-            startBridge()
+        when (intent?.action) {
+            ACTION_STOP -> stopSelf()
+            ACTION_SCAN -> {
+                startBridge()
+                if (::ble.isInitialized) ble.rescan()
+            }
+            ACTION_DISCONNECT -> {
+                if (::ble.isInitialized) ble.stop()
+            }
+            else -> startBridge()
         }
         return START_STICKY
     }
@@ -117,7 +126,7 @@ class VoiceBridgeService : Service() {
 
         pipeline = VoicePipeline(
             scope = scope,
-            stt = SpeechRecognizerStt(this),
+            stt = SttFactory.create(this),
             gateway = gateway,
             tts = tts,
             sendText = { text -> sendTextFrame(text) },
@@ -126,7 +135,8 @@ class VoiceBridgeService : Service() {
 
         ble = BleCentral(
             context = this,
-            staticPasskey = STATIC_PASSKEY,
+            // 配对输入框弹在 App 前台 Activity 上(Service 无 window token 弹不了对话框)
+            pairingDialogContext = { AppActivity.current() },
             listener = object : BleCentral.Listener {
                 override fun onConnecting() = publishStatus("正在连接设备…")
                 override fun onConnected() = publishStatus("已连接,等待加密")

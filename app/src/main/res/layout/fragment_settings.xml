@@ -1,0 +1,121 @@
+<?xml version="1.0" encoding="utf-8"?>
+<ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:fillViewport="true"
+    android:background="#0F1220">
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="vertical"
+        android:padding="16dp">
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="网关设置"
+            android:textSize="16sp"
+            android:textStyle="bold"
+            android:textColor="#FFFFFF"
+            android:layout_marginBottom="8dp" />
+
+        <EditText
+            android:id="@+id/inputHost"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:hint="网关域名(如 hs0033439-openclaw.my.hiksemi.net)"
+            android:inputType="textUri"
+            android:autofillHints="url"
+            android:textColor="#FFFFFF"
+            android:textColorHint="#9E9E9E"
+            android:background="@drawable/bg_input"
+            android:padding="10dp" />
+
+        <EditText
+            android:id="@+id/inputPort"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:hint="端口(如 8035)"
+            android:inputType="number"
+            android:autofillHints="none"
+            android:textColor="#FFFFFF"
+            android:textColorHint="#9E9E9E"
+            android:background="@drawable/bg_input"
+            android:padding="10dp" />
+
+        <CheckBox
+            android:id="@+id/checkUseTls"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="使用 HTTPS/WSS"
+            android:textColor="#DDDDDD" />
+
+        <EditText
+            android:id="@+id/inputToken"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:hint="网关访问令牌(运行时 secret,只存本机)"
+            android:inputType="textPassword"
+            android:autofillHints="password"
+            android:textColor="#FFFFFF"
+            android:textColorHint="#9E9E9E"
+            android:background="@drawable/bg_input"
+            android:padding="10dp" />
+
+        <EditText
+            android:id="@+id/inputWsPath"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:hint="WS 对话路径(默认 /message/messages/ws)"
+            android:inputType="textUri"
+            android:autofillHints="none"
+            android:textColor="#FFFFFF"
+            android:textColorHint="#9E9E9E"
+            android:background="@drawable/bg_input"
+            android:padding="10dp" />
+
+        <Button
+            android:id="@+id/btnSave"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="保存网关设置" />
+
+        <Button
+            android:id="@+id/btnHealth"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="探活 /health" />
+
+        <Button
+            android:id="@+id/btnStartService"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="启动语音桥服务" />
+
+        <Button
+            android:id="@+id/btnStopService"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="停止语音桥服务" />
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="日志"
+            android:textSize="16sp"
+            android:textStyle="bold"
+            android:textColor="#FFFFFF"
+            android:layout_marginTop="16dp"
+            android:layout_marginBottom="4dp" />
+
+        <TextView
+            android:id="@+id/logText"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="(空)"
+            android:textSize="12sp"
+            android:typeface="monospace"
+            android:textColor="#9E9E9E" />
+    </LinearLayout>
+</ScrollView>

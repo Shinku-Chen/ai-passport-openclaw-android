@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:orientation="vertical"
+    android:background="#0F1220">
+
+    <TextView
+        android:id="@+id/devicesTitle"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="设备管理"
+        android:textSize="18sp"
+        android:textStyle="bold"
+        android:textColor="#FFFFFF"
+        android:padding="16dp" />
+
+    <Button
+        android:id="@+id/btnScan"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="扫描并连接设备"
+        android:layout_marginHorizontal="12dp"
+        android:layout_marginBottom="4dp" />
+
+    <Button
+        android:id="@+id/btnDisconnect"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="断开设备"
+        android:layout_marginHorizontal="12dp"
+        android:layout_marginBottom="8dp" />
+
+    <TextView
+        android:id="@+id/deviceStatusText"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="未连接"
+        android:textSize="13sp"
+        android:textColor="#DDDDDD"
+        android:paddingHorizontal="16dp"
+        android:paddingBottom="8dp" />
+
+    <androidx.recyclerview.widget.RecyclerView
+        android:id="@+id/deviceList"
+        android:layout_width="match_parent"
+        android:layout_height="0dp"
+        android:layout_weight="1"
+        android:paddingHorizontal="8dp" />
+</LinearLayout>

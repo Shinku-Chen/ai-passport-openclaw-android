@@ -6,28 +6,36 @@ import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.PackageManager
+import android.graphics.Color
 import android.os.Build
 import android.os.Bundle
 import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
+import androidx.fragment.app.Fragment
+import com.google.android.material.tabs.TabLayout
 import com.shinku.aipassport.openclaw.databinding.ActivityMainBinding
+import com.shinku.aipassport.openclaw.gateway.GatewayApi
 import com.shinku.aipassport.openclaw.gateway.GatewaySettings
 import com.shinku.aipassport.openclaw.service.VoiceBridgeService
+import com.shinku.aipassport.openclaw.ui.ChatFragment
+import com.shinku.aipassport.openclaw.ui.DevicesFragment
+import com.shinku.aipassport.openclaw.ui.NotificationsFragment
+import com.shinku.aipassport.openclaw.ui.OverviewFragment
+import com.shinku.aipassport.openclaw.ui.SettingsFragment
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
-import okhttp3.OkHttpClient
-import java.util.concurrent.TimeUnit
 
 /**
- * 主界面:网关设置区(域名+端口+token)+ 探活 /health + 启停语音桥 + 状态展示。
+ * 主界面:顶部网关连接状态卡片 + 5 个 Tab(对话/概览/设备/通知/设置)。
  *
- * 网关设置在 App 内配置,存 SharedPreferences(GatewaySettings),token 只存本机、不写死。
- * 业务逻辑仍在 VoiceBridgeService;此处负责设置与入口。
+ * 本地 OpenClaw 网关控制台 + 设备管理 + 通知同步 —— 对标原型 App 的本地子集,
+ * 不包含登录/账号/订阅/订单/云智能灯效(那是云套餐业务,本端不依赖)。
+ * 网关设置在"设置"Tab 内(域名+token 存 SharedPreferences,仅测试值预填,用户可改)。
  */
 class MainActivity : AppCompatActivity() {
 
@@ -49,21 +57,72 @@ class MainActivity : AppCompatActivity() {
         override fun onReceive(context: Context, intent: Intent) {
             val s = intent.getStringExtra(VoiceBridgeService.EXTRA_STATUS) ?: return
             binding.statusText.text = s
+            updateStatusDot(s)
         }
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        AppActivity.set(this)
         binding = ActivityMainBinding.inflate(layoutInflater)
         setContentView(binding.root)
         settings = GatewaySettings(this)
 
-        loadSettings()
+        setupTabs()
+        binding.btnRefreshStatus.setOnClickListener { refreshStatus() }
+        refreshStatus()
+    }
 
-        binding.btnSave.setOnClickListener { saveSettings() }
-        binding.btnHealth.setOnClickListener { probeHealth() }
-        binding.btnStart.setOnClickListener { startWithPermissions() }
-        binding.btnStop.setOnClickListener { VoiceBridgeService.stop(this) }
+    private fun setupTabs() {
+        binding.tabLayout.addOnTabSelectedListener(object : TabLayout.OnTabSelectedListener {
+            override fun onTabSelected(tab: TabLayout.Tab) {
+                showTab(tab.position)
+            }
+            override fun onTabUnselected(tab: TabLayout.Tab) {}
+            override fun onTabReselected(tab: TabLayout.Tab) {}
+        })
+        // 显式展示首个 Tab(XML TabItem 不会自动触发选中回调)
+        showTab(0)
+        binding.tabLayout.getTabAt(0)?.select()
+    }
+
+    private fun showTab(position: Int) {
+        supportFragmentManager.beginTransaction()
+            .replace(binding.fragmentContainer.id, createFragment(position), "tab_$position")
+            .commit()
+    }
+
+    private fun createFragment(position: Int): Fragment = when (position) {
+        0 -> ChatFragment()
+        1 -> OverviewFragment()
+        2 -> DevicesFragment()
+        3 -> NotificationsFragment()
+        else -> SettingsFragment()
+    }
+
+    private fun refreshStatus() {
+        binding.statusText.text = "探活中…"
+        binding.statusDot.background.setTint(Color.GRAY)
+        scope.launch {
+            val r = GatewayApi(settings).health()
+            if (r.ok) {
+                binding.statusText.text = "网关健康 (HTTP ${r.code}) — ${settings.host}:${settings.port}"
+                binding.statusDot.background.setTint(Color.GREEN)
+            } else {
+                binding.statusText.text = "网关不可达: ${r.body}"
+                binding.statusDot.background.setTint(Color.RED)
+            }
+        }
+    }
+
+    private fun updateStatusDot(status: String) {
+        val color = when {
+            status.contains("就绪") || status.contains("已加密") || status.contains("健康") -> Color.GREEN
+            status.contains("错误") || status.contains("失败") || status.contains("不可达") -> Color.RED
+            status.contains("连接") || status.contains("扫描") || status.contains("探活") -> Color.YELLOW
+            else -> Color.GRAY
+        }
+        binding.statusDot.background.setTint(color)
     }
 
     override fun onStart() {
@@ -92,70 +151,10 @@ class MainActivity : AppCompatActivity() {
     }
 
     override fun onDestroy() {
+        AppActivity.clear(this)
         scope.cancel()
         super.onDestroy()
     }
-
-    // ---- 设置 ----
-
-    private fun loadSettings() {
-        binding.inputHost.setText(settings.host.ifBlank { "hs0033439-openclaw.my.hiksemi.net" })
-        binding.inputPort.setText(settings.port)
-        binding.checkUseTls.isChecked = settings.useTls
-        binding.inputToken.setText(settings.token)
-    }
-
-    private fun saveSettings() {
-        val host = binding.inputHost.text.toString().trim()
-        val port = binding.inputPort.text.toString().trim()
-        val token = binding.inputToken.text.toString().trim()
-        if (host.isBlank() || port.isBlank()) {
-            Toast.makeText(this, "请填写网关域名和端口", Toast.LENGTH_SHORT).show()
-            return
-        }
-        settings.save(host, port, binding.checkUseTls.isChecked, token)
-        binding.statusText.text = "网关设置已保存"
-        Toast.makeText(this, "网关设置已保存", Toast.LENGTH_SHORT).show()
-    }
-
-    // ---- 探活 ----
-
-    private fun probeHealth() {
-        val host = binding.inputHost.text.toString().trim()
-        val port = binding.inputPort.text.toString().trim()
-        if (host.isBlank() || port.isBlank()) {
-            Toast.makeText(this, "请先填写网关域名和端口", Toast.LENGTH_SHORT).show()
-            return
-        }
-        binding.statusText.text = "探活中…"
-        scope.launch {
-            val result = withContext(Dispatchers.IO) { doProbe(host, port, binding.checkUseTls.isChecked) }
-            binding.statusText.text = result
-        }
-    }
-
-    private fun doProbe(host: String, port: String, useTls: Boolean): String {
-        return try {
-            val client = OkHttpClient.Builder()
-                .connectTimeout(8, TimeUnit.SECONDS)
-                .readTimeout(8, TimeUnit.SECONDS)
-                .build()
-            val url = "http${if (useTls) "s" else ""}://$host:$port/health"
-            val req = okhttp3.Request.Builder().url(url).get().build()
-            client.newCall(req).execute().use { resp ->
-                val body = resp.body?.string().orEmpty()
-                if (resp.isSuccessful) {
-                    "探活成功 /health ${resp.code}: $body"
-                } else {
-                    "探活失败 /health HTTP ${resp.code}"
-                }
-            }
-        } catch (e: Exception) {
-            "探活失败:${e.message}"
-        }
-    }
-
-    // ---- 权限与启动 ----
 
     private fun startWithPermissions() {
         val needed = mutableListOf<String>()

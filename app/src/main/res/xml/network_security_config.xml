@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<network-security-config>
+    <!--
+        网关域名为自建/自签 TLS(用户自建 OpenClaw 网关)。
+        仅为调试/个人使用放行该域名;正式发布不应信任自签证书。
+        域名从 App 设置读取,但这里的信任域需在构建时列出;
+        若用户网关域名变更,请在此处同步添加(或改用运行时 TrustManager)。
+    -->
+    <domain-config cleartextTrafficPermitted="false">
+        <domain includeSubdomains="false">hs0033439-openclaw.my.hiksemi.net</domain>
+        <trust-anchors>
+            <!-- 信任系统 CA(正常 HTTPS) -->
+            <certificates src="system" />
+        </trust-anchors>
+    </domain-config>
+</network-security-config>

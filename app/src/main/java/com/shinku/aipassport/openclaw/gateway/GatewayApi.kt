@@ -32,14 +32,14 @@ class GatewayApi(
 
     data class ApiResult(val ok: Boolean, val body: String, val code: Int)
 
-    /** 通用 GET;token 存在则带 Bearer。 */
+    /** 通用 GET;token 存在则带 Bearer。URL 构造失败/网络异常统一捕获,不崩溃。 */
     private fun get(path: String): ApiResult {
-        val url = GatewayConfig.baseUrl(settings) + path
-        val builder = Request.Builder().url(url).get()
-        if (settings.token.isNotBlank()) {
-            builder.header("Authorization", "Bearer ${settings.token}")
-        }
         return try {
+            val url = GatewayConfig.baseUrl(settings) + path
+            val builder = Request.Builder().url(url).get()
+            if (settings.token.isNotBlank()) {
+                builder.header("Authorization", "Bearer ${settings.token}")
+            }
             client.newCall(builder.build()).execute().use { resp ->
                 ApiResult(
                     ok = resp.isSuccessful,
@@ -48,6 +48,7 @@ class GatewayApi(
                 )
             }
         } catch (e: Exception) {
+            // 网关不可达/URL 非法/证书不信任:返回失败结果,不向 UI 抛异常。
             ApiResult(ok = false, body = "请求失败: ${e.message}", code = 0)
         }
     }

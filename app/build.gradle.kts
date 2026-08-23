@@ -54,4 +54,7 @@ dependencies {
 
     // ed25519 设备身份签名(OpenClaw 网关 connect 鉴权需要;minSdk 26 需第三方实现)
     implementation("org.bouncycastle:bcprov-jdk18on:1.78.1")
+
+    // Vosk 离线语音识别(消费设备 BLE PCM;模型需用户放入 filesDir 下 vosk-model-* 目录)
+    implementation("com.alphacephei:vosk-android:0.3.47")
 }

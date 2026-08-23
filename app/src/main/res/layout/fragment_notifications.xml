@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:orientation="vertical"
+    android:background="#0F1220">
+
+    <TextView
+        android:id="@+id/notificationsTitle"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="通知同步"
+        android:textSize="18sp"
+        android:textStyle="bold"
+        android:textColor="#FFFFFF"
+        android:padding="16dp" />
+
+    <Button
+        android:id="@+id/btnRefreshNotifications"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="刷新通知"
+        android:layout_marginHorizontal="12dp"
+        android:layout_marginBottom="8dp" />
+
+    <androidx.recyclerview.widget.RecyclerView
+        android:id="@+id/notificationList"
+        android:layout_width="match_parent"
+        android:layout_height="0dp"
+        android:layout_weight="1"
+        android:paddingHorizontal="8dp" />
+</LinearLayout>

@@ -10,6 +10,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import okhttp3.OkHttpClient
@@ -25,7 +26,7 @@ import java.util.concurrent.TimeUnit
  * OpenClaw 网关 WebSocket 客户端(文本输入 → 文本回复)。
  *
  * 实时协议(已对线上网关逐帧验证):
- *  1. 连接 wss://<host>:<port>/gateway/ws/agent?sessionKey=main
+ *  1. 连接 wss://<host>:<port><wsPath>?sessionKey=main(默认 /message/messages/ws,可配置)
  *     (带 Origin 头 = 网关自身 origin,否则 CONTROL_UI_ORIGIN_NOT_ALLOWED)
  *  2. 服务端发 connect.challenge{nonce};客户端回 connect:
  *     {type:"req", id:<uuid>, method:"connect", params:{minProtocol:4, maxProtocol:4,
@@ -171,8 +172,11 @@ class GatewayClient(
                             pendingNonce = obj.getAsJsonObject("payload")?.get("nonce")?.asString
                             sendConnect()
                         }
-                        "chat" -> handleChatEvent(obj)
+                        else -> handleReplyEvent(obj)
                     }
+                }
+                "response", "result", "message", "assistant.message" -> {
+                    handleReplyFrame(obj)
                 }
                 "res" -> {
                     val id = obj.get("id")?.asString ?: return
@@ -205,63 +209,47 @@ class GatewayClient(
     }
 
     private fun sendConnect() {
-        val signedAtMs = System.currentTimeMillis()
         val nonce = pendingNonce ?: UUID.randomUUID().toString()
-        val scopes = "operator.write"
-        // 镜像网关客户端 j():v2|<deviceId>|<clientId>|<clientMode>|<role>|<scopes>|<signedAtMs>|<token>|<nonce>
-        val signPayload = listOf(
-            "v2",
-            identity.deviceId,
-            "openclaw-android",
-            "webchat",
-            "operator",
-            scopes,
-            signedAtMs.toString(),
-            settings.token,
-            nonce,
-        ).joinToString("|")
-        val signature = identity.sign(signPayload)
-
+        val scopes = "operator.read"
+        // 实测确认:client.id=openclaw-control-ui + mode=webchat + protocol=4 走 token 优先鉴权
+        // (错误 token 返回 AUTH_TOKEN_MISMATCH;正确 token 即通过,无需设备配对签名)。
+        // 不携带 device 块(control-ui 路径 token 是唯一门禁)。
         val params = JsonObject().apply {
             addProperty("minProtocol", 4)
             addProperty("maxProtocol", 4)
             add("client", JsonObject().apply {
-                addProperty("id", "openclaw-android")
+                addProperty("id", "openclaw-control-ui")
                 addProperty("version", "0.1.0")
                 addProperty("platform", "android")
                 addProperty("mode", "webchat")
-                addProperty("instanceId", UUID.randomUUID().toString())
             })
             addProperty("role", "operator")
-            add("scopes", gson.toJsonTree(listOf(scopes)))
-            add("device", JsonObject().apply {
-                addProperty("id", identity.deviceId)
-                addProperty("publicKey", identity.publicKeyBase64)
-                addProperty("signature", signature)
-                addProperty("signedAt", signedAtMs)
-                addProperty("nonce", nonce)
-            })
-            add("caps", gson.toJsonTree(listOf("tool-events")))
+            add("scopes", gson.toJsonTree(listOf("operator.read", "operator.write")))
+            add("caps", gson.toJsonTree(emptyList<String>()))
+            add("commands", gson.toJsonTree(emptyList<String>()))
+            add("permissions", JsonObject())
             add("auth", JsonObject().apply {
-                // 设置里保存的网关 token;默认空。已配对设备用 deviceToken。
-                addProperty("token", identity.deviceToken.ifBlank { settings.token })
-                addProperty("password", "")
+                // 运行时注入的网关 token(设置页 SharedPreferences);默认空 → AUTH_TOKEN_MISSING
+                addProperty("token", settings.token)
             })
-            addProperty("userAgent", "ai-passport-android/0.1")
             addProperty("locale", "zh-CN")
+            addProperty("userAgent", "passport-android/0.1.0")
         }
         request("connect", params)?.let { deferred ->
             scope.launch {
                 val ok = withTimeoutOrNull(10_000) { deferred.await() } != null
                 connected = ok
-                if (!ok) Log.w(tag, "网关 connect 鉴权失败(未配对需主机批准设备)")
+                if (!ok) {
+                    Log.w(tag, "网关 connect 鉴权失败(检查 token 是否正确填写)")
+                    onStatus("网关鉴权失败:请在设置页检查 token")
+                }
             }
         }
     }
 
     // ---- chat.send 与回复收集 ----
 
-    private fun sendChat(text: String): String? {
+    private suspend fun sendChat(text: String): String? {
         val idempotency = UUID.randomUUID().toString()
         val params = JsonObject().apply {
             addProperty("sessionKey", GatewayConfig.SESSION_KEY)
@@ -274,7 +262,7 @@ class GatewayClient(
         return reply?.get("runId")?.asString
     }
 
-    private fun collectReply(runId: String?): String? {
+    private suspend fun collectReply(runId: String?): String? {
         val collector = ReplyCollector()
         collector.runId = runId
         activeCollector = collector
@@ -287,17 +275,67 @@ class GatewayClient(
         }
     }
 
-    private fun handleChatEvent(obj: JsonObject) {
+    /** 处理下行事件(event 包),按 OpenClaw 通用结构解析文本。 */
+    private fun handleReplyEvent(obj: JsonObject) {
         val payload = obj.getAsJsonObject("payload") ?: return
-        val state = payload.get("state")?.asString ?: return
+        handleReplyPayload(payload)
+    }
+
+    /** 处理非 event 类型下行帧(response/result/message/assistant.message)。 */
+    private fun handleReplyFrame(obj: JsonObject) {
+        handleReplyPayload(obj)
+    }
+
+    /**
+     * 从下行 payload 提取文本,兼容多种 OpenClaw 消息结构:
+     *  - {state:delta|final, message:{content}, runId}
+     *  - {message:{text}} / {text}
+     *  - {reply} / {response} / {answer} / {content}
+     *  - {choices:[{message:{content}}]}
+     */
+    private fun handleReplyPayload(payload: JsonObject) {
         val collector = activeCollector ?: return
         val evRunId = payload.get("runId")?.asString
         if (evRunId != null && collector.runId == null) collector.runId = evRunId
         if (collector.runId != null && evRunId != null && evRunId != collector.runId) return
-        val message = payload.getAsJsonObject("message")
-        val text = message?.get("content")?.asString
-        if (!text.isNullOrBlank()) collector.append(text)
-        if (state == "final") collector.finish()
+
+        val text = extractText(payload) ?: return
+        if (text.isNotBlank()) collector.append(text)
+
+        // 终结判定:state==final 或 isFinal/final==true 或 delta 不再出现
+        val state = payload.get("state")?.asString
+        val isFinal = payload.get("isFinal")?.asBoolean
+            ?: payload.get("final")?.asBoolean
+            ?: false
+        if (state == "final" || isFinal) collector.finish()
+    }
+
+    /** 尽量从各种结构的 JSON 里抠出文本。 */
+    private fun extractText(payload: JsonObject): String? {
+        // 1. {message:{content|text}}
+        payload.getAsJsonObject("message")?.let { m ->
+            m.get("content")?.takeIf { it.isJsonPrimitive }?.asString
+                ?.takeIf { it.isNotBlank() }?.let { return it }
+            m.get("text")?.takeIf { it.isJsonPrimitive }?.asString
+                ?.takeIf { it.isNotBlank() }?.let { return it }
+        }
+        // 2. {choices:[{message:{content}}]}
+        payload.getAsJsonArray("choices")?.let { choices ->
+            if (choices.size() > 0) {
+                val first = choices[0]
+                if (first.isJsonObject) {
+                    first.asJsonObject.getAsJsonObject("message")
+                        ?.get("content")?.takeIf { it.isJsonPrimitive }?.asString
+                        ?.takeIf { it.isNotBlank() }?.let { return it }
+                }
+            }
+        }
+        // 3. 顶层文本字段
+        listOf("text", "content", "reply", "response", "answer").forEach { k ->
+            payload.get(k)?.takeIf { it.isJsonPrimitive }?.asString
+                ?.takeIf { it.isNotBlank() }?.let { return it }
+        }
+        return null
     }
 
     // ---- 底层请求 ----
@@ -323,7 +361,7 @@ class GatewayClient(
         }
     }
 
-    private fun requestSync(method: String, params: JsonObject): JsonObject? {
+    private suspend fun requestSync(method: String, params: JsonObject): JsonObject? {
         val deferred = request(method, params) ?: return null
         return withTimeoutOrNull(GatewayConfig.TIMEOUT_SECONDS * 1000) { deferred.await() }
     }
