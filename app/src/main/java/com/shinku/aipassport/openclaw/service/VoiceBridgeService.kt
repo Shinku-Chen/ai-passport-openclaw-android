@@ -131,8 +131,10 @@ class VoiceBridgeService : Service() {
         pipeline = VoicePipeline(
             scope = scope,
             stt = SttFactory.create(this) { partial ->
-                // 流式识别中间结果:实时回传设备屏显示(role='U'),边说边显示。
-                scope.launch { sendTextFrame('U', partial) }
+                // 流式识别中间结果:不实时回传设备屏。小智识别会把多条 partial 连续回调,
+                // 若每条都 sendTextFrame('U') 上屏,设备会被海量 partial 淹没、状态卡在"接收中",
+                // 且覆盖最终的完整回复。识别文本最终由 onTurnEnd 的 sendText('U', text) 一次回传。
+                Log.d(TAG, "识别中间结果(不上屏): $partial")
             },
             gateway = gateway,
             tts = tts,
@@ -190,6 +192,7 @@ class VoiceBridgeService : Service() {
         payload[0] = role.code.toByte()
         System.arraycopy(body, 0, payload, 1, body.size)
         val frame = vbEncodeFrame(VbFrame.TYPE_TEXT, 0, payload)
+        Log.i(TAG, "sendTextFrame role=$role text=${text.take(30)} 字节=${frame.size}")
         ble.writeBytes(frame)
     }
 
