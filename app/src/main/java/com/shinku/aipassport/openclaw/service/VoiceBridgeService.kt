@@ -20,6 +20,7 @@ import com.shinku.aipassport.openclaw.ble.BleCentral
 import com.shinku.aipassport.openclaw.gateway.GatewayClient
 import com.shinku.aipassport.openclaw.gateway.GatewaySettings
 import com.shinku.aipassport.openclaw.pipeline.VoicePipeline
+import com.shinku.aipassport.openclaw.ui.ConversationStore
 import com.shinku.aipassport.openclaw.protocol.VbFrame
 import com.shinku.aipassport.openclaw.protocol.VbFrameReassembler
 import com.shinku.aipassport.openclaw.protocol.vbEncodeFrame
@@ -118,6 +119,9 @@ class VoiceBridgeService : Service() {
         initialized = true
         startForegroundCompat()
 
+        // 共享对话历史:硬件语音也要写入同一列表,供对话 Tab 实时展示
+        ConversationStore.init(this)
+
         gateway = GatewayClient(this, GatewaySettings(this)) { status -> publishStatus(status) }
         tts = TtsEngine(this)
 
@@ -145,6 +149,11 @@ class VoiceBridgeService : Service() {
                 // 帧处理统一投递到主线程 scope:保证帧重组 + 流水线在单线程上串行,
                 // STT(startTurn)/EVENT 起停/识别顺序确定,不因 BLE 回调线程而竞态。
                 override fun onBytesReceived(bytes: ByteArray) {
+                    // 调试:打印收到的 BLE 字节前 20 + 交给帧重组(定位帧边界错乱)
+                    if (bytes.isNotEmpty()) {
+                        val dbg = bytes.take(24).joinToString(" ") { "%02x".format(it) }
+                        Log.i(TAG, "BLE RX ${bytes.size}B: $dbg")
+                    }
                     scope.launch { reassembler.push(bytes) }
                 }
                 override fun onDisconnected() {

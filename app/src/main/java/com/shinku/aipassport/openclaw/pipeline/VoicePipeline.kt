@@ -8,6 +8,7 @@ import com.shinku.aipassport.openclaw.protocol.VbFrame
 import com.shinku.aipassport.openclaw.protocol.VbFrameData
 import com.shinku.aipassport.openclaw.stt.SttEngine
 import com.shinku.aipassport.openclaw.tts.TtsEngine
+import com.shinku.aipassport.openclaw.ui.ConversationStore
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -49,6 +50,9 @@ class VoicePipeline(
 
     /** 从帧重组器来的完整帧。 */
     fun handleFrame(frame: VbFrameData) {
+        // 调试:打印吐出的每帧 type + payload 前缀(定位帧重组错位)
+        val dbg = frame.payload.take(24).joinToString(" ") { "%02x".format(it) }
+        Log.i(tag, "帧 type=${frame.type} flags=${frame.flags} len=${frame.payload.size}: $dbg")
         when (frame.type) {
             VbFrame.TYPE_AUDIO -> handleAudio(frame.payload)
             VbFrame.TYPE_EVENT -> handleEvent(frame.payload)
@@ -127,6 +131,8 @@ class VoicePipeline(
             }
             Log.i(tag, "识别结果: $text")
             onState("识别: $text")
+            // 硬件语音也写入共享对话历史:让对话 Tab 能看到语音这一条
+            ConversationStore.add("user", text, ConversationStore.SOURCE_VOICE)
 
             val reply = gateway.chat(text)
             if (myTurn != turnId) return@launch
@@ -137,6 +143,7 @@ class VoicePipeline(
             }
             Log.i(tag, "网关回复: $reply")
             onState("回复: $reply")
+            ConversationStore.add("agent", reply, ConversationStore.SOURCE_VOICE)
             speak(reply)
         }
     }

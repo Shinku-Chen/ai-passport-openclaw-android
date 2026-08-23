@@ -9,32 +9,18 @@ import androidx.recyclerview.widget.RecyclerView
 import com.shinku.aipassport.openclaw.R
 
 /**
- * 聊天消息列表:用户/网关双向气泡。
+ * 聊天消息列表:用户/网关双向气泡,来源标记(语音/文字)。
+ * 数据完全由 [ConversationStore] 的 StateFlow 驱动——Adapter 只负责渲染,
+ * 每次 [setMessages] 全量刷新(历史 ≤200 条,成本可忽略),不做内存缓存。
  */
 class ChatAdapter : RecyclerView.Adapter<ChatAdapter.VH>() {
 
-    data class Message(val role: String, val text: String)
+    private var items: List<ConversationStore.Message> = emptyList()
 
-    private val items = mutableListOf<Message>()
-
-    fun currentMessages(): List<Message> = items.toList()
-
-    fun setMessages(list: List<Message>) {
-        items.clear()
-        items.addAll(list)
+    /** 用共享存储的最新历史整体刷新。 */
+    fun setMessages(list: List<ConversationStore.Message>) {
+        items = list
         notifyDataSetChanged()
-    }
-
-    fun add(role: String, text: String) {
-        items.add(Message(role, text))
-        notifyItemInserted(items.size - 1)
-    }
-
-    /** 把最后一条消息替换为给定文本(用于占位"…"→ 真实回复)。 */
-    fun replaceLast(text: String) {
-        if (items.isEmpty()) return
-        items[items.size - 1] = items[items.size - 1].copy(text = text)
-        notifyItemChanged(items.size - 1)
     }
 
     override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): VH {
@@ -48,7 +34,9 @@ class ChatAdapter : RecyclerView.Adapter<ChatAdapter.VH>() {
     override fun onBindViewHolder(holder: VH, position: Int) {
         val msg = items[position]
         val isUser = msg.role == "user"
-        holder.role.text = if (isUser) "我" else "网关"
+        // 来源标签:语音走硬件,文字走对话框——让用户一眼看出这条是"说"的还是"打字"的
+        val sourceLabel = if (msg.source == ConversationStore.SOURCE_VOICE) "语音" else "文字"
+        holder.role.text = if (isUser) "我($sourceLabel)" else "网关($sourceLabel)"
         holder.bubble.text = msg.text
         holder.bubble.setBackgroundResource(
             if (isUser) R.drawable.bg_bubble_user else R.drawable.bg_bubble_agent
