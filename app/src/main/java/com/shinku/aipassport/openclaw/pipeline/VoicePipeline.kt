@@ -56,6 +56,7 @@ class VoicePipeline(
         Log.i(tag, "帧 type=${frame.type} flags=${frame.flags} len=${frame.payload.size}: $dbg")
         when (frame.type) {
             VbFrame.TYPE_AUDIO -> handleAudio(frame.payload)
+            VbFrame.TYPE_OPUS -> handleAudio(frame.payload)   // Opus 帧也交给识别端(小智会转发)
             VbFrame.TYPE_EVENT -> handleEvent(frame.payload)
             VbFrame.TYPE_TEXT -> Log.d(tag, "设备回传文本(忽略): ${String(frame.payload, Charsets.UTF_8)}")
             VbFrame.TYPE_CONTROL -> Unit

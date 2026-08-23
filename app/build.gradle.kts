@@ -57,4 +57,8 @@ dependencies {
 
     // Vosk 离线语音识别(消费设备 BLE PCM;模型需用户放入 filesDir 下 vosk-model-* 目录)
     implementation("com.alphacephei:vosk-android:0.3.47")
+
+    // Opus 编码器(裸 Opus 帧输出) —— 小智识别必须收 16k Opus 帧;App 把设备 PCM 编成 Opus 上送。
+    // rifai/android-opus-codec 预编译 aar(libopus 1.3.1),已放 app/libs/opus.aar
+    implementation(files("libs/opus.aar"))
 }

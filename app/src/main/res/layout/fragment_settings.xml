@@ -102,6 +102,69 @@
         <TextView
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
+            android:text="小智识别(云端流式中文,替代 Vosk)"
+            android:textSize="16sp"
+            android:textStyle="bold"
+            android:textColor="#FFFFFF"
+            android:layout_marginTop="16dp"
+            android:layout_marginBottom="4dp" />
+
+        <EditText
+            android:id="@+id/inputXzUrl"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:hint="小智服务器地址(如 wss://api.tenclass.net/xiaozhi/v1/);留空则回退 Vosk"
+            android:inputType="textUri"
+            android:textColor="#FFFFFF"
+            android:textColorHint="#9E9E9E"
+            android:background="@drawable/bg_input"
+            android:padding="10dp" />
+
+        <EditText
+            android:id="@+id/inputXzToken"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:hint="小智 token(默认 test-token;正式可换自建 server 的 token)"
+            android:inputType="textPassword"
+            android:textColor="#FFFFFF"
+            android:textColorHint="#9E9E9E"
+            android:background="@drawable/bg_input"
+            android:padding="10dp" />
+
+        <Button
+            android:id="@+id/btnSaveXz"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="保存小智识别设置" />
+
+        <TextView
+            android:id="@+id/xzStatus"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text=""
+            android:textSize="12sp"
+            android:textColor="#4FC3F7"
+            android:padding="4dp" />
+
+        <Button
+            android:id="@+id/btnActivateXz"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="激活小智设备(首次需在 xiaozhi.me 绑定)" />
+
+        <TextView
+            android:id="@+id/xzActiveStatus"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text=""
+            android:textSize="12sp"
+            android:textColor="#9E9E9E"
+            android:padding="8dp"
+            android:background="@drawable/bg_input" />
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
             android:text="识别模型"
             android:textSize="16sp"
             android:textStyle="bold"

@@ -11,6 +11,7 @@ import com.shinku.aipassport.openclaw.gateway.GatewayApi
 import com.shinku.aipassport.openclaw.gateway.GatewaySettings
 import com.shinku.aipassport.openclaw.service.VoiceBridgeService
 import com.shinku.aipassport.openclaw.stt.ModelManager
+import com.shinku.aipassport.openclaw.stt.XiaozhiSettings
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -28,6 +29,7 @@ class SettingsFragment : Fragment() {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
 
     private lateinit var settings: GatewaySettings
+    private lateinit var xzSettings: XiaozhiSettings
 
     override fun onCreateView(
         inflater: LayoutInflater,
@@ -41,9 +43,12 @@ class SettingsFragment : Fragment() {
     override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
         super.onViewCreated(view, savedInstanceState)
         settings = GatewaySettings(requireContext())
+        xzSettings = XiaozhiSettings(requireContext())
         loadSettings()
 
         binding.btnSave.setOnClickListener { saveSettings() }
+        binding.btnSaveXz.setOnClickListener { saveXiaozhi() }
+        binding.btnActivateXz.setOnClickListener { activateXiaozhi() }
         binding.btnHealth.setOnClickListener { healthCheck() }
         binding.btnStartService.setOnClickListener { VoiceBridgeService.start(requireContext()) }
         binding.btnStopService.setOnClickListener { VoiceBridgeService.stop(requireContext()) }
@@ -107,6 +112,69 @@ class SettingsFragment : Fragment() {
         binding.checkUseTls.isChecked = settings.useTls
         binding.inputToken.setText(settings.token)
         binding.inputWsPath.setText(settings.wsPath)
+        // 小智识别配置
+        val url = xzSettings.serverUrl
+        binding.inputXzUrl.setText(url)
+        binding.inputXzToken.setText(xzSettings.token)
+        binding.xzStatus.text = if (url.isBlank()) "未启用小智,使用 Vosk 本地识别" else "已启用小智云端识别"
+    }
+
+    private fun activateXiaozhi() {
+        if (!xzSettings.enabled()) {
+            Toast.makeText(requireContext(), "请先填写并保存小智地址", Toast.LENGTH_SHORT).show()
+            return
+        }
+        binding.btnActivateXz.isEnabled = false
+        binding.xzActiveStatus.text = "正在请求小智 OTA/激活…"
+        log("小智激活:请求 OTA…")
+
+        // 设备蓝牙 MAC(小智 Device-Id 必须是真实设备 MAC;从 BleCentral 记住的地址读取)
+        val mac = bleCentralDeviceMac()
+        val activator = com.shinku.aipassport.openclaw.stt.XiaozhiActivator(
+            requireContext(), mac, xzSettings.otaUrl,
+        )
+        scope.launch {
+            val result = activator.activateAndPoll { code, msg ->
+                // 拿到绑定码 → 主线程展示,让用户去 xiaozhi.me 绑定
+                scope.launch {
+                    binding.xzActiveStatus.text = "请到 xiaozhi.me 登录→添加设备→输入绑定码:\n$code\n($msg)\n完成后自动检测…"
+                    log("请到 xiaozhi.me 输入绑定码 $code")
+                }
+            }
+            binding.btnActivateXz.isEnabled = true
+            if (result.activated) {
+                xzSettings.activated = true
+                xzSettings.wsUrl = result.wsUrl ?: ""
+                xzSettings.wsToken = result.wsToken ?: "test-token"
+                binding.xzActiveStatus.text = "激活成功!小智识别已可用"
+                log("小智激活成功,ws=${result.wsUrl}")
+                Toast.makeText(requireContext(), "激活成功,请重启语音桥服务", Toast.LENGTH_LONG).show()
+            } else {
+                binding.xzActiveStatus.text = result.detail ?: "激活失败"
+                log("小智激活失败: ${result.detail ?: result.message}")
+                Toast.makeText(requireContext(), result.detail ?: "激活失败", Toast.LENGTH_LONG).show()
+            }
+        }
+    }
+
+    /** 从 BleCentral 的 prefs 读取上次连接的设备蓝牙 MAC(小智激活用真实设备 MAC)。 */
+    private fun bleCentralDeviceMac(): String {
+        val p = requireContext().getSharedPreferences("ble_central", android.content.Context.MODE_PRIVATE)
+        return p.getString("last_device_addr", "") ?: ""
+    }
+
+    private fun saveXiaozhi() {
+        val url = binding.inputXzUrl.text.toString().trim()
+        val token = binding.inputXzToken.text.toString().trim()
+        xzSettings.save(url, token)
+        val msg = if (url.isBlank()) {
+            "已保存:未启用小智,回退 Vosk"
+        } else {
+            "已保存小智识别。重启语音桥服务生效"
+        }
+        log(msg)
+        binding.xzStatus.text = if (url.isBlank()) "未启用小智,使用 Vosk 本地识别" else "已启用小智云端识别"
+        Toast.makeText(requireContext(), msg, Toast.LENGTH_SHORT).show()
     }
 
     private fun saveSettings() {

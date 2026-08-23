@@ -22,6 +22,7 @@ object VbFrame {
     const val TYPE_TEXT = 0x02       // App→设备 UTF-8 文本,渲染到屏幕
     const val TYPE_CONTROL = 0x03    // App→设备 JSON 命令
     const val TYPE_EVENT = 0x04      // 设备→App JSON 事件
+    const val TYPE_OPUS = 0x05       // 设备→App Opus 帧(固件已编码),供小智识别
 
     // ---- FLAGS ----
     const val FLAG_MORE = 0x01       // 续帧

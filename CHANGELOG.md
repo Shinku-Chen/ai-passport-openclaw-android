@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- 接入小智(xiaozhi.me)云端流式中文识别替代 Vosk:App 作小智 WebSocket 客户端(manual 模式),
+  设备 BLE 送来的 16k PCM 在 App 经 libopus 编成 60ms Opus 帧上送,只取 `stt` 文本喂 OpenClaw 网关,
+  丢弃小智 llm/tts。新增 XiaozhiStt(WS+Opus 编码)、XiaozhiSettings(默认填官方 URL/`test-token`)、
+  XiaozhiActivator(OTA→绑定码→activate 轮询激活)、XiaozhiUtil(MAC 稳定派生 Client-Id)。
+  关键:Device-Id 用真实蓝牙 MAC、Client-Id 用 MAC 派生固定 UUID(v4)、首次需在 xiaozhi.me 网页
+  输入绑定码激活;SttFactory 配置小智则优先 XiaozhiStt 否则回退 Vosk。
 - 恢复 Vosk 离线 STT(设备麦克风 BLE PCM):VoskStt 消费固件 BLE 送来的 int16 mono 16k PCM,
   Model/Recognizer/sampleRate=16000;SttFactory 探测模型(Vosk 优先,模型缺失降级系统 SpeechRecognizer)。
   修正 Vosk 构建错误:Model(path) 构造、acceptWaveForm(pcm, size)。

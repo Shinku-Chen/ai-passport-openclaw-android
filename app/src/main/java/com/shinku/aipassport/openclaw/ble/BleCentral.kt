@@ -104,6 +104,9 @@ class BleCentral(
     private val lastDeviceAddr: String?
         get() = prefs.getString(KEY_LAST_DEVICE, null)
 
+    /** 供外部(如小智激活)读取上次连接的设备蓝牙 MAC。 */
+    fun lastConnectedAddr(): String? = lastDeviceAddr
+
     private fun rememberDevice(addr: String) {
         prefs.edit().putString(KEY_LAST_DEVICE, addr).apply()
     }
