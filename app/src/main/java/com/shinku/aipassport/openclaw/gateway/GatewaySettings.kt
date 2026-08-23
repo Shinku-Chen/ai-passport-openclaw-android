@@ -15,7 +15,8 @@ class GatewaySettings(context: Context) {
         context.getSharedPreferences("gateway_settings", Context.MODE_PRIVATE)
 
     var host: String
-        get() = prefs.getString(KEY_HOST, "") ?: ""
+        // 默认给自建网关域名(测试用),未在设置页保存时也能连;AI Passport 网关对讲主机。
+        get() = prefs.getString(KEY_HOST, DEFAULT_HOST) ?: DEFAULT_HOST
         set(value) = prefs.edit().putString(KEY_HOST, value.trim()).apply()
 
     var port: String
@@ -52,6 +53,8 @@ class GatewaySettings(context: Context) {
     }
 
     companion object {
+        /** 默认网关域名(自建 AI Passport OpenClaw 网关,测试用),未保存时也可连。 */
+        const val DEFAULT_HOST = "hs0033439-openclaw.my.hiksemi.net"
         private const val KEY_HOST = "gateway_host"
         private const val KEY_PORT = "gateway_port"
         private const val KEY_USE_TLS = "gateway_use_tls"
