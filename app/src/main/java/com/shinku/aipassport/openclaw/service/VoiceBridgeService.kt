@@ -145,7 +145,7 @@ class VoiceBridgeService : Service() {
                 override fun onConnecting() = publishStatus("正在连接设备…")
                 override fun onConnected() = publishStatus("已连接,等待加密")
                 override fun onEncrypted() = publishStatus("已加密")
-                override fun onReady() = publishStatus("就绪,按住设备 UP 说话")
+                override fun onReady() = publishStatus("就绪,长按设备 OK 说话")
                 // 帧处理统一投递到主线程 scope:保证帧重组 + 流水线在单线程上串行,
                 // STT(startTurn)/EVENT 起停/识别顺序确定,不因 BLE 回调线程而竞态。
                 override fun onBytesReceived(bytes: ByteArray) {
