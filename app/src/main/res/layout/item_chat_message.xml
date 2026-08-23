@@ -13,12 +13,19 @@
         android:textColor="#9E9E9E"
         android:paddingHorizontal="4dp" />
 
-    <TextView
-        android:id="@+id/chatBubble"
-        android:layout_width="wrap_content"
-        android:layout_height="wrap_content"
-        android:padding="12dp"
-        android:textSize="15sp"
-        android:lineSpacingExtra="2dp"
-        android:textIsSelectable="true" />
+    <!-- 气泡:用 FrameLayout 包裹以便按 role 左右对齐(用户右侧/网关左侧) -->
+    <FrameLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content">
+
+        <TextView
+            android:id="@+id/chatBubble"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:padding="12dp"
+            android:textSize="15sp"
+            android:lineSpacingExtra="2dp"
+            android:textIsSelectable="true"
+            android:layout_gravity="start" />
+    </FrameLayout>
 </LinearLayout>

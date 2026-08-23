@@ -92,7 +92,42 @@ class VbFrameReassembler(
                 need = frameLen - len
             }
 
-            // 等 payload
+            // 等 payload —— 关键:即使正攒一帧,也要监测 payload 里是否【嵌入了新帧头】。
+            // 固件在 AUDIO 帧发送中途可能插入 EVENT 帧(turn_end),此时 EVENT 的 6B 头
+            // 会紧跟 AUDIO 帧的某个 notify。若这里不切帧,EVENT 会被当成 AUDIO 的 payload
+            // 余量吞掉(App 收不到 turn_end → STT 永不 endTurn → 卡"发送中")。
+            // 这里扫描未处理字节中是否出现合法新帧头(magic + 合法type + 合理 len),
+            // 命中即丢弃当前半截帧、切到新帧重同步。AUDIO 里恰好出现 a5 5a + 合法type
+            // 概率 ~1/65536,且还需 len 合理,误切风险可忽略。
+            var cut = -1
+            var i = 0
+            while (i + 5 < n) {
+                val b0 = bytes[idx + i].toInt() and 0xFF
+                val b1 = bytes[idx + i + 1].toInt() and 0xFF
+                if (b0 == VbFrame.MAGIC0 && b1 == VbFrame.MAGIC1) {
+                    val t = bytes[idx + i + 2].toInt() and 0xFF
+                    // 只在检测到【非音频】的插入帧(EVENT/TEXT/CONTROL)时才切帧。
+                    // 固件不会在 AUDIO 帧里再嵌一个 AUDIO 帧,故仅当 type∈{2,3,4}
+                    // 且 len 合理才视为边界;避免 AUDIO payload 里偶发的 a5 5a+type=1
+                    // 被误切。turn_end 正是 EVENT(type=4),正是要救的场景。
+                    val okType = t == VbFrame.TYPE_TEXT || t == VbFrame.TYPE_CONTROL ||
+                        t == VbFrame.TYPE_EVENT
+                    val pl = ((bytes[idx + i + 4].toInt() and 0xFF) shl 8) or
+                        (bytes[idx + i + 5].toInt() and 0xFF)
+                    // EVENT 帧都很短(turn_start ~19B / turn_end ~34B);限制 ≤256 更安全,
+                    // 也避免把 AUDIO payload 中偶发的 a5 5a + type=2/3/4 + 大 len 误判。
+                    val okLen = pl <= 256
+                    if (okType && okLen) { cut = i; break }
+                }
+                i++
+            }
+            if (cut != -1) {
+                // 半截 frame(如果已有内容)先丢弃;跳到新帧头切帧
+                len = 0; need = 0; frameLen = 0; inFrame = false
+                idx += cut; n -= cut
+                continue
+            }
+
             val take = if (n < need) n else need
             System.arraycopy(bytes, idx, buf, len, take)
             len += take; idx += take; n -= take; need -= take

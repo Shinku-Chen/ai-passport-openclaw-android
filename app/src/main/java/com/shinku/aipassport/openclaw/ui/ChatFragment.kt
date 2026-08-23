@@ -8,6 +8,7 @@ import android.view.inputmethod.EditorInfo
 import androidx.fragment.app.Fragment
 import androidx.lifecycle.lifecycleScope
 import androidx.recyclerview.widget.LinearLayoutManager
+import com.shinku.aipassport.openclaw.R
 import com.shinku.aipassport.openclaw.databinding.FragmentChatBinding
 import com.shinku.aipassport.openclaw.gateway.GatewayClient
 import com.shinku.aipassport.openclaw.gateway.GatewaySettings
@@ -61,6 +62,17 @@ class ChatFragment : Fragment() {
         binding.btnSend.setOnClickListener { send() }
         binding.chatInput.setOnEditorActionListener { _, actionId, _ ->
             if (actionId == EditorInfo.IME_ACTION_SEND) { send(); true } else false
+        }
+
+        // 输入法弹出时把底部输入行抬到键盘上方(adjustResize 之外的兜底,横竖/沉浸都稳)。
+        // 监听 ime insets,把输入行 bottom 设为屏底减 ime 高度;聊天列表随之被压缩,输入框不被遮挡。
+        androidx.core.view.ViewCompat.setOnApplyWindowInsetsListener(view) { v, insets ->
+            val ime = insets.getInsets(androidx.core.view.WindowInsetsCompat.Type.ime())
+            val bars = insets.getInsets(androidx.core.view.WindowInsetsCompat.Type.systemBars())
+            // 输入行 bottom padding = ime 高度,列表受到足够空间
+            val inputRow = binding.root.findViewById<View>(R.id.chatInputRow)
+            inputRow?.setPadding(0, 0, 0, ime.bottom)
+            insets
         }
     }
 

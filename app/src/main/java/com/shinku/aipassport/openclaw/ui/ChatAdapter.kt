@@ -44,10 +44,10 @@ class ChatAdapter : RecyclerView.Adapter<ChatAdapter.VH>() {
         holder.bubble.setTextColor(
             ContextCompat.getColor(holder.bubble.context, android.R.color.white)
         )
-        val lp = holder.bubble.layoutParams as ViewGroup.MarginLayoutParams
-        lp.marginStart = if (isUser) 80.dp(holder.itemView) else 0
-        lp.marginEnd = if (isUser) 0 else 80.dp(holder.itemView)
-        holder.bubble.layoutParams = lp
+        // 气泡左右对齐:用户消息靠右、网关消息靠左(通过 FrameLayout 的 layout_gravity)
+        val flp = holder.bubble.layoutParams as android.widget.FrameLayout.LayoutParams
+        flp.gravity = if (isUser) android.view.Gravity.END else android.view.Gravity.START
+        holder.bubble.layoutParams = flp
     }
 
     private fun Int.dp(view: View): Int =
