@@ -313,15 +313,17 @@ class BleCentral(
 
     /** 把一帧字节(已含帧头+payload)写入 RX 特征。 */
     fun writeBytes(data: ByteArray) {
-        val g = gatt ?: return
-        val service = g.getService(BleNus.SERVICE_UUID) ?: return
-        val rx = service.getCharacteristic(BleNus.RX_UUID) ?: return
+        val g = gatt ?: run { Log.w(tag, "writeBytes: gatt 为 null,丢弃"); return }
+        val service = g.getService(BleNus.SERVICE_UUID) ?: run { Log.w(tag, "writeBytes: 未找到 NUS 服务,丢弃"); return }
+        val rx = service.getCharacteristic(BleNus.RX_UUID) ?: run { Log.w(tag, "writeBytes: 未找到 RX 特征,丢弃"); return }
+        Log.i(tag, "writeBytes 开始: 字节=${data.size}")
         bleHandler.post {
             if (data.size <= WRITE_CHUNK) {
-                try { writeOne(rx, data) }
+                try { writeOne(rx, data); Log.i(tag, "writeBytes 完成 writeOne 字节=${data.size}") }
                 catch (e: Exception) { Log.e(tag, "写 RX 失败", e) }
             } else {
                 // 超 MTU 单写限 → 分片串行写(固件帧重组器按 frame magic+len 重组)
+                Log.i(tag, "writeBytes 分片写 字节=${data.size}")
                 writeChunked(rx, data)
             }
         }
