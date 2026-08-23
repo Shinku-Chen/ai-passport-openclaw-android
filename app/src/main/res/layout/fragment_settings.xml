@@ -120,16 +120,17 @@
             android:background="@drawable/bg_input" />
 
         <Button
-            android:id="@+id/btnDownloadSmall"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:text="下载 small 模型(44MB)" />
-
-        <Button
             android:id="@+id/btnDownloadLarge"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:text="下载 large 模型(1.3GB,提升识别率)" />
+
+        <Spinner
+            android:id="@+id/modelHostSpinner"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:padding="8dp"
+            android:background="@drawable/bg_input" />
 
         <TextView
             android:id="@+id/modelProgress"

@@ -48,11 +48,17 @@ class SettingsFragment : Fragment() {
         binding.btnStartService.setOnClickListener { VoiceBridgeService.start(requireContext()) }
         binding.btnStopService.setOnClickListener { VoiceBridgeService.stop(requireContext()) }
 
-        binding.btnDownloadSmall.setOnClickListener {
-            downloadModel("small", ModelManager.SMALL_URL)
-        }
+        // large 模型:host 下拉列表(多个镜像)供用户选择,再点下载
+        val hostLabels = ModelManager.LARGE_HOSTS.map { it.first }
+        binding.modelHostSpinner.adapter = android.widget.ArrayAdapter(
+            requireContext(),
+            android.R.layout.simple_spinner_item,
+            hostLabels,
+        ).apply { setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item) }
         binding.btnDownloadLarge.setOnClickListener {
-            downloadModel("large", ModelManager.LARGE_URL)
+            val idx = binding.modelHostSpinner.selectedItemPosition
+            val (hostLabel, hostUrl) = ModelManager.LARGE_HOSTS[idx]
+            downloadModel(hostLabel, hostUrl)
         }
         refreshModelStatus()
     }
@@ -68,7 +74,6 @@ class SettingsFragment : Fragment() {
 
     private fun downloadModel(label: String, url: String) {
         // 禁用按钮防并发;进度显示
-        binding.btnDownloadSmall.isEnabled = false
         binding.btnDownloadLarge.isEnabled = false
         binding.modelProgress.text = "下载 $label 模型中…"
         log("开始下载 $label 模型…")
@@ -82,7 +87,6 @@ class SettingsFragment : Fragment() {
                 onDone = { modelDir ->
                     binding.modelProgress.text = "下载 $label 模型完成"
                     log("下载 $label 模型完成: ${modelDir.name}")
-                    binding.btnDownloadSmall.isEnabled = true
                     binding.btnDownloadLarge.isEnabled = true
                     refreshModelStatus()
                     Toast.makeText(requireContext(), "模型已就绪,请点「停止服务」再「启动服务」生效", Toast.LENGTH_LONG).show()
@@ -90,9 +94,8 @@ class SettingsFragment : Fragment() {
                 onError = { msg ->
                     binding.modelProgress.text = "下载 $label 模型失败"
                     log("下载 $label 模型失败: $msg")
-                    binding.btnDownloadSmall.isEnabled = true
                     binding.btnDownloadLarge.isEnabled = true
-                    Toast.makeText(requireContext(), "下载 $label 模型失败: $msg", Toast.LENGTH_LONG).show()
+                    Toast.makeText(requireContext(), "下载 $label 模型失败:$msg,可换 host 重试", Toast.LENGTH_LONG).show()
                 },
             )
         }
