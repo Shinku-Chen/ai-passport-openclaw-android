@@ -247,6 +247,7 @@ class BleCentral(
             characteristic: BluetoothGattCharacteristic,
             status: Int,
         ) {
+            bleHandler.post { finishWriteCallback(status) }
             if (status == BluetoothGatt.GATT_INSUFFICIENT_AUTHENTICATION ||
                 status == BluetoothGatt.GATT_INSUFFICIENT_ENCRYPTION
             ) {
