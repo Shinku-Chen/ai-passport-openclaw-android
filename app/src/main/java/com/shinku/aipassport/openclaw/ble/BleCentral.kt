@@ -107,6 +107,9 @@ class BleCentral(
     /** 供外部(如小智激活)读取上次连接的设备蓝牙 MAC。 */
     fun lastConnectedAddr(): String? = lastDeviceAddr
 
+    /** BLE 是否当前已连接(供连接监控器定时检测)。 */
+    fun isConnected(): Boolean = gatt != null
+
     private fun rememberDevice(addr: String) {
         prefs.edit().putString(KEY_LAST_DEVICE, addr).apply()
     }

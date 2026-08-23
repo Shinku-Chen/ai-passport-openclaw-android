@@ -86,6 +86,9 @@ class XiaozhiStt(
     override val isAvailable: Boolean
         get() = serverUrl.isNotBlank()
 
+    /** 小智 websocket 是否当前活跃连接(供连接监控器定时检测)。 */
+    fun isConnected(): Boolean = ws != null
+
     override fun startTurn() {
         // 确保连接 + 发 hello;成功后发 listen.start。若失败,置 listening=false,endTurn 返回 null。
         listening = false

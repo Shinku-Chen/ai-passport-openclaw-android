@@ -180,6 +180,34 @@ class VoiceBridgeService : Service() {
 
         pipeline.prewarm()
         ble.start()
+        startConnectionMonitor()
+    }
+
+    // ---- 连接监控:定时检测设备(BLE)+ 小智 连接,断则及时重连 ----
+
+    private var monitorJob: kotlinx.coroutines.Job? = null
+
+    private fun startConnectionMonitor() {
+        monitorJob?.cancel()
+        monitorJob = scope.launch {
+            try {
+                while (true) {
+                    kotlinx.coroutines.delay(6_000)
+                    try {
+                        // 设备(BLE)连接检测:若断,触发重连(自动重连上次设备)。
+                        if (!ble.isConnected()) {
+                            Log.w(TAG, "连接监控: 设备 BLE 已断开,触发重连")
+                            publishStatus("设备断开,自动重连…")
+                            ble.rescan()
+                        }
+                    } catch (e: Exception) {
+                        Log.e(TAG, "连接监控异常", e)
+                    }
+                }
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                // 服务停止时取消监控循环
+            }
+        }
     }
 
     // ---- 数据出口 ----
