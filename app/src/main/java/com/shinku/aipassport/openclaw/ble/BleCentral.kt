@@ -11,6 +11,7 @@ import android.bluetooth.BluetoothGattCharacteristic
 import android.bluetooth.BluetoothGattDescriptor
 import android.bluetooth.BluetoothManager
 import android.bluetooth.BluetoothProfile
+import android.bluetooth.BluetoothStatusCodes
 import android.bluetooth.le.BluetoothLeScanner
 import android.bluetooth.le.ScanCallback
 import android.bluetooth.le.ScanFilter
@@ -314,49 +315,115 @@ class BleCentral(
     /** 单次 ATT 写安全片长(MTU256-3≈253,留余量用 240)。 */
     private val WRITE_CHUNK = 240
 
-    /** 把一帧字节(已含帧头+payload)写入 RX 特征。 */
+    /** 所有 App→设备逻辑帧共用串行队列,避免长回复分片交错。 */
+    private val writeQueue = ArrayDeque<ByteArray>()
+    private var currentWrite: ByteArray? = null
+    private var currentOffset = 0
+    private var writeInProgress = false
+    private var writeGeneration = 0L
+    private var pendingWriteContinuation: ((Int) -> Unit)? = null
+    private var pendingWriteTimeout: Runnable? = null
+
+    /** 把一帧完整字节加入队列,同一帧的所有切片连续发送。 */
     fun writeBytes(data: ByteArray) {
-        val g = gatt ?: run { Log.w(tag, "writeBytes: gatt 为 null,丢弃"); return }
-        val service = g.getService(BleNus.SERVICE_UUID) ?: run { Log.w(tag, "writeBytes: 未找到 NUS 服务,丢弃"); return }
-        val rx = service.getCharacteristic(BleNus.RX_UUID) ?: run { Log.w(tag, "writeBytes: 未找到 RX 特征,丢弃"); return }
-        Log.i(tag, "writeBytes 开始: 字节=${data.size}")
         bleHandler.post {
-            if (data.size <= WRITE_CHUNK) {
-                try { writeOne(rx, data); Log.i(tag, "writeBytes 完成 writeOne 字节=${data.size}") }
-                catch (e: Exception) { Log.e(tag, "写 RX 失败", e) }
+            if (gatt == null) {
+                Log.w(tag, "writeBytes: gatt 为 null,丢弃")
+                return@post
+            }
+            writeQueue.addLast(data.copyOf())
+            Log.i(tag, "writeBytes 入队 字节=${data.size} 队列=${writeQueue.size}")
+            pumpWriteQueue()
+        }
+    }
+
+    /** 回复中重新 PTT 时丢弃旧的未发送帧,避免旧 A 分片占用 GATT。 */
+    fun clearPendingWrites() {
+        bleHandler.post {
+            writeQueue.clear()
+            currentWrite = null
+            currentOffset = 0
+            writeInProgress = false
+            pendingWriteContinuation = null
+            pendingWriteTimeout?.let { bleHandler.removeCallbacks(it) }
+            pendingWriteTimeout = null
+            writeGeneration++
+            Log.i(tag, "清理 BLE 待写队列 generation=$writeGeneration")
+        }
+    }
+
+    /** 由 GATT 写回调推进当前逻辑帧。 */
+    private fun finishWriteCallback(status: Int) {
+        pendingWriteTimeout?.let { bleHandler.removeCallbacks(it) }
+        pendingWriteTimeout = null
+        val continuation = pendingWriteContinuation
+        pendingWriteContinuation = null
+        continuation?.invoke(status)
+    }
+
+    /** 按完整逻辑帧串行切片,每片等待 onCharacteristicWrite 回调。 */
+    private fun pumpWriteQueue() {
+        if (writeInProgress) return
+        if (currentWrite == null) {
+            currentWrite = writeQueue.removeFirstOrNull() ?: return
+            currentOffset = 0
+        }
+        val g = gatt ?: run { currentWrite = null; return }
+        val service = g.getService(BleNus.SERVICE_UUID) ?: run { currentWrite = null; return }
+        val rx = service.getCharacteristic(BleNus.RX_UUID) ?: run { currentWrite = null; return }
+        val frame = currentWrite ?: return
+        if (currentOffset >= frame.size) {
+            Log.i(tag, "writeBytes 逻辑帧完成 字节=${frame.size}")
+            currentWrite = null
+            pumpWriteQueue()
+            return
+        }
+
+        val end = minOf(currentOffset + WRITE_CHUNK, frame.size)
+        val slice = frame.copyOfRange(currentOffset, end)
+        val offset = currentOffset
+        currentOffset = end
+        if (!writeOne(rx, slice)) {
+            Log.e(tag, "GATT 写入调用失败 offset=$offset/${frame.size}")
+            currentWrite = null
+            pumpWriteQueue()
+            return
+        }
+        writeInProgress = true
+        pendingWriteContinuation = { status ->
+            writeInProgress = false
+            if (status == BluetoothGatt.GATT_SUCCESS) {
+                pumpWriteQueue()
             } else {
-                // 超 MTU 单写限 → 分片串行写(固件帧重组器按 frame magic+len 重组)
-                Log.i(tag, "writeBytes 分片写 字节=${data.size}")
-                writeChunked(rx, data)
+                Log.e(tag, "GATT 写失败 status=$status offset=$offset/${frame.size}")
+                currentWrite = null
+                currentOffset = 0
+                pumpWriteQueue()
             }
         }
-    }
-
-    // 长帧分片串行写:wa 用延迟串行,避免 GATT 并发写冲突。
-    private fun writeChunked(rx: BluetoothGattCharacteristic, data: ByteArray) {
-        var off = 0
-        val pending = data.size
-        fun sendSlice() {
-            if (off >= pending) return
-            val end = minOf(off + WRITE_CHUNK, pending)
-            val slice = data.copyOfRange(off, end)
-            off = end
-            try { writeOne(rx, slice) } catch (e: Exception) { Log.e(tag, "写 RX 分片失败", e); return }
-            if (off < pending) {
-                bleHandler.postDelayed({ sendSlice() }, 12)   // 12ms 间隔发下一片(提速,避免回复同步慢)
+        val timeout = Runnable {
+            if (writeInProgress) {
+                Log.e(tag, "GATT 写回调超时 offset=$offset/${frame.size}")
+                finishWriteCallback(BluetoothGatt.GATT_FAILURE)
             }
         }
-        sendSlice()
+        pendingWriteTimeout = timeout
+        bleHandler.postDelayed(timeout, 500)
     }
 
-    private fun writeOne(rx: BluetoothGattCharacteristic, data: ByteArray) {
-        if (Build.VERSION.SDK_INT >= 33) {
-            gatt?.writeCharacteristic(rx, data, BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT)
-        } else {
-            @Suppress("DEPRECATION")
-            rx.value = data
-            @Suppress("DEPRECATION")
-            gatt?.writeCharacteristic(rx)
+    private fun writeOne(rx: BluetoothGattCharacteristic, data: ByteArray): Boolean {
+        return try {
+            if (Build.VERSION.SDK_INT >= 33) {
+                gatt?.writeCharacteristic(rx, data, BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT) == BluetoothStatusCodes.SUCCESS
+            } else {
+                @Suppress("DEPRECATION")
+                rx.value = data
+                @Suppress("DEPRECATION")
+                gatt?.writeCharacteristic(rx) == true
+            }
+        } catch (e: Exception) {
+            Log.e(tag, "writeCharacteristic 异常", e)
+            false
         }
     }
 

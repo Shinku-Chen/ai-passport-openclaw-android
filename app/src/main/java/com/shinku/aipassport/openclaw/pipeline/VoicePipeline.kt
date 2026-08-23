@@ -34,6 +34,7 @@ class VoicePipeline(
     /** 回传 TEXT 帧给固件上屏。role: 'U'=用户语音识别文本,'A'=网关回复。 */
     private val sendText: (role: Char, text: String) -> Unit,
     private val onState: (String) -> Unit,
+    private val clearPendingWrites: () -> Unit = {},
 ) {
     private val tag = "VoicePipeline"
     private val gson = Gson()
@@ -118,6 +119,7 @@ class VoicePipeline(
         tts.stop()
         stt.barge()
         gateway.interruptCurrent()
+        clearPendingWrites()
         stt.startTurn()
         onState("录音中…")
     }

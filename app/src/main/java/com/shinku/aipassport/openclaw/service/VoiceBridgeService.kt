@@ -140,6 +140,7 @@ class VoiceBridgeService : Service() {
             tts = tts,
             sendText = { role, text -> sendTextFrame(role, text) },
             onState = { status -> publishStatus(status) },
+            clearPendingWrites = { ble.clearPendingWrites() },
         )
 
         ble = BleCentral(
