@@ -28,7 +28,9 @@ class GatewaySettings(context: Context) {
         set(value) = prefs.edit().putBoolean(KEY_USE_TLS, value).apply()
 
     var token: String
-        get() = prefs.getString(KEY_TOKEN, "") ?: ""
+        // 测试用:默认填入自建网关 token(用户之前要求暂时填充,方便联调)。
+        // 注意:此默认值会随代码入库,测试完成后应从 DEFAULT_TOKEN 移除该值(改回空串)+ 删除本注释。
+        get() = prefs.getString(KEY_TOKEN, DEFAULT_TOKEN) ?: DEFAULT_TOKEN
         set(value) = prefs.edit().putString(KEY_TOKEN, value.trim()).apply()
 
     /** WebSocket 对话路径(OpenClaw 网关,实测 /message/messages/ws、/ws 均接受升级)。可配置。 */
@@ -55,6 +57,8 @@ class GatewaySettings(context: Context) {
     companion object {
         /** 默认网关域名(自建 AI Passport OpenClaw 网关,测试用),未保存时也可连。 */
         const val DEFAULT_HOST = "hs0033439-openclaw.my.hiksemi.net"
+        /** 测试用默认 token(用户要求暂时填充)。测试完成后改回空串并删除本常量。 */
+        const val DEFAULT_TOKEN = "3ztbj2vlzyh8hvktwwg9ra1tlslq9r8ppxpgr1g34op5mptr"
         private const val KEY_HOST = "gateway_host"
         private const val KEY_PORT = "gateway_port"
         private const val KEY_USE_TLS = "gateway_use_tls"
