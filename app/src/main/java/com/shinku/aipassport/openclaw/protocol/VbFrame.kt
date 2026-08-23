@@ -3,12 +3,19 @@ package com.shinku.aipassport.openclaw.protocol
 /**
  * 语音对讲桥帧协议 —— 与固件 main/voice_bridge_frame.h 完全一致。
  *
- * 每帧 = [TYPE:1B][FLAGS:1B][LEN:uint16 大端] + payload(LEN 字节),共 4+LEN 字节。
- * 接收端跨 BLE notify 重组:攒到 >=4 读 LEN,再攒到 4+LEN 才吐帧;无分隔符,
- * 音频字节永不被误当控制。
+ * 每帧 = [MAGIC0][MAGIC1][TYPE:1B][FLAGS:1B][LEN:uint16 大端] + payload(LEN 字节),共 6+LEN 字节。
+ * 接收端跨 BLE notify 重组:先找 magic(0xA5 0x5A)对齐帧边界,再读 LEN,凑齐 6+LEN 才吐帧。
+ *
+ * 为什么加 magic:旧协议只有 1B type(0x01-0x04),而 PCM 采样字节大量等于这些值。
+ * 一旦任何单字节失步(丢 notify / 分片错位),接收端会把 PCM 里恰好等于 0x01-0x04 的字节
+ * 当成帧头,永久锁死(表现为 flags=201/172/255 等伪帧)。magic 0xA5 0x5A 在随机数据中
+ * 出现的概率约 1/65536,几乎不会与音频/JSON 混淆,接收端凭它可靠重同步;type 仅作辅助校验。
+ * 同时 AUDIO 帧 payload 固定为 1024B,长度不符的帧一律丢弃,确保脏数据不进 STT。
  */
 object VbFrame {
-    const val HEADER_SIZE = 4
+    const val MAGIC0 = 0xA5
+    const val MAGIC1 = 0x5A
+    const val HEADER_SIZE = 6
 
     // ---- 帧类型 ----
     const val TYPE_AUDIO = 0x01      // 设备→App 原始 PCM int16 mono 16k
@@ -24,7 +31,7 @@ object VbFrame {
     // ---- 常量 ----
     const val AUDIO_CHUNK_SAMPLES = 512
     const val AUDIO_CHUNK_BYTES = AUDIO_CHUNK_SAMPLES * 2   // 1024B
-    const val MAX_FRAME = HEADER_SIZE + AUDIO_CHUNK_BYTES   // 1028B
+    const val MAX_FRAME = HEADER_SIZE + AUDIO_CHUNK_BYTES   // 6 + 1024 = 1030B
 }
 
 /**
@@ -54,22 +61,35 @@ class VbFrameReassembler(
         var idx = 0
         while (n > 0) {
             if (!inFrame) {
-                // 等帧头(4 字节)
+                // 等帧头(magic + type/flags/len 共 6 字节)。未凑齐前逐字节扫描 magic 重同步:
+                // 只要 buf 头两字节不是 magic,就丢弃 1 字节继续找,不信任 PCM/JSON 里的伪帧头。
                 val want = VbFrame.HEADER_SIZE - len
                 val take = if (n < want) n else want
                 System.arraycopy(bytes, idx, buf, len, take)
                 len += take; idx += take; n -= take
-                if (len < VbFrame.HEADER_SIZE) break
+                if (len < 2) continue
 
-                val payloadLen = ((buf[2].toInt() and 0xFF) shl 8) or (buf[3].toInt() and 0xFF)
+                // 找 magic 前缀
+                while (true) {
+                    if ((buf[0].toInt() and 0xFF) == VbFrame.MAGIC0 &&
+                        (buf[1].toInt() and 0xFF) == VbFrame.MAGIC1) break
+                    if (len <= 1) { len = 0; break }
+                    System.arraycopy(buf, 1, buf, 0, len - 1)
+                    len -= 1
+                }
+                if (len == 0) continue          // 还在找 magic,原有剩余不足
+                if (len < VbFrame.HEADER_SIZE) continue   // 帧头还没凑齐
+
+                val payloadLen = ((buf[4].toInt() and 0xFF) shl 8) or (buf[5].toInt() and 0xFF)
                 frameLen = VbFrame.HEADER_SIZE + payloadLen
-                inFrame = true
-                need = frameLen - len
-                if (frameLen > buf.size) {
-                    // 异常帧:丢弃
-                    len = 0; inFrame = false; need = 0; frameLen = 0
+                if (frameLen > buf.size || payloadLen > VbFrame.AUDIO_CHUNK_BYTES) {
+                    // 异常帧长:即便 magic 命中,超界仍说明错位 → 丢弃头字节继续找下一个 magic
+                    System.arraycopy(buf, 1, buf, 0, len - 1)
+                    len -= 1
                     continue
                 }
+                inFrame = true
+                need = frameLen - len
             }
 
             // 等 payload
@@ -78,8 +98,9 @@ class VbFrameReassembler(
             len += take; idx += take; n -= take; need -= take
 
             if (need == 0) {
-                val type = buf[0].toInt() and 0xFF
-                val flags = buf[1].toInt() and 0xFF
+                // 完整帧:type/flags 在 buf 的 magic 之后(offset 2/3)
+                val type = buf[2].toInt() and 0xFF
+                val flags = buf[3].toInt() and 0xFF
                 val p = ByteArray(frameLen - VbFrame.HEADER_SIZE)
                 System.arraycopy(buf, VbFrame.HEADER_SIZE, p, 0, p.size)
                 onFrame(VbFrameData(type, flags, p))
@@ -99,10 +120,12 @@ class VbFrameReassembler(
 fun vbEncodeFrame(type: Int, flags: Int, payload: ByteArray): ByteArray {
     val total = VbFrame.HEADER_SIZE + payload.size
     val out = ByteArray(total)
-    out[0] = type.toByte()
-    out[1] = flags.toByte()
-    out[2] = ((payload.size shr 8) and 0xFF).toByte()
-    out[3] = (payload.size and 0xFF).toByte()
+    out[0] = VbFrame.MAGIC0.toByte()
+    out[1] = VbFrame.MAGIC1.toByte()
+    out[2] = type.toByte()
+    out[3] = flags.toByte()
+    out[4] = ((payload.size shr 8) and 0xFF).toByte()
+    out[5] = (payload.size and 0xFF).toByte()
     System.arraycopy(payload, 0, out, VbFrame.HEADER_SIZE, payload.size)
     return out
 }
