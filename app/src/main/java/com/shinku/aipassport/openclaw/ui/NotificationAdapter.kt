@@ -32,7 +32,7 @@ class NotificationAdapter : RecyclerView.Adapter<NotificationAdapter.VH>() {
     override fun onBindViewHolder(holder: VH, position: Int) {
         val n = items[position]
         holder.title.text = n.title
-        holder.detail.text = n.detail
+        holder.detail.text = if (n.app.isNotBlank()) "${n.app}  ${n.detail}".trim() else n.detail
         holder.time.text = n.time
     }
 

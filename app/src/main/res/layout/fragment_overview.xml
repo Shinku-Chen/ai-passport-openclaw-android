@@ -1,88 +1,183 @@
 <?xml version="1.0" encoding="utf-8"?>
-<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+<ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
-    android:orientation="vertical"
-    android:background="#0F1220">
+    android:background="#0F1220"
+    android:fillViewport="true">
 
-    <TextView
-        android:id="@+id/overviewTitle"
+    <LinearLayout
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:text="Agent / 概览"
-        android:textSize="18sp"
-        android:textStyle="bold"
-        android:textColor="#FFFFFF"
-        android:padding="16dp" />
+        android:orientation="vertical"
+        android:paddingBottom="16dp">
 
-    <androidx.recyclerview.widget.RecyclerView
-        android:id="@+id/agentList"
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:paddingHorizontal="8dp"
-        android:nestedScrollingEnabled="false" />
+        <TextView
+            android:id="@+id/overviewTitle"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="网关控制台"
+            android:textSize="18sp"
+            android:textStyle="bold"
+            android:textColor="#FFFFFF"
+            android:padding="16dp" />
 
-    <TextView
-        android:id="@+id/labelModels"
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:text="模型"
-        android:textSize="15sp"
-        android:textStyle="bold"
-        android:textColor="#4FC3F7"
-        android:padding="12dp" />
+        <Button
+            android:id="@+id/btnRefreshOverview"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="刷新控制台"
+            android:layout_marginHorizontal="12dp" />
 
-    <TextView
-        android:id="@+id/textModels"
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:text="未加载"
-        android:textSize="13sp"
-        android:textColor="#DDDDDD"
-        android:paddingHorizontal="12dp" />
+        <!-- Agent 分区 -->
+        <TextView
+            android:id="@+id/labelAgents"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Agent"
+            android:textSize="15sp"
+            android:textStyle="bold"
+            android:textColor="#4FC3F7"
+            android:padding="12dp" />
+        <TextView
+            android:id="@+id/textAgents"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="未加载"
+            android:textSize="13sp"
+            android:textColor="#DDDDDD"
+            android:paddingHorizontal="12dp" />
 
-    <TextView
-        android:id="@+id/labelSkills"
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:text="技能"
-        android:textSize="15sp"
-        android:textStyle="bold"
-        android:textColor="#4FC3F7"
-        android:padding="12dp" />
+        <!-- 模型 + 命令 分区 -->
+        <TextView
+            android:id="@+id/labelModels"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="模型 / 命令"
+            android:textSize="15sp"
+            android:textStyle="bold"
+            android:textColor="#4FC3F7"
+            android:padding="12dp" />
+        <TextView
+            android:id="@+id/textModels"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="未加载"
+            android:textSize="13sp"
+            android:textColor="#DDDDDD"
+            android:paddingHorizontal="12dp" />
 
-    <TextView
-        android:id="@+id/textSkills"
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:text="未加载"
-        android:textSize="13sp"
-        android:textColor="#DDDDDD"
-        android:paddingHorizontal="12dp" />
+        <!-- 会话 分区 -->
+        <TextView
+            android:id="@+id/labelSessions"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="会话"
+            android:textSize="15sp"
+            android:textStyle="bold"
+            android:textColor="#4FC3F7"
+            android:padding="12dp" />
+        <TextView
+            android:id="@+id/textSessions"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="未加载"
+            android:textSize="13sp"
+            android:textColor="#DDDDDD"
+            android:paddingHorizontal="12dp" />
 
-    <TextView
-        android:id="@+id/labelUsage"
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:text="用量 / 概览"
-        android:textSize="15sp"
-        android:textStyle="bold"
-        android:textColor="#4FC3F7"
-        android:padding="12dp" />
+        <!-- 概览 / 系统信息 分区 -->
+        <TextView
+            android:id="@+id/labelOverview"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="概览 / 系统"
+            android:textSize="15sp"
+            android:textStyle="bold"
+            android:textColor="#4FC3F7"
+            android:padding="12dp" />
+        <TextView
+            android:id="@+id/textOverview"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="未加载"
+            android:textSize="13sp"
+            android:textColor="#DDDDDD"
+            android:paddingHorizontal="12dp" />
 
-    <TextView
-        android:id="@+id/textUsage"
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:text="未加载"
-        android:textSize="13sp"
-        android:textColor="#DDDDDD"
-        android:paddingHorizontal="12dp" />
+        <!-- Cron / 目录 分区 -->
+        <TextView
+            android:id="@+id/labelCron"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="定时任务 / 目录"
+            android:textSize="15sp"
+            android:textStyle="bold"
+            android:textColor="#4FC3F7"
+            android:padding="12dp" />
+        <TextView
+            android:id="@+id/textCron"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="未加载"
+            android:textSize="13sp"
+            android:textColor="#DDDDDD"
+            android:paddingHorizontal="12dp" />
 
-    <Button
-        android:id="@+id/btnRefreshOverview"
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:text="刷新概览"
-        android:layout_margin="12dp" />
-</LinearLayout>
+        <!-- 渠道 分区 -->
+        <TextView
+            android:id="@+id/labelChannels"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="渠道"
+            android:textSize="15sp"
+            android:textStyle="bold"
+            android:textColor="#4FC3F7"
+            android:padding="12dp" />
+        <TextView
+            android:id="@+id/textChannels"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="未加载"
+            android:textSize="13sp"
+            android:textColor="#DDDDDD"
+            android:paddingHorizontal="12dp" />
+
+        <!-- 技能 分区 -->
+        <TextView
+            android:id="@+id/labelSkills"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="技能"
+            android:textSize="15sp"
+            android:textStyle="bold"
+            android:textColor="#4FC3F7"
+            android:padding="12dp" />
+        <TextView
+            android:id="@+id/textSkills"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="未加载"
+            android:textSize="13sp"
+            android:textColor="#DDDDDD"
+            android:paddingHorizontal="12dp" />
+
+        <!-- 用量 分区 -->
+        <TextView
+            android:id="@+id/labelUsage"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="用量"
+            android:textSize="15sp"
+            android:textStyle="bold"
+            android:textColor="#4FC3F7"
+            android:padding="12dp" />
+        <TextView
+            android:id="@+id/textUsage"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="未加载"
+            android:textSize="13sp"
+            android:textColor="#DDDDDD"
+            android:paddingHorizontal="12dp" />
+    </LinearLayout>
+</ScrollView>

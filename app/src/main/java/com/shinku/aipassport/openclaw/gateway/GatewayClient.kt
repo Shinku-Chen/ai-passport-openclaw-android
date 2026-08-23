@@ -63,6 +63,10 @@ class GatewayClient(
 
     private val pendingReqs = ConcurrentHashMap<String, CompletableDeferred<JsonObject?>>()
 
+    /** 最近一次 RPC 错误信息(供控制台分区显示"不可用/需权限"原因)。 */
+    @Volatile
+    private var lastRpcError: String? = null
+
     @Volatile
     private var ws: WebSocket? = null
 
@@ -94,6 +98,72 @@ class GatewayClient(
 
     /** 设备是否已配对(有 deviceToken)。 */
     fun isPaired(): Boolean = identity.deviceToken.isNotBlank()
+
+    // ---- 网关控制台 RPC 查询(实测可用/需权限的 method) ----
+
+    data class RpcResult(val ok: Boolean, val payload: String?, val error: String?)
+
+    /**
+     * 通用 RPC 查询(connect 鉴权后调用):发 method,取 res.payload JSON 字符串。
+     * 失败(scope 不足/不支持/超时)返回 ok=false,error 带原因,不抛异常。
+     */
+    suspend fun rpcQuery(method: String, params: Map<String, Any?> = emptyMap()): RpcResult =
+        withContext(Dispatchers.IO) {
+            if (!ensureConnected()) {
+                return@withContext RpcResult(false, null, "网关未连接或鉴权失败")
+            }
+            val p = JsonObject()
+            params.forEach { (k, v) ->
+                when (v) {
+                    null -> p.add(k, com.google.gson.JsonNull.INSTANCE)
+                    is String -> p.addProperty(k, v)
+                    is Number -> p.addProperty(k, v)
+                    is Boolean -> p.addProperty(k, v)
+                    is List<*> -> p.add(k, gson.toJsonTree(v))
+                    else -> p.add(k, gson.toJsonTree(v))
+                }
+            }
+            lastRpcError = null
+            val reply = requestSync(method, p)
+            if (reply != null) {
+                RpcResult(true, reply.toString(), null)
+            } else {
+                RpcResult(false, null, lastRpcError ?: "网关未响应或超时")
+            }
+        }
+
+    /** Agent 列表(实测 agent.identity.get → payload.agents)。 */
+    suspend fun rpcAgents(): RpcResult = rpcQuery("agent.identity.get")
+
+    /** 模型 + 命令(实测 health → payload.models / payload.commands)。 */
+    suspend fun rpcModels(): RpcResult = rpcQuery("health")
+
+    /** 系统信息/概览(实测 system.info)。 */
+    suspend fun rpcOverview(): RpcResult = rpcQuery("system.info")
+
+    /** 会话列表(实测 sessions.list)。 */
+    suspend fun rpcSessions(): RpcResult = rpcQuery("sessions.list")
+
+    /** 定时任务(实测 cron.list → payload.worktrees;jobs 在 directory.list)。 */
+    suspend fun rpcCron(): RpcResult = rpcQuery("cron.list")
+
+    /** 目录/任务(实测 directory.list → payload.jobs)。 */
+    suspend fun rpcDirectory(): RpcResult = rpcQuery("directory.list")
+
+    /** 渠道列表(实测需 operator.admin,当前 token 可能无权限)。 */
+    suspend fun rpcChannels(): RpcResult = rpcQuery("channels.list")
+
+    /** 技能列表(实测需 operator.admin)。 */
+    suspend fun rpcSkills(): RpcResult = rpcQuery("skills")
+
+    /** 用量(实测需 operator.admin)。 */
+    suspend fun rpcUsage(): RpcResult = rpcQuery("usage")
+
+    /** 节点列表(实测需 operator.admin)。 */
+    suspend fun rpcNodes(): RpcResult = rpcQuery("nodes.list")
+
+    /** 设备列表(实测需 operator.admin)。 */
+    suspend fun rpcDevices(): RpcResult = rpcQuery("devices.list")
 
     fun close() {
         scope.cancel()
@@ -195,9 +265,13 @@ class GatewayClient(
                         val code = err?.get("code")?.asString
                         val message = err?.get("message")?.asString
                         Log.e(tag, "RPC 错误 [$code]: $message")
+                        lastRpcError = message?.takeIf { it.isNotBlank() } ?: code
                         if (code == "INVALID_REQUEST" && message?.contains("device") == true) {
                             Log.w(tag, "设备未配对,需在网关主机执行 openclaw devices approve")
                             onStatus("网关设备待配对:请在网关主机执行 openclaw devices approve")
+                        }
+                        if (message?.contains("missing scope") == true) {
+                            onStatus("该数据需网关 admin 权限,当前 token 无权读取")
                         }
                         deferred.complete(null)
                     }

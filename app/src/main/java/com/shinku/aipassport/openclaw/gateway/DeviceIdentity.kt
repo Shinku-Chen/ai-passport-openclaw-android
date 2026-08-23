@@ -24,6 +24,14 @@ class DeviceIdentity(context: Context) {
 
     private var cachedPrivate: Ed25519PrivateKeyParameters? = null
 
+    init {
+        // 构造时即确保完整身份生成并持久化:device_id + 私钥 seed 绑定。
+        // 否则 App 重启后 privateKey() 重新生成新私钥 -> 公钥变化 -> 网关卡 approve 的设备指纹对不上。
+        // 用 deviceId 兜底确保 seed 已写回(apply 是异步,这里顺带触发一次)。
+        privateKey()
+        Log.i("DeviceIdentity", "身份就绪 device_id=$deviceId 私钥已持久化")
+    }
+
     /** 网关在 connect 成功后下发的 deviceToken(首次配对后非空)。 */
     var deviceToken: String
         get() = prefs.getString(KEY_DEVICE_TOKEN, "") ?: ""
@@ -57,7 +65,8 @@ class DeviceIdentity(context: Context) {
         } else {
             val k = newKey()
             val seed = k.getEncoded()
-            prefs.edit().putString(KEY_PRIVATE_SEED, Base64.encodeToString(seed, Base64.NO_WRAP)).apply()
+            // commit() 同步写入,确保 seed 立即落盘(apply 异步,App 重启前可能未写)。
+            prefs.edit().putString(KEY_PRIVATE_SEED, Base64.encodeToString(seed, Base64.NO_WRAP)).commit()
             k
         }
         cachedPrivate = key
@@ -67,8 +76,9 @@ class DeviceIdentity(context: Context) {
     private fun createDeviceId(): String {
         // 设备 id 由 app 侧生成,格式满足网关 /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/
         val id = "ai-passport-android-${UUID.randomUUID().toString().take(8)}"
-        prefs.edit().putString(KEY_DEVICE_ID, id).apply()
-        Log.i("DeviceIdentity", "生成设备 id: $id")
+        // commit() 同步写入,确保 device_id 立即落盘稳定(与后续 seed 绑定)。
+        prefs.edit().putString(KEY_DEVICE_ID, id).commit()
+        Log.i("DeviceIdentity", "生成设备 id(已持久化): $id")
         return id
     }
 

@@ -155,15 +155,18 @@ class GatewayApi(
                     ?: obj.get("text")?.asString
                     ?: obj.get("body")?.asString
                     ?: obj.get("message")?.asString
+                // app:来源 App 名(优先 app/source/packageName 字段)
+                val app = obj.get("app")?.asString
+                    ?: obj.get("source")?.asString
+                    ?: obj.get("packageName")?.asString
+                    ?: ""
                 if (text == null) null else NotificationItem(
                     title = text,
-                    detail = obj.get("detail")?.asString
-                        ?: obj.get("app")?.asString
-                        ?: obj.get("source")?.asString
-                        ?: "",
+                    detail = obj.get("detail")?.asString ?: "",
                     time = obj.get("time")?.asString
                         ?: obj.get("timestamp")?.asString
                         ?: "",
+                    app = app,
                 )
             }
         } catch (e: Exception) {
@@ -173,5 +176,10 @@ class GatewayApi(
 
     data class AgentSummary(val id: String, val name: String, val status: String)
 
-    data class NotificationItem(val title: String, val detail: String, val time: String)
+    data class NotificationItem(
+        val title: String,
+        val detail: String,
+        val time: String,
+        val app: String = "",
+    )
 }

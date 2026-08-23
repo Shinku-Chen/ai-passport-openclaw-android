@@ -23,6 +23,47 @@
         android:layout_marginHorizontal="12dp"
         android:layout_marginBottom="8dp" />
 
+    <!-- 过滤策略 -->
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="horizontal"
+        android:paddingHorizontal="12dp"
+        android:gravity="center_vertical">
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="过滤:"
+            android:textColor="#DDDDDD" />
+
+        <Spinner
+            android:id="@+id/filterModeSpinner"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:layout_marginStart="8dp" />
+
+        <Button
+            android:id="@+id/btnEditFilterApps"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="App 列表"
+            android:layout_marginStart="8dp"
+            android:minHeight="0dp"
+            android:textSize="12sp" />
+    </LinearLayout>
+
+    <TextView
+        android:id="@+id/filterStatusText"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="过滤: 关闭"
+        android:textSize="12sp"
+        android:textColor="#9E9E9E"
+        android:paddingHorizontal="12dp"
+        android:paddingVertical="4dp" />
+
     <androidx.recyclerview.widget.RecyclerView
         android:id="@+id/notificationList"
         android:layout_width="match_parent"
