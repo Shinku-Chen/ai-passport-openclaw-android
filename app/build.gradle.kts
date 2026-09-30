@@ -3,6 +3,30 @@ plugins {
     id("org.jetbrains.kotlin.android")
 }
 
+/**
+ * 正式签名配置:参数全部从**环境变量**读取,keystore 与密码都不入仓库
+ * (仓库里只有变量名,密钥文件放在仓库外,例如 `D:\Git-Workspace\.tools\keys\`)。
+ *
+ * 四个变量(缺任意一个则 release 构建保持未签名,保证别人 clone 也能正常构建):
+ *   AIPASSPORT_KEYSTORE            keystore 绝对路径
+ *   AIPASSPORT_KEYSTORE_PASSWORD   keystore 口令
+ *   AIPASSPORT_KEY_ALIAS           密钥别名
+ *   AIPASSPORT_KEY_PASSWORD        密钥口令
+ *
+ * 本机用法(凭据文件在仓库外):
+ *   source D:/Git-Workspace/.tools/keys/aipassport-openclaw.env.sh
+ *   ./gradlew assembleRelease
+ */
+val releaseKeystorePath: String? = System.getenv("AIPASSPORT_KEYSTORE")
+val releaseKeystorePassword: String? = System.getenv("AIPASSPORT_KEYSTORE_PASSWORD")
+val releaseKeyAlias: String? = System.getenv("AIPASSPORT_KEY_ALIAS")
+val releaseKeyPassword: String? = System.getenv("AIPASSPORT_KEY_PASSWORD")
+val hasReleaseSigning: Boolean = !releaseKeystorePath.isNullOrBlank() &&
+    !releaseKeystorePassword.isNullOrBlank() &&
+    !releaseKeyAlias.isNullOrBlank() &&
+    !releaseKeyPassword.isNullOrBlank() &&
+    file(releaseKeystorePath).exists()
+
 android {
     namespace = "com.shinku.aipassport.openclaw"
     compileSdk = 35
@@ -15,10 +39,26 @@ android {
         versionName = "0.1.0"
     }
 
+    signingConfigs {
+        if (hasReleaseSigning) {
+            create("release") {
+                storeFile = file(releaseKeystorePath!!)
+                storePassword = releaseKeystorePassword
+                keyAlias = releaseKeyAlias
+                keyPassword = releaseKeyPassword
+            }
+        }
+    }
+
     buildTypes {
         release {
             isMinifyEnabled = false
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"))
+            // 只有四个环境变量都在时才签名;否则产出未签名 APK(不静默回退到 debug 签名,
+            // 避免“看起来是正式包实际是调试签名”)
+            if (hasReleaseSigning) {
+                signingConfig = signingConfigs.getByName("release")
+            }
         }
     }
 
