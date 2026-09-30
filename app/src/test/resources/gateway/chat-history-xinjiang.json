@@ -1,0 +1,136 @@
+{
+  "sessionKey": "agent:main:passport",
+  "sessionId": "00000000-0000-0000-0000-000000000000",
+  "messages": [
+    {
+      "id": "msg-prev-user",
+      "role": "user",
+      "timestamp": 1790697500000,
+      "content": [
+        {
+          "type": "text",
+          "text": "北京天气是什么？\n请用不超过 200 字回复，不要使用 emoji 表情，也不要使用 Markdown 表格。"
+        }
+      ]
+    },
+    {
+      "id": "msg-prev-answer",
+      "role": "assistant",
+      "timestamp": 1790697510000,
+      "content": [
+        {
+          "type": "text",
+          "text": "北京明天晴，20℃/10℃。"
+        }
+      ]
+    },
+    {
+      "id": "msg-prev-tool-call",
+      "role": "assistant",
+      "timestamp": 1790697520000,
+      "content": [
+        {
+          "type": "toolCall",
+          "name": "exec",
+          "arguments": {
+            "command": "curl -sS http://d1.weather.com.cn/sk_2d/101010100.html"
+          }
+        }
+      ]
+    },
+    {
+      "id": "msg-prev-tool-result",
+      "role": "toolResult",
+      "timestamp": 1790697530000,
+      "content": [
+        {
+          "type": "text",
+          "text": "{\"city\":\"北京\",\"temp\":\"20℃\",\"weather\":\"晴\"}"
+        }
+      ]
+    },
+    {
+      "id": "msg-turn-user",
+      "role": "user",
+      "timestamp": 1790699144650,
+      "content": [
+        {
+          "type": "text",
+          "text": "新疆天气是什么？\n请用不超过 200 字回复，不要使用 emoji 表情，也不要使用 Markdown 表格。"
+        }
+      ]
+    },
+    {
+      "id": "msg-turn-tool-call-1",
+      "role": "assistant",
+      "timestamp": 1790699144700,
+      "content": [
+        {
+          "type": "toolCall",
+          "name": "exec",
+          "arguments": {
+            "command": "curl -sS http://d1.weather.com.cn/sk_2d/101130101.html"
+          }
+        }
+      ]
+    },
+    {
+      "id": "msg-turn-tool-result-1",
+      "role": "toolResult",
+      "timestamp": 1790699149000,
+      "content": [
+        {
+          "type": "text",
+          "text": "{\"city\":\"乌鲁木齐\",\"temp\":\"14.6℃\",\"weather\":\"多云\",\"aqi\":54,\"time\":\"09-30 00:05\"}"
+        }
+      ]
+    },
+    {
+      "id": "msg-turn-answer",
+      "role": "assistant",
+      "timestamp": 1790699150000,
+      "content": [
+        {
+          "type": "text",
+          "text": "新疆以首府乌鲁木齐为例（09-30 00:05 实况）：多云，14.6℃，微风，AQI 54（良）。全疆范围很大，阿勒泰、喀什等地差异明显，需要具体城市可以再说。"
+        }
+      ]
+    },
+    {
+      "id": "msg-turn-tool-call-2",
+      "role": "assistant",
+      "timestamp": 1790699152000,
+      "content": [
+        {
+          "type": "toolCall",
+          "name": "exec",
+          "arguments": {
+            "command": "memos add turn"
+          }
+        }
+      ]
+    },
+    {
+      "id": "msg-turn-tool-result-2",
+      "role": "toolResult",
+      "timestamp": 1790699155000,
+      "content": [
+        {
+          "type": "text",
+          "text": "{\"ok\":true,\"added\":1}"
+        }
+      ]
+    },
+    {
+      "id": "msg-turn-status-talk",
+      "role": "assistant",
+      "timestamp": 1790699157236,
+      "content": [
+        {
+          "type": "text",
+          "text": "没有活跃的 exec 会话或子代理，也没有待办事项。新疆天气已回复完毕，有需要继续叫我。"
+        }
+      ]
+    }
+  ]
+}

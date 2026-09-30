@@ -13,23 +13,41 @@ import okhttp3.Response
 import okhttp3.WebSocket
 import okhttp3.WebSocketListener
 import java.util.UUID
+import java.util.concurrent.Executors
+import java.util.concurrent.ScheduledFuture
 import java.util.concurrent.TimeUnit
 
 /**
  * 小智(xiaozhi.me)云端流式中文识别 —— App 作小智 WebSocket 客户端,只取 ASR(stt)文本。
  *
  * 链路(manual 模式,对应设备 PTT 的 turn_start/turn_end):
- *  设备麦克风 → [固件 Opus 编码] → BLE → App feedPcm(已收到 Opus 帧) → 原样转发小智
- *  → 小智 server 跑 ASR → 回 {"type":"stt","text":"..."} → 只取 text 喂 OpenClaw
+ *  设备麦克风 → [固件 Opus 编码] → BLE → App feedOpus(已剥掉 SEQ) → 原样转发小智
+ *  → 小智 server 跑 ASR → 回 {"type":"stt","text":"..."} → 只取 text 喂网关
  *  → 小智的 llm/tts 消息丢弃(我们不用小智的 LLM/TTS)。
  *
- * 关键:固件已编码 Opus,App 收到的是【Opus 帧】,直接作为 WS 二进制帧上送,不做本地
- * 解码/重编码(因此 App 无需 Opus 库)。
+ * 两条上行路径:
+ *  - [feedOpus](默认):固件已编码,v1 帧 payload = [SEQ][Opus 包],App 剥掉 SEQ 后
+ *    直接把 Opus 包当 WS 二进制帧上送,不做任何解码/重编码;
+ *  - [feedPcm](兜底):固件只能给 PCM 时,App 用 libopus 编成小智要的 16k 60ms 帧再上送。
  *
  * WS 协议(已实测):连接 wss://api.tenclass.net/xiaozhi/v1/,HTTP 头带
- *  Device-Id/Client-Id/Protocol-Version;必须先发客户端 hello,否则服务器立即 close。
+ * Device-Id/Client-Id/Protocol-Version;必须先发客户端 hello,否则服务器立即 close。
  *  服务器回 hello{sample_rate:24000(下行TTS),session_id};发 listen.start(manual);
  *  上送 Opus 二进制帧;发 listen.stop;收 stt 文本。
+ *
+ * **识别通道常驻预热(热连接)**:握手 + `hello` 往返实测 0.5–2s,若每轮都重做,设备「按下→可说话」
+ * 就有明显空窗(整屏红等待)。因此:
+ *  - 一轮结束([endTurn])后**不关 socket**,保留 hello 结果作「热连接」;
+ *  - 下一轮 [startTurn] 若热连接仍可用(见 [WarmLink.decide])→ **直接发 `listen.start`** 并回调
+ *    `onReady()`(毫秒级);不可用/已断开/闲置超时 → 走原有「按下才连」的 [connectAndHello] 路径;
+ *  - 预热时机:[prewarm](服务启动 / BLE 链路就绪时由 [SttEngine.prewarm] 静默调用)+ 每轮结束后保留;
+ *  - 闲置超过 [WarmLink.IDLE_TIMEOUT_MS] 主动关闭;[release]/[onLinkDown](服务停止 / 断开 BLE)立即关闭;
+ *  - 复用失败(`listen.start` 发不出去)自动兜底重连**一次**,绝不因此让整轮识别失败。
+ *
+ * 正确性约定不变:
+ *  - [turnRunning] 在 [startTurn] 一开始就置 true,按下起的 PCM/Opus 立即累积并上送(绝不丢开头);
+ *  - `onReady` 仍然只在**本轮识别会话真的建立**(`listen.start` 已发出)时回调(见 [WarmLink.sessionEstablished]);
+ *  - 连接/预热失败只记日志,退回「按下才连」的既有行为,不让整轮失败。
  */
 class XiaozhiStt(
     private val serverUrl: String,          // 如 wss://api.tenclass.net/xiaozhi/v1/
@@ -48,10 +66,46 @@ class XiaozhiStt(
         .connectTimeout(8, TimeUnit.SECONDS)
         .readTimeout(0, TimeUnit.MILLISECONDS)
         .writeTimeout(10, TimeUnit.SECONDS)
+        // 保活+死链检测:真机上热连接会被中间设备/服务端静默回收(实测 `小智 WS 失败 code=null null: null`,
+        // 无错误码),一旦静默掉线而 App 不自知,用户按下就只能现场握手 → 「等好久才变绿」。
+        // 周期 ping 既维持连接,也能在链路死掉时尽快触发 onFailure,交给预热看门狗重建。
+        .pingInterval(20, TimeUnit.SECONDS)
         .build()
 
-    // 会话状态
+    // ---- 热连接(识别通道常驻预热)状态 ----
+
+    /** 热连接状态的修改锁:startTurn / 闲置超时线程 / WS 回调都会改这几个字段。 */
+    private val linkLock = Any()
+
+    /** 当前 WebSocket(热连接或本轮新连的);null = 无连接。跨线程读写(OkHttp 回调/主线程/定时器)。 */
+    @Volatile
     private var ws: WebSocket? = null
+
+    /** 热连接是否可用:WS 已 open + 服务器 hello 已回 + 未失败/未关闭(可直接 listen.start)。 */
+    @Volatile
+    private var warmReady = false
+
+    /** 热连接最近一次活动(建立/复用/一轮结束)的时刻,用于闲置超时判定。 */
+    @Volatile
+    private var warmActiveAtMs = 0L
+
+    /** 是否有一条连接正在建立(hello 还没回):预热与「按下才连」不重复建两条 socket。 */
+    @Volatile
+    private var connecting = false
+
+    /** 闲置超时定时器:后台把超过 [WarmLink.IDLE_TIMEOUT_MS] 没人用的热连接关掉。 */
+    private val warmIdleScheduler = Executors.newSingleThreadScheduledExecutor { r ->
+        Thread(r, "xiaozhi-warm-idle").apply { isDaemon = true }
+    }
+
+    @Volatile
+    private var warmIdleTask: ScheduledFuture<*>? = null
+
+    /** 本轮因热连接复用失败而自动重连的次数(最多一次,见 [WarmLink.shouldFallbackReconnect])。 */
+    @Volatile
+    private var warmFallbackAttempts = 0
+
+    // ---- 会话状态 ----
 
     /** 本 turn 最新一条 stt 文本(小智边识边发,取最后一次作结果)。 */
     @Volatile private var lastStt = ""
@@ -61,7 +115,8 @@ class XiaozhiStt(
 
     @Volatile private var listening = false
 
-    /** turn 是否在进行(startTurn 置 true,endTurn/barge 置 false)。feedPcm 据此刻允许上送,不依赖 hello 回包。 */
+    /** turn 是否在进行(startTurn 置 true,endTurn/barge 置 false)。feedPcm 据此刻允许上送,不依赖 hello 回包。
+     *  注意:它**不**代表「识别会话已建立」—— 后者才触发 startTurn(onReady) 的就绪回调。 */
     @Volatile private var turnRunning = false
 
     /** Opus 编码器(libopus JNI):把设备 PCM 编成小智要的 16k 裸 Opus 帧。 */
@@ -76,7 +131,8 @@ class XiaozhiStt(
     /** pcmBuffer 当前已填字节数。 */
     private var pcmLen = 0
 
-    /** 收到服务器 hello 后回调,供 startTurn 决定是否 startListening。 */
+    /** 收到服务器 hello(成功)/ 连接失败(失败)后回调一次;供 startTurn / prewarm 决定下一步。 */
+    @Volatile
     private var onHelloCallback: ((Boolean) -> Unit)? = null
 
     /** 识别文本(含中间 stt)每句回调。 */
@@ -88,21 +144,96 @@ class XiaozhiStt(
     /** 小智 websocket 是否当前活跃连接(供连接监控器定时检测)。 */
     fun isConnected(): Boolean = ws != null
 
-    override fun startTurn() {
-        // 确保连接 + 发 hello;成功后发 listen.start。若失败,置 listening=false,endTurn 返回 null。
+    // ---- 预热 / 一轮的起止 ----
+
+    /**
+     * 建立一条**后台静默的热连接**(识别通道常驻预热):服务启动、BLE 链路就绪时调用。
+     *
+     * 不影响 UI;失败只记日志(下一轮按下仍会走「按下才连」,行为与未预热时一致)。
+     * 已有可用热连接时直接返回;闲置超时的旧连接先关再建(不泄漏 socket)。
+     */
+    override fun prewarm() {
+        if (!isAvailable) return
+        when (WarmLink.decide(warmState(), System.currentTimeMillis())) {
+            WarmLink.WarmDecision.REUSE -> return   // 已有热连接,不重复建
+            WarmLink.WarmDecision.RECONNECT_IDLE_TIMEOUT -> {
+                Log.i(tag, "热连接闲置超时,已关闭")
+                dropWarmLink()
+            }
+            WarmLink.WarmDecision.RECONNECT_DISCONNECTED -> Unit
+        }
+        Log.i(tag, "识别通道预热中…")
+        connectAndHello { ok ->
+            if (ok) {
+                Log.i(tag, "识别通道常驻预热已建立")
+            } else {
+                Log.w(tag, "识别通道预热失败(不影响按下时就绪),将在按下时重连")
+            }
+        }
+    }
+
+    override fun startTurn(onReady: () -> Unit) {
+        // 立即允许 feedPcm/feedOpus 累积编码上送(不等握手,避免开头 PCM 丢失)
         listening = false
-        turnRunning = true      // 立即允许 feedPcm 累积编码上送(不等 hello 回包,避免开头 PCM 丢失)
+        turnRunning = true          // 先置 true:闲置超时定时器据此不动热连接
         lastStt = ""
         pcmLen = 0
+        warmFallbackAttempts = 0
         initOpusEncoder()
-        onHelloCallback = { ok ->
-            if (ok) {
-                startListening()
-                listening = true
-            }
-            // 失败:listening 保持 false,endTurn 已 guard 返回 null
+
+        // ① 优先复用热连接:按下时直接 listen.start,毫秒级就绪(不用再等一次 hello 往返)。
+        // 判定与 listen.start 放在同一把锁里,避免与「hello 刚回来 / 闲置定时器刚好到点」交叉。
+        val decision: WarmLink.WarmDecision
+        val sessionReady: Boolean
+        synchronized(linkLock) {
+            decision = WarmLink.decide(warmState(), System.currentTimeMillis())
+            sessionReady = decision == WarmLink.WarmDecision.REUSE &&
+                WarmLink.sessionEstablished(startListening())
         }
-        connectAndHello(onHelloCallback!!)
+        if (sessionReady) {
+            listening = true
+            warmActiveAtMs = System.currentTimeMillis()
+            cancelWarmIdleTimer()
+            Log.i(tag, "复用热连接,直接 listen.start(按下即可说话)")
+            // 识别会话真的建立(listen.start 已发出、服务器可用)才回调:
+            // 设备侧「按下即红、就绪变绿」据此变绿,表示「现在说话一定能被识别」。
+            Log.i(tag, "小智识别会话已建立,本轮可以说话")
+            onReady()
+            return
+        }
+        if (decision == WarmLink.WarmDecision.REUSE) {
+            // 热连接看着可用但 listen.start 发不出去(socket 刚好被对端关掉):
+            // 兜底重连一次,绝不因此让整轮识别失败。
+            Log.w(tag, "热连接不可用,重连中:listen.start 发送失败")
+            dropWarmLink()
+            if (!WarmLink.shouldFallbackReconnect(warmFallbackAttempts)) {
+                Log.w(tag, "本轮已重连过,不再重试(等设备侧 2.5s 兜底)")
+                return
+            }
+            warmFallbackAttempts++
+        } else {
+            Log.i(tag, "热连接不可用,重连中:${decision.reason}")
+            if (decision == WarmLink.WarmDecision.RECONNECT_IDLE_TIMEOUT) {
+                Log.i(tag, "热连接闲置超时,已关闭")
+                dropWarmLink()
+            }
+        }
+
+        // ② 冷路径(与未预热时完全一致):现连现握手,hello 回包后发 listen.start 再回调 onReady。
+        // 失败:listening 保持 false,endTurn 已 guard 返回 null;设备侧另有 2.5s 兜底超时。
+        // 若预热握手刚好已回来(warmReady 变 true),connectAndHello 直接当就绪,不再建第二条 socket。
+        connectAndHello { ok ->
+            if (!ok) return@connectAndHello
+            if (WarmLink.sessionEstablished(startListening())) {
+                listening = true
+                warmActiveAtMs = System.currentTimeMillis()
+                cancelWarmIdleTimer()
+                Log.i(tag, "小智识别会话已建立,本轮可以说话")
+                onReady()
+            } else {
+                Log.w(tag, "listen.start 未发出(连接不可用),本轮不就绪")
+            }
+        }
     }
 
     /** 初始化 Opus 编码器(16k 单声道,audio 应用模式,兼容小智上行)。 */
@@ -125,7 +256,7 @@ class XiaozhiStt(
     }
 
     override fun feedPcm(pcm: ByteArray) {
-        // 固件发来的是【原始 PCM int16 16k】;App 累积到 60ms(960 samples/1920B)编成 Opus 帧上送小智。
+        // 兜底路径:固件给的是【原始 PCM int16 16k】;App 累积到 60ms(960 samples/1920B)编成 Opus 帧上送小智。
         val socket = ws ?: return
         val enc = opusEncoder ?: return
         if (!turnRunning) return   // 用 turnRunning(不等 hello 回包),避免开头 PCM 丢失
@@ -157,9 +288,28 @@ class XiaozhiStt(
         }
     }
 
+    /**
+     * 设备已编码的 Opus 包(固件 v1 默认上行):[VoicePipeline] 已剥掉首字节 SEQ。
+     * 直接作为 WebSocket 二进制帧原样上送小智,不再本地解码/重编码。
+     */
+    override fun feedOpus(packet: ByteArray) {
+        val socket = ws ?: return
+        if (!turnRunning) return   // 与 feedPcm 一致:不等 hello 回包,避免开头丢帧
+        if (packet.isEmpty()) return
+        try {
+            socket.send(okio.ByteString.of(*packet))   // 二进制帧(opcode 0x2)
+        } catch (e: Exception) {
+            Log.e(tag, "feedOpus 上送失败", e)
+        }
+    }
+
     override suspend fun endTurn(): String? = withContext(Dispatchers.IO) {
-        if (!listening) return@withContext null
-        // 发 listen.stop 结束本段,小智会停止本次识别。
+        if (!listening) {
+            // 本轮识别会话没建立(热连接与重连都失败):本轮无结果,但不影响 socket 现状
+            turnRunning = false
+            return@withContext null
+        }
+        // 发 listen.stop 结束本段,小智会停止本次识别;socket **不关**(保留做热连接)。
         stopListening()
         listening = false
         turnRunning = false
@@ -170,16 +320,36 @@ class XiaozhiStt(
             kotlinx.coroutines.delay(200)
         }
         val result = lastStt.takeIf { it.isNotBlank() }
-        // 用完即清理,下轮 startTurn 重建
-        releaseSocket()
+        // 不再关 socket:保持热连接(hello 结果仍在),下一轮按下可直接 listen.start(毫秒级就绪)。
+        keepWarm()
         result
     }
 
     override fun barge() {
-        // 打断:取消等待、关闭会话;新一轮 startTurn 会重连。
+        // 打断:取消本轮等待、结束本段识别,但**保留热连接**(下一轮 startTurn 可直接复用)。
+        // 因此这里只发 listen.stop,不关 socket —— 关掉就等于每轮都要重新握手(正是要修的空窗)。
+        val wasListening = listening
         listening = false
         turnRunning = false
-        releaseSocket()
+        if (wasListening) stopListening()
+        pcmLen = 0   // 丢掉不满一帧的余量,不跨轮拼接
+    }
+
+    override fun onLinkDown() {
+        // 设备链路断开(BLE 断开/掉线):留热连接没有意义,立即关闭。
+        listening = false
+        turnRunning = false
+        pcmLen = 0
+        dropWarmLink()
+    }
+
+    override fun release() {
+        // 服务停止/引擎释放:立即关闭热连接并释放编码器(不留后台资源)。
+        listening = false
+        turnRunning = false
+        dropWarmLink()
+        cancelWarmIdleTimer()
+        warmIdleScheduler.shutdownNow()
         releaseOpus()
     }
 
@@ -189,44 +359,160 @@ class XiaozhiStt(
         pcmLen = 0
     }
 
-    override fun release() = barge()
+    // ---- 热连接簿记 ----
+
+    /** 热连接状态快照(供 [WarmLink] 判定)。 */
+    private fun warmState(): WarmLink.WarmLinkState =
+        WarmLink.WarmLinkState(connected = warmReady && ws != null, lastActiveAtMs = warmActiveAtMs)
+
+    /**
+     * 一轮结束后把 socket 留作热连接:标记可用、刷新活动时间、挂上闲置超时定时器。
+     * 若已开新一轮(存在并发 old endTurn 回调),不动记账。
+     */
+    private fun keepWarm() {
+        synchronized(linkLock) {
+            if (turnRunning || listening) return
+            if (ws == null) {
+                warmReady = false
+                cancelWarmIdleTimer()
+                return
+            }
+            warmReady = true
+            warmActiveAtMs = System.currentTimeMillis()
+            armWarmIdleTimer()
+            Log.d(tag, "本轮结束:保留热连接(下一轮按下可直接 listen.start)")
+        }
+    }
+
+    /** 挂上闲置超时定时器(到点只在「真的一直没人用」时才关)。 */
+    private fun armWarmIdleTimer() {
+        cancelWarmIdleTimer()
+        if (!isAvailable) return
+        warmIdleTask = try {
+            warmIdleScheduler.schedule(
+                { closeWarmLinkIfIdle() },
+                WarmLink.IDLE_TIMEOUT_MS,
+                TimeUnit.MILLISECONDS,
+            )
+        } catch (e: Exception) {
+            Log.w(tag, "热连接闲置定时器启动失败", e)
+            null
+        }
+    }
+
+    private fun cancelWarmIdleTimer() {
+        warmIdleTask?.cancel(false)
+        warmIdleTask = null
+    }
+
+    /** 闲置超时:只在【没有轮次在跑、且确实闲置超时】时关掉热连接,避免长期占用 socket/服务器会话。 */
+    private fun closeWarmLinkIfIdle() {
+        synchronized(linkLock) {
+            if (turnRunning || listening) return   // 期间被复用/正在用
+            if (WarmLink.decide(warmState(), System.currentTimeMillis()) !=
+                WarmLink.WarmDecision.RECONNECT_IDLE_TIMEOUT
+            ) {
+                return
+            }
+            Log.i(tag, "热连接闲置超时,已关闭")
+            closeSocketLocked()
+        }
+    }
+
+    /** 丢弃热连接(关 socket、清标记、停定时器);下一轮按下会重连。 */
+    private fun dropWarmLink() {
+        cancelWarmIdleTimer()
+        synchronized(linkLock) { closeSocketLocked() }
+    }
+
+    /** 关掉当前 socket 并清掉热连接标记;调用方需持有 [linkLock]。 */
+    private fun closeSocketLocked() {
+        warmReady = false
+        warmActiveAtMs = 0L
+        val socket = ws
+        ws = null
+        try { socket?.close(1000, "done") } catch (_: Exception) {}
+    }
 
     // ---- 连接与协议 ----
 
+    /**
+     * 建链 + 发客户端 hello;服务器回 hello 时回调 [onReady](true),失败回调 false。
+     *
+     * 若已有一条连接正在建立(通常是预热),不重复建 socket,只把回调换成本次的 ——
+     * 这样「预热握手还没回来时用户就按下」也能直接等这次握手,不做两次往返。
+     */
     private fun connectAndHello(onReady: (Boolean) -> Unit) {
-        val req = Request.Builder()
-            .url(serverUrl)
-            // 小智：必须先带 Device-Id/Client-Id/Protocol-Version 握手头 + 发 hello,否则立即 close
-            // Client-Id 每次 App 启动随机生成(进程内稳定,重启换新)。
-            .addHeader("Authorization", token.ifBlank { "test-token" })
-            .addHeader("Protocol-Version", "1")
-            .addHeader("Device-Id", deviceId)
-            .addHeader("Client-Id", clientId)
-            .build()
-        val socket = client.newWebSocket(req, object : WebSocketListener() {
-            override fun onOpen(webSocket: WebSocket, response: Response) {
-                Log.i(tag, "小智 WS 已连接 code=${response.code} ${response.message},发送 hello")
-                sendHello(webSocket)
+        val alreadyWarm: Boolean
+        synchronized(linkLock) {
+            if (connecting) {
+                Log.i(tag, "连接已在建立中,复用在途握手")
+                onHelloCallback = onReady
+                return
             }
-
-            override fun onMessage(webSocket: WebSocket, text: String) {
-                Log.d(tag, "收到小智文本: ${text.take(200)}")
-                handleServerMessage(text)
+            // 握手在这之前刚完成(通常是预热):直接当就绪,不再建第二条 socket
+            alreadyWarm = warmReady && ws != null
+            if (!alreadyWarm) {
+                connecting = true
+                ws = client.newWebSocket(buildRequest(), listener())
             }
+        }
+        if (alreadyWarm) {
+            Log.i(tag, "已有可用热连接,跳过握手")
+            onReady(true)
+        }
+        // onReady 由 handleServerMessage 收到 hello 后触发(存于 onHelloCallback);此处只建连+发 hello
+    }
 
-            override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
-                Log.e(tag, "小智 WS 失败 code=${response?.code} ${response?.message}: ${t.message}")
+    private fun buildRequest(): Request = Request.Builder()
+        .url(serverUrl)
+        // 小智:必须先带 Device-Id/Client-Id/Protocol-Version 握手头 + 发 hello,否则立即 close
+        // Client-Id 每次 App 启动随机生成(进程内稳定,重启换新)。
+        .addHeader("Authorization", token.ifBlank { "test-token" })
+        .addHeader("Protocol-Version", "1")
+        .addHeader("Device-Id", deviceId)
+        .addHeader("Client-Id", clientId)
+        .build()
+
+    private fun listener(): WebSocketListener = object : WebSocketListener() {
+        override fun onOpen(webSocket: WebSocket, response: Response) {
+            Log.i(tag, "小智 WS 已连接 code=${response.code} ${response.message},发送 hello")
+            sendHello(webSocket)
+        }
+
+        override fun onMessage(webSocket: WebSocket, text: String) {
+            Log.d(tag, "收到小智文本: ${text.take(200)}")
+            handleServerMessage(text, webSocket)
+        }
+
+        override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
+            Log.e(tag, "小智 WS 失败 code=${response?.code} ${response?.message}: ${t.message}")
+            // 旧 socket 的迟到回调不能影响当前(新)连接:只有确定是自己的连接才处理
+            val cb: ((Boolean) -> Unit)?
+            synchronized(linkLock) {
+                if (!(ws === webSocket || ws == null)) return
+                connecting = false
+                warmReady = false
+                ws = null
+                cancelWarmIdleTimer()
+                listening = false
+                cb = onHelloCallback
                 onHelloCallback = null
-                listening = false
             }
+            cb?.invoke(false)
+        }
 
-            override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
-                Log.w(tag, "小智 WS 关闭 $code $reason")
+        override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
+            Log.w(tag, "小智 WS 关闭 $code $reason")
+            synchronized(linkLock) {
+                if (!(ws === webSocket || ws == null)) return
+                connecting = false
+                warmReady = false
+                ws = null
+                cancelWarmIdleTimer()
                 listening = false
             }
-        })
-        ws = socket
-        // onReady 由 handleServerMessage 收到 hello 后触发(存于 onReady);此函数只建连+发 hello
+        }
     }
 
     private fun sendHello(webSocket: WebSocket) {
@@ -244,7 +530,14 @@ class XiaozhiStt(
         webSocket.send(hello.toString())
     }
 
-    private fun startListening() {
+    /**
+     * 发 `listen.start`(manual 模式)。
+     *
+     * @return 是否已被 OkHttp 写队列接受 —— **true 才算「本轮识别会话真的建立」**,
+     *   `onReady`(设备 `turn_ready` 变绿)只用它放行(见 [WarmLink.sessionEstablished])。
+     */
+    private fun startListening(): Boolean {
+        val socket = ws ?: return false
         val sid = sessionId ?: "probe"
         val start = JsonObject().apply {
             addProperty("session_id", sid)
@@ -252,33 +545,39 @@ class XiaozhiStt(
             addProperty("state", "start")
             addProperty("mode", "manual")
         }
-        ws?.send(start.toString())
+        return try {
+            socket.send(start.toString())
+        } catch (e: Exception) {
+            Log.e(tag, "listen.start 发送失败", e)
+            false
+        }
     }
 
     private fun stopListening() {
+        val socket = ws ?: return
         val sid = sessionId ?: "probe"
         val stop = JsonObject().apply {
             addProperty("session_id", sid)
             addProperty("type", "listen")
             addProperty("state", "stop")
         }
-        ws?.send(stop.toString())
+        try {
+            socket.send(stop.toString())
+        } catch (e: Exception) {
+            Log.w(tag, "listen.stop 发送失败", e)
+        }
     }
 
-    private fun handleServerMessage(text: String) {
+    private fun handleServerMessage(text: String, socket: WebSocket) {
         try {
             val obj = gson.fromJson(text, JsonObject::class.java) ?: return
             when (obj.get("type")?.asString) {
-                "hello" -> {
-                    // 服务器回 hello:记录 session_id,然后通知 startTurn 可以 startListening
-                    obj.get("session_id")?.takeIf { it.isJsonPrimitive }?.asString?.let { sessionId = it }
-                    Log.i(tag, "小智 hello 回包: ${obj.toString()}")
-                    onHelloCallback?.invoke(true)
-                    onHelloCallback = null
-                }
+                "hello" -> onServerHello(obj, socket)
                 "stt" -> {
                     // 识别结果。小智边识边发 stt(每条可能是部分/最终),取最新一条作最终结果,
                     // 同时回调 onPartial 让设备屏实时上屏。
+                    // 旧连接(已被替换/关闭)的迟到 stt 丢弃,避免污染本轮结果。
+                    if (ws !== socket) return
                     val textVal = obj.get("text")?.takeIf { it.isJsonPrimitive }?.asString
                     if (!textVal.isNullOrBlank()) {
                         lastStt = textVal
@@ -295,8 +594,27 @@ class XiaozhiStt(
         }
     }
 
-    private fun releaseSocket() {
-        try { ws?.close(1000, "done") } catch (_: Exception) {}
-        ws = null
+    /**
+     * 服务器 `hello` 回包:这条 socket 从此是「热连接」(下一轮可直接 `listen.start`)。
+     * 状态更新在同一把锁里完成,避免与 `startTurn` 的复用判定交叉(不多建 socket、不误报就绪)。
+     */
+    private fun onServerHello(obj: JsonObject, socket: WebSocket) {
+        val cb: ((Boolean) -> Unit)?
+        synchronized(linkLock) {
+            if (ws !== socket) {
+                Log.w(tag, "忽略旧连接的 hello(连接已更换)")
+                return
+            }
+            obj.get("session_id")?.takeIf { it.isJsonPrimitive }?.asString?.let { sessionId = it }
+            connecting = false
+            warmReady = true
+            warmActiveAtMs = System.currentTimeMillis()
+            cb = onHelloCallback
+            onHelloCallback = null
+        }
+        Log.i(tag, "小智 hello 回包: ${obj.toString()}")
+        // 纯预热连接(没有轮次在跑)挂上闲置超时兜底;轮内连接由 endTurn 的 keepWarm 挂。
+        if (!turnRunning) armWarmIdleTimer()
+        cb?.invoke(true)
     }
 }

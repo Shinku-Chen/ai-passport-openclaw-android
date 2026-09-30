@@ -32,6 +32,12 @@ android {
     buildFeatures {
         viewBinding = true
     }
+    testOptions {
+        unitTests {
+            // 网关类里用了 android.util.Log;JVM 单测下让它返回默认值而不是抛 "not mocked"
+            isReturnDefaultValues = true
+        }
+    }
 }
 
 dependencies {
@@ -61,4 +67,9 @@ dependencies {
     // Opus 编码器(裸 Opus 帧输出) —— 小智识别必须收 16k Opus 帧;App 把设备 PCM 编成 Opus 上送。
     // rifai/android-opus-codec 预编译 aar(libopus 1.3.1),已放 app/libs/opus.aar
     implementation(files("libs/opus.aar"))
+
+    // 单测:HermesGateway 的 HTTP 行为用 MockWebServer 在 JVM 上验证(不依赖真设备/真网关)
+    testImplementation("junit:junit:4.13.2")
+    testImplementation("com.squareup.okhttp3:mockwebserver:4.12.0")
+    testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.9.0")
 }

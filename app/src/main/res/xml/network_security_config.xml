@@ -1,13 +1,34 @@
 <?xml version="1.0" encoding="utf-8"?>
 <network-security-config>
     <!--
-        网关域名为自建/自签 TLS(用户自建 OpenClaw 网关)。
-        仅为调试/个人使用放行该域名;正式发布不应信任自签证书。
-        域名从 App 设置读取,但这里的信任域需在构建时列出;
-        若用户网关域名变更,请在此处同步添加(或改用运行时 TrustManager)。
+        这个文件的作用:域级网络安全策略(信任哪些 CA、是否允许明文 HTTP)。
+
+        关键:只要存在本文件,AndroidManifest 里的 usesCleartextTraffic 就会被忽略,
+        是否允许明文完全由这里的 base-config / domain-config 决定。因此这里必须显式
+        放行明文,否则内网 http:// / ws://(如 http://192.168.x.x:port)会被系统拦成
+        CLEARTEXT communication to ... not permitted by network security policy。
+
+        只保留这一套配置:manifest 侧不再重复声明明文策略,避免两处打架。
+    -->
+    <base-config cleartextTrafficPermitted="true">
+        <trust-anchors>
+            <!-- 常规 HTTPS 仍只信任系统 CA;明文放行不等于放宽 TLS 校验 -->
+            <certificates src="system" />
+        </trust-anchors>
+    </base-config>
+
+    <!--
+        域级条目只保留一个「示例」:网关域名是运行时在设置页填写的,而这份配置必须在
+        构建时静态给出域名,所以这里只能放示例,请按需替换成你自己的网关域名(可写多条)。
+        示例域名不参与任何真实连接,保留它不影响运行;想要对某域收紧明文时照下面这样写。
+
+        注意:自签 TLS 证书不要在这里放宽信任域(trust-anchors 绝不写成信任所有证书)。
+        App 已提供「允许自签证书(仅调试)」开关(OpenClaw/Hermes/自定义 OpenAI 兼容三套配置
+        各有一个,默认关闭),联调自签证书时用它即可。
     -->
     <domain-config cleartextTrafficPermitted="false">
-        <domain includeSubdomains="false">hs0033439-openclaw.my.hiksemi.net</domain>
+        <!-- 示例域名:按需替换成你自己的网关域名 -->
+        <domain includeSubdomains="false">gateway.example.com</domain>
         <trust-anchors>
             <!-- 信任系统 CA(正常 HTTPS) -->
             <certificates src="system" />

@@ -1,10 +1,15 @@
 <?xml version="1.0" encoding="utf-8"?>
 <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:id="@+id/root"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
-    android:orientation="vertical">
+    android:orientation="vertical"
+    android:background="#1A1A2E">
 
-    <!-- 顶部:网关连接状态指示 -->
+    <!-- 根布局 background = 顶部状态条同色:
+         状态栏/导航栏 inset 作为 padding 补回后,那块新暴露出来的窗口区域会显示主题默认
+         的浅色 windowBackground(浅底配浅色系统图标会看不见)。填上应用已有的深色,保持深色观感。 -->
+    <!-- 顶部:网关连接状态指示(token 校验失败/网关断开的具体原因也显示在这里) -->
     <LinearLayout
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
@@ -66,11 +71,6 @@
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
             android:text="设备" />
-
-        <com.google.android.material.tabs.TabItem
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:text="通知" />
 
         <com.google.android.material.tabs.TabItem
             android:layout_width="wrap_content"

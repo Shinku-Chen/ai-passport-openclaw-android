@@ -31,14 +31,18 @@ class SpeechRecognizerStt(
     override val isAvailable: Boolean
         get() = SpeechRecognizer.isRecognitionAvailable(context)
 
-    override fun startTurn() {
+    override fun startTurn(onReady: () -> Unit) {
         barge()
         val sr = SpeechRecognizer.createSpeechRecognizer(context)
         recognizer = sr
         val deferred = CompletableDeferred<String?>()
         pending = deferred
         sr.setRecognitionListener(object : RecognitionListener {
-            override fun onReadyForSpeech(params: Bundle?) {}
+            override fun onReadyForSpeech(params: Bundle?) {
+                // 麦克风已打开、识别会话就绪 —— 这才是「现在说话一定能被识别」的那一刻
+                // (startListening 只是请求,回调之前说话可能丢开头)。
+                onReady()
+            }
             override fun onBeginningOfSpeech() {}
             override fun onRmsChanged(rmsdB: Float) {}
             override fun onBufferReceived(buffer: ByteArray?) {}
@@ -73,6 +77,8 @@ class SpeechRecognizerStt(
 
     override fun feedPcm(pcm: ByteArray) {
         // 系统 SpeechRecognizer 无法接收外部 PCM;忽略。
+        // feedOpus 同理不重写:系统引擎只采本机麦克风,拿不到设备送来的 Opus/PCM,
+        // 所以这里不假装支持设备上行音频(需要设备音频时必须用 Vosk 或小智引擎)。
     }
 
     override suspend fun endTurn(): String? = withContext(Dispatchers.Default) {

@@ -7,3 +7,6 @@ local.properties
 captures/
 .externalNativeBuild/
 .cxx/
+
+# Kotlin 编译日志(构建产物,不入库)
+.kotlin/

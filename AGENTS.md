@@ -22,31 +22,62 @@ app/                                    安卓应用模块
     protocol/VbFrame.kt                 线协议(与固件 voice_bridge_frame.h 一致):帧编解码/重组
     gateway/GatewayConfig.kt            网关域名/端口/token 读取口(来自 App 设置)
     gateway/GatewaySettings.kt          网关设置的 SharedPreferences 存取
-    gateway/GatewayClient.kt            OpenClaw WS RPC:connect(Ed25519 鉴权)+ chat.send + 事件流收集
+    gateway/GatewayAdapter.kt           网关抽象层:统一接口 + 按类型构造适配器的工厂
+    gateway/OpenClawGateway.kt          OpenClaw WS RPC:connect(Ed25519 鉴权)+ chat.send + 事件流收集
+    gateway/HermesGateway.kt            Hermes OpenAI 兼容 HTTP(Bearer key,/health 探活,SSE 流式)
+    gateway/EchoGateway.kt              本地回显(无网关也能联调 BLE/STT/TTS/上屏)
     gateway/DeviceIdentity.kt           Ed25519 设备身份生成/签名/持久化 + deviceToken
     pipeline/VoicePipeline.kt           流水线编排:BLE AUDIO→STT→网关→TTS→TEXT 回传 + barge
     stt/Stt.kt                          语音识别抽象
     stt/SpeechRecognizerStt.kt          系统 SpeechRecognizer 实现(当前唯一 STT 引擎)
-    tts/TtsEngine.kt                    系统 TextToSpeech 合成封装
+    tts/TtsEngine.kt                    系统 TextToSpeech 合成封装(手机本地播放)
+    tts/DeviceTtsEngine.kt              设备朗读(下行 TTS)合成抽象 + 引擎标识
+    tts/AndroidTtsEngine.kt             系统 TTS 合成成 PCM(synthesizeToFile → WAV)供下行
+    tts/HttpTtsEngine.kt                HTTP TTS 引擎骨架(OpenAI 兼容/自建,TODO)
+    tts/TtsFraming.kt                   60ms 分帧 + WAV 解析 + 一轮下发的 Opus 包计划(纯逻辑)
+    tts/TtsFlowControl.kt               下行 TTS 领先量节流(≤2s / 33 帧,目标 800ms;纯逻辑)
+    tts/TtsPlaybackReport.kt            设备 tts_playback_done/aborted 解析与日志行(纯逻辑)
+    tts/DeviceTtsSession.kt             设备朗读编排(turn_start 必发 tts_abort;开关/引擎门)
     service/VoiceBridgeService.kt       前台 Service:装配 BLE/STT/网关/TTS/流水线
   src/main/res/                         strings / themes / 前台通知图标 / activity_main 布局
 流程:
   固件(BLE 采集+PCM) → BleCentral(AUDIO 帧) → VbFrameReassembler(重组) → VoicePipeline
-    → SpeechRecognizerStt(STT 出文本) → GatewayClient(chat.send → 回复) → TtsEngine(合成)
+    → SpeechRecognizerStt(STT 出文本) → GatewayAdapter(chat → 回复) → TtsEngine(手机本地播放)
     → 回传 TEXT 帧给固件上屏;barge 在流水线内实现(再按 PTT 打断 TTS)
+  设备朗读(可选,设置项 tts_enabled 默认关):上屏之后 → DeviceTtsEngine(合成 PCM)
+    → TtsFraming/TtsFlowControl 分帧编 Opus → DeviceTtsPush 逐帧 TYPE_TTS_OPUS(0x06) → 设备播放
 ```
 
 ## 构建与验证
 
 ```bash
 ./gradlew assembleDebug        # 构建 Debug APK(需 Android SDK/JDK)
+./gradlew testDebugUnitTest    # JVM 单测(网关适配器:Hermes HTTP/SSE 行为与错误映射)
 ./gradlew lint                 # 静态检查
-# 未见自动化单测;BLE/STT/网关/TTS 均为硬件或外部依赖,需真机验证
 ```
 
-改动后至少跑 `./gradlew assembleDebug`(能快速构建时)。BLE 配对、STT 识别、网关 chat、
-TTS 合成依赖真机与自建 OpenClaw 网关,需在真机上验证;首次 connect 需网关主机
-`openclaw devices approve` 批准本设备 Ed25519 身份。
+Gradle wrapper 已入库(`gradlew`/`gradlew.bat`/`gradle/wrapper/*`,Gradle 8.10.2),
+`distributionUrl` 保持官方地址。但它需要能访问 `services.gradle.org` 下载发行版,
+在无法访问的网络下改用本机已安装的 Gradle,或临时把 `distributionUrl` 换成本地镜像:
+
+```bash
+# 1) 用本机已安装的 Gradle 构建(本机为 /d/gradle/gradle-8.10.2/bin/gradle)
+JAVA_HOME=/d/AndroidSdk/jdk21/jdk-21.0.12.1+1 \
+  /d/gradle/gradle-8.10.2/bin/gradle --no-daemon assembleDebug testDebugUnitTest
+
+# 2) 临时用镜像分发版(改完改回官方地址,镜像地址不要提交)
+#    gradle/wrapper/gradle-wrapper.properties:
+#    distributionUrl=https\://mirrors.cloud.tencent.com/gradle/gradle-8.10.2-bin.zip
+```
+
+wrapper 只读 `gradle/wrapper/gradle-wrapper.properties` 里的 `distributionUrl`;
+实测 Gradle 8.10.2 的 wrapper **不认** `-Dgradle.distributionUrl` 这类命令行/环境变量覆盖,
+所以换源只能改 properties 文件。同样,直连 Maven Central / `dl.google.com` 不通时,
+可用 init script 把仓库地址换成镜像(如 aliyun)后再构建。
+
+改动后至少跑 `./gradlew assembleDebug`(能快速构建时)与 `./gradlew testDebugUnitTest`。BLE 配对、STT 识别、
+真实网关 chat、TTS 合成依赖真机与自建网关(OpenClaw 或 Hermes),需在真机上验证;
+OpenClaw 首次 connect 需网关主机 `openclaw devices approve` 批准本设备 Ed25519 身份。
 
 ## 代码约定
 

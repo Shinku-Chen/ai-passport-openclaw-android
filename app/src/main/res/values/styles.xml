@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+
+    <!--
+        设置页字段标签:输入框/开关上方的小字灰色 label。
+        hint 在输入后会消失,所以每个字段都要有常驻 label,否则回看表单认不出字段含义。
+    -->
+    <style name="FieldLabel">
+        <item name="android:layout_width">wrap_content</item>
+        <item name="android:layout_height">wrap_content</item>
+        <item name="android:layout_marginTop">8dp</item>
+        <item name="android:textSize">12sp</item>
+        <item name="android:textColor">#9E9E9E</item>
+    </style>
+</resources>

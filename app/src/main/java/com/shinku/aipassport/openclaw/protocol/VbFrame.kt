@@ -10,7 +10,8 @@ package com.shinku.aipassport.openclaw.protocol
  * 一旦任何单字节失步(丢 notify / 分片错位),接收端会把 PCM 里恰好等于 0x01-0x04 的字节
  * 当成帧头,永久锁死(表现为 flags=201/172/255 等伪帧)。magic 0xA5 0x5A 在随机数据中
  * 出现的概率约 1/65536,几乎不会与音频/JSON 混淆,接收端凭它可靠重同步;type 仅作辅助校验。
- * 同时 AUDIO 帧 payload 固定为 1024B,长度不符的帧一律丢弃,确保脏数据不进 STT。
+ * 同时每种类型有载荷长度上限(v1 音频载荷含 1 字节 SEQ),长度不符的帧一律丢弃,
+ * 确保脏数据不进 STT。
  */
 object VbFrame {
     const val MAGIC0 = 0xA5
@@ -23,6 +24,7 @@ object VbFrame {
     const val TYPE_CONTROL = 0x03    // App→设备 JSON 命令
     const val TYPE_EVENT = 0x04      // 设备→App JSON 事件
     const val TYPE_OPUS = 0x05       // 设备→App Opus 帧(固件已编码),供小智识别
+    const val TYPE_TTS_OPUS = 0x06   // App→设备 下行 TTS Opus 帧(手机合成,设备播放回复)
 
     // ---- FLAGS ----
     const val FLAG_MORE = 0x01       // 续帧
@@ -32,7 +34,43 @@ object VbFrame {
     // ---- 常量 ----
     const val AUDIO_CHUNK_SAMPLES = 512
     const val AUDIO_CHUNK_BYTES = AUDIO_CHUNK_SAMPLES * 2   // 1024B
-    const val MAX_FRAME = HEADER_SIZE + AUDIO_CHUNK_BYTES   // 6 + 1024 = 1030B
+
+    /** Opus 单包上限(与固件 OC_OPUS_PAYLOAD_MAX 一致)。 */
+    const val OPUS_PAYLOAD_MAX = 512
+
+    /**
+     * 下行 TTS 帧头长度:`[SEQ:1B][rate_khz:1B][frame_ms:1B]`(单位字节)。
+     * 见 [VbTtsOpusPayload]。
+     */
+    const val TTS_HEADER_SIZE = 3
+
+    /** 下行 TTS 单帧 Opus 包上限(与固件 OC_TTS_OPUS_PAYLOAD_MAX 一致);不含 3B 帧头。 */
+    const val TTS_OPUS_PAYLOAD_MAX = 512
+
+    /** 文本载荷上限(与固件 OC_TEXT_PAYLOAD_MAX 一致)。 */
+    const val TEXT_PAYLOAD_MAX = 2048
+
+    /** 控制/事件 JSON 载荷上限(与固件 OC_JSON_PAYLOAD_MAX 一致)。 */
+    const val JSON_PAYLOAD_MAX = 512
+
+    /**
+     * 各帧类型的载荷上限。
+     *
+     * 音频类载荷首字节是 [SEQ:1B](v1 协议;SEQ 只占 1 字节,用于丢帧统计),
+     * 所以 PCM 兜底帧是 1024+1、Opus 帧是 ≤512+1,不是恰好 1024/512。
+     * 超限一律按错位处理(见 [VbFrameReassembler])。
+     */
+    fun payloadLimit(type: Int): Int = when (type) {
+        TYPE_AUDIO -> AUDIO_CHUNK_BYTES + 1     // [SEQ] + int16 PCM
+        TYPE_OPUS -> OPUS_PAYLOAD_MAX + 1       // [SEQ] + 一个 Opus 包
+        TYPE_TTS_OPUS -> TTS_HEADER_SIZE + TTS_OPUS_PAYLOAD_MAX   // [SEQ][rate_khz][frame_ms] + Opus 包
+        TYPE_TEXT -> TEXT_PAYLOAD_MAX
+        TYPE_CONTROL, TYPE_EVENT -> JSON_PAYLOAD_MAX
+        else -> 0
+    }
+
+    /** 重组缓冲容量:容纳合法最大帧(TEXT 2048,协议规范要求的 6 + 2048)。 */
+    const val MAX_FRAME = HEADER_SIZE + TEXT_PAYLOAD_MAX   // 6 + 2048 = 2054B
 }
 
 /**
@@ -82,9 +120,11 @@ class VbFrameReassembler(
                 if (len < VbFrame.HEADER_SIZE) continue   // 帧头还没凑齐
 
                 val payloadLen = ((buf[4].toInt() and 0xFF) shl 8) or (buf[5].toInt() and 0xFF)
+                val type = buf[2].toInt() and 0xFF
+                val limit = VbFrame.payloadLimit(type)
                 frameLen = VbFrame.HEADER_SIZE + payloadLen
-                if (frameLen > buf.size || payloadLen > VbFrame.AUDIO_CHUNK_BYTES) {
-                    // 异常帧长:即便 magic 命中,超界仍说明错位 → 丢弃头字节继续找下一个 magic
+                if (frameLen > buf.size || limit == 0 || payloadLen > limit) {
+                    // 异常帧长/未知类型:即便 magic 命中,超界仍说明错位 → 丢弃头字节继续找下一个 magic
                     System.arraycopy(buf, 1, buf, 0, len - 1)
                     len -= 1
                     continue
@@ -164,4 +204,110 @@ fun vbEncodeFrame(type: Int, flags: Int, payload: ByteArray): ByteArray {
     out[5] = (payload.size and 0xFF).toByte()
     System.arraycopy(payload, 0, out, VbFrame.HEADER_SIZE, payload.size)
     return out
+}
+
+/**
+ * 下行 TTS Opus 帧的载荷(payload,不含 6B 帧头):
+ *
+ * ```
+ * [SEQ:1B][rate_khz:1B][frame_ms:1B][Opus 包 ≤512B]
+ * ```
+ *
+ * 与固件 `intercom-wire-protocol.md` 的 `TTS_OPUS`(0x06)一致:
+ *  - [seq] 是 1 字节计数器,每帧 +1、到 256 回绕(见 [VbTtsOpusPayload.nextSeq]);只用于设备侧
+ *    统计 SEQ 缺口,丢了不重传(丢一个包 = 60ms 音频);
+ *  - [rateKhz] 只允许 `16` / `24`(帧头自带采样率,流中换采样率也合法:设备按新值重配解码器);
+ *  - [frameMs] 目前恒为 `60`(每帧恰好一个 Opus 包);
+ *  - [opus] 是一个完整 Opus 包,上限 [VbFrame.TTS_OPUS_PAYLOAD_MAX](512)。
+ *
+ * 整个 payload 长度因此是 `4..515`(`3 + 包长`),超出即按错位处理(同 [VbFrameReassembler])。
+ */
+data class VbTtsOpusPayload(
+    val seq: Int,
+    val rateKhz: Int,
+    val frameMs: Int,
+    val opus: ByteArray,
+) {
+    companion object {
+        /** SEQ 是 1 字节计数器:每帧 +1,到 256 回绕到 0。 */
+        fun nextSeq(seq: Int): Int = (seq + 1) and 0xFF
+    }
+}
+
+/**
+ * 组装一个下行 TTS 载荷([VbTtsOpusPayload])。
+ *
+ * @throws IllegalArgumentException [opus] 超过 [VbFrame.TTS_OPUS_PAYLOAD_MAX](512B)
+ */
+fun encodeTtsOpusPayload(seq: Int, rateKhz: Int, frameMs: Int, opus: ByteArray): ByteArray {
+    require(opus.size <= VbFrame.TTS_OPUS_PAYLOAD_MAX) {
+        "opus packet ${opus.size}B exceeds ${VbFrame.TTS_OPUS_PAYLOAD_MAX}B"
+    }
+    val out = ByteArray(VbFrame.TTS_HEADER_SIZE + opus.size)
+    out[0] = (seq and 0xFF).toByte()
+    out[1] = (rateKhz and 0xFF).toByte()
+    out[2] = (frameMs and 0xFF).toByte()
+    System.arraycopy(opus, 0, out, VbFrame.TTS_HEADER_SIZE, opus.size)
+    return out
+}
+
+/**
+ * 解析下行 TTS 载荷。[encodeTtsOpusPayload] 的逆操作。
+ *
+ * 长度不足(没有 Opus 包)或超出上限([VbFrame.TTS_HEADER_SIZE] + [VbFrame.TTS_OPUS_PAYLOAD_MAX])时返回 null:
+ * 这两种情况都说明帧边界已错位,调用方按错位处理(不交给解码器)。
+ */
+fun decodeTtsOpusPayload(payload: ByteArray): VbTtsOpusPayload? {
+    if (payload.size <= VbFrame.TTS_HEADER_SIZE) return null
+    if (payload.size > VbFrame.TTS_HEADER_SIZE + VbFrame.TTS_OPUS_PAYLOAD_MAX) return null
+    return VbTtsOpusPayload(
+        seq = payload[0].toInt() and 0xFF,
+        rateKhz = payload[1].toInt() and 0xFF,
+        frameMs = payload[2].toInt() and 0xFF,
+        opus = payload.copyOfRange(VbFrame.TTS_HEADER_SIZE, payload.size),
+    )
+}
+
+/**
+ * 编码一整帧下行 TTS 帧(发送方向):`[A5][5A][0x06][FLAGS=0][LEN]` + [encodeTtsOpusPayload]。
+ *
+ * FLAGS 固定 0:音频帧各自独立可解,分段语义由 `tts_start` / `tts_stop` 界定,不用 MORE/FIRST/LAST。
+ */
+fun vbEncodeTtsOpusFrame(seq: Int, rateKhz: Int, frameMs: Int, opus: ByteArray): ByteArray =
+    vbEncodeFrame(VbFrame.TYPE_TTS_OPUS, 0, encodeTtsOpusPayload(seq, rateKhz, frameMs, opus))
+
+/**
+ * 把 UTF-8 文本字节按 [maxBytes] 切成多片,每片都回退到 UTF-8 字符边界,
+ * 保证不会把一个多字节字符(如汉字 3 字节、emoji 4 字节)切到两片中间。
+ *
+ * 上行 TEXT 帧的 payload 上限是 [VbFrame.TEXT_PAYLOAD_MAX](2048),还要减去 1 字节 role,
+ * 因此长语音/带附加提示的长文本必须分片。纯函数、无 Android 依赖,便于 JVM 单测
+ * 验证「含中文多字节时仍不切坏汉字」(见 `TextChunkingTest`)。
+ *
+ * 边界判定:分片点若落在 UTF-8 续字节(0b10xxxxxx)上,说明正切在字符中间,
+ * 向前退到该字符的首字节(`cut` 指向下一片的首字节,即一个字符边界)。
+ * 注:这是对提取前服务内联循环的修正 —— 旧写法检查的是 `cut-1` 恒字节,
+ * 会切在字符中间、并可能把末尾几个续字节留在 `cut == off` 分支丢掉。
+ *
+ * 语义:
+ *  - 空输入返回空列表(调用方自行发一条空帧);
+ *  - 每片 ≤ [maxBytes];末片可能更短;
+ *  - 各片按顺序拼接后与输入字节完全相同(不丢字节)。
+ */
+fun splitTextPayload(body: ByteArray, maxBytes: Int): List<ByteArray> {
+    require(maxBytes > 0) { "maxBytes must be > 0" }
+    if (body.isEmpty()) return emptyList()
+    val chunks = ArrayList<ByteArray>()
+    var off = 0
+    while (off < body.size) {
+        val end = minOf(off + maxBytes, body.size)
+        // 回退到 UTF-8 字符边界:cut 落在续字节上就往前退
+        var cut = end
+        while (cut > off && cut < body.size && (body[cut].toInt() and 0xC0) == 0x80) cut--
+        // 非法 UTF-8(单个字符比 maxBytes 还长)兜底:不前进会死循环,至少保证推进
+        if (cut == off) cut = end
+        chunks.add(body.copyOfRange(off, cut))
+        off = cut
+    }
+    return chunks
 }

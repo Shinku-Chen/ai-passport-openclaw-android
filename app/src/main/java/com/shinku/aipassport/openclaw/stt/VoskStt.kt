@@ -4,6 +4,8 @@ import android.content.Context
 import android.util.Log
 import com.google.gson.Gson
 import com.google.gson.JsonObject
+import com.theeasiestway.opus.Constants
+import com.theeasiestway.opus.Opus
 import org.vosk.Model
 import org.vosk.Recognizer
 import java.io.File
@@ -21,6 +23,9 @@ import java.io.File
  * (见 SttFactory.findModelDir)。模型缺失时 isAvailable=false,由
  * SttFactory 降级到系统 SpeechRecognizer,不打扰用户。
  *
+ * 输入格式:固件 v1 默认上行是 Opus([feedOpus],payload 已由流水线剥掉 SEQ),
+ * Vosk 只吃 PCM,所以先用 libopus 解码;若固件回退到 PCM 则走 [feedPcm]。
+ *
  * 线程:识别器与 JNI 的交互(acceptWaveForm / finalResult / reset / close)
  * 统一用 [lock] 串行保护,与 VoicePipeline 在主线程投递帧的模型一致。
  */
@@ -37,6 +42,13 @@ class VoskStt(
 
     private var model: Model? = null
     private var recognizer: Recognizer? = null
+
+    /**
+     * Opus 解码器(libopus JNI,同 app/libs/opus.aar):
+     * 固件 v1 默认上行 Opus,而 Vosk 只吃 PCM,因此本地识别需要把 Opus 包解成 int16 PCM。
+     * 该库的编码/解码 JNI 都在,这里只用解码器(如果换成只有编码器的版本,应直接报错而不是假装支持)。
+     */
+    private var opusDecoder: Opus? = null
 
     /** 识别过程与 JNI 交互用同一把锁。 */
     private val lock = Any()
@@ -64,7 +76,7 @@ class VoskStt(
         }
     }
 
-    override fun startTurn() {
+    override fun startTurn(onReady: () -> Unit) {
         synchronized(lock) {
             // prewarm 未跑完或失败时,兜底加载模型。
             if (model == null) {
@@ -82,6 +94,9 @@ class VoskStt(
             } catch (e: Exception) {
                 Log.w(tag, "startTurn reset 异常", e)
             }
+            // 识别器可用 = 已经能吃音频(可以说话);模型/识别器不可用时不回调,
+            // 设备侧有 2.5s 兜底超时。
+            if (recognizer != null) onReady()
         }
     }
 
@@ -101,6 +116,35 @@ class VoskStt(
                 Log.w(tag, "feedPcm 异常", e)
             }
         }
+    }
+
+    /**
+     * 设备已编码的 Opus 包(固件 v1 默认上行):[VoicePipeline] 已剥掉首字节 SEQ。
+     * Vosk 只接受 PCM,所以这里先用 libopus 解码成 16k 单声道 int16,再交给 [feedPcm]。
+     */
+    override fun feedOpus(packet: ByteArray) {
+        if (packet.isEmpty()) return
+        val pcm = try {
+            decodeOpus(packet)
+        } catch (e: Exception) {
+            Log.w(tag, "Opus 解码失败", e)
+            null
+        } ?: return
+        if (pcm.isNotEmpty()) feedPcm(pcm)
+    }
+
+    /** Opus 包 → int16 PCM(16k 单声道,60ms=960 samples)。解码器懒加载并在 release 时释放。 */
+    private fun decodeOpus(packet: ByteArray): ByteArray? {
+        val decoder = opusDecoder ?: try {
+            Opus().also {
+                it.decoderInit(Constants.SampleRate._16000(), Constants.Channels.mono())
+                opusDecoder = it
+            }
+        } catch (e: Exception) {
+            Log.e(tag, "Opus 解码器初始化失败", e)
+            return null
+        }
+        return decoder.decode(packet, Constants.FrameSize._960())
     }
 
     // 从 partialResult JSON {"partial":"..."} 取 partial 文本。
@@ -157,5 +201,9 @@ class VoskStt(
             } catch (_: Exception) {}
             model = null
         }
+        try {
+            opusDecoder?.decoderRelease()
+        } catch (_: Exception) {}
+        opusDecoder = null
     }
 }

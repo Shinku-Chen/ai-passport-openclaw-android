@@ -20,84 +20,524 @@
             android:textColor="#FFFFFF"
             android:layout_marginBottom="8dp" />
 
-        <EditText
-            android:id="@+id/inputHost"
+        <!-- 网关类型:决定语音流水线实例化哪个适配器(openclaw / hermes / openai / echo)。
+             下拉选择,切换只切可见分组;真正落盘仍要等「保存网关设置」校验通过。 -->
+        <TextView
+            style="@style/FieldLabel"
+            android:text="网关类型" />
+
+        <Spinner
+            android:id="@+id/spinnerType"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:hint="网关域名(如 hs0033439-openclaw.my.hiksemi.net)"
-            android:inputType="textUri"
-            android:autofillHints="url"
-            android:textColor="#FFFFFF"
-            android:textColorHint="#9E9E9E"
+            android:layout_marginTop="4dp"
             android:background="@drawable/bg_input"
-            android:padding="10dp" />
+            android:padding="10dp"
+            android:popupBackground="#1A1A2E"
+            android:spinnerMode="dropdown" />
+
+        <!-- 明文连接提示:非阻断,只在 host 填了 http:// 或关掉 TLS 时显示。
+             明文回放 https/ws 的 token/文本都在链路上裸奔,只建议局域网/自签环境使用。 -->
+        <TextView
+            android:id="@+id/textCleartextHint"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text=""
+            android:textSize="12sp"
+            android:textColor="#FFB74D"
+            android:padding="6dp"
+            android:visibility="gone" />
+
+        <!-- OpenClaw:WebSocket + Ed25519 设备鉴权;各套配置各自持久化,切换类型不丢 -->
+        <LinearLayout
+            android:id="@+id/groupOpenclaw"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical">
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="OpenClaw(WebSocket)"
+                android:textStyle="bold"
+                android:textColor="#4FC3F7"
+                android:layout_marginTop="8dp" />
+
+            <TextView
+                style="@style/FieldLabel"
+                android:text="域名" />
+
+            <EditText
+                android:id="@+id/inputHost"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:hint="网关域名或 IP"
+                android:inputType="textUri"
+                android:autofillHints="url"
+                android:textColor="#FFFFFF"
+                android:textColorHint="#9E9E9E"
+                android:background="@drawable/bg_input"
+                android:padding="10dp" />
+
+            <TextView
+                style="@style/FieldLabel"
+                android:text="端口" />
+
+            <EditText
+                android:id="@+id/inputPort"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:hint="默认 8035"
+                android:inputType="number"
+                android:autofillHints="none"
+                android:textColor="#FFFFFF"
+                android:textColorHint="#9E9E9E"
+                android:background="@drawable/bg_input"
+                android:padding="10dp" />
+
+            <TextView
+                style="@style/FieldLabel"
+                android:text="Token" />
+
+            <EditText
+                android:id="@+id/inputToken"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:hint="网关访问令牌(运行时 secret,只存本机)"
+                android:inputType="textVisiblePassword"
+                android:autofillHints="none"
+                android:textColor="#FFFFFF"
+                android:textColorHint="#9E9E9E"
+                android:background="@drawable/bg_input"
+                android:padding="10dp" />
+
+            <TextView
+                style="@style/FieldLabel"
+                android:text="WS 路径" />
+
+            <EditText
+                android:id="@+id/inputWsPath"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:hint="默认 /message/messages/ws"
+                android:inputType="textUri"
+                android:autofillHints="none"
+                android:textColor="#FFFFFF"
+                android:textColorHint="#9E9E9E"
+                android:background="@drawable/bg_input"
+                android:padding="10dp" />
+
+            <!-- 回复等待上限:Agent 跑工具常要几十秒,默认 180s(越界夹紧到 15..900) -->
+            <TextView
+                style="@style/FieldLabel"
+                android:text="回复等待上限(秒)" />
+
+            <EditText
+                android:id="@+id/inputReplyTimeout"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:hint="默认 180;Agent 跑工具会很久"
+                android:inputType="number"
+                android:autofillHints="none"
+                android:textColor="#FFFFFF"
+                android:textColorHint="#9E9E9E"
+                android:background="@drawable/bg_input"
+                android:padding="10dp" />
+
+            <!-- 会话名:sessionKey = agent:main:<名字>。默认 passport(与 PC/微信/飞书分开) -->
+            <TextView
+                style="@style/FieldLabel"
+                android:text="会话名" />
+
+            <EditText
+                android:id="@+id/inputSessionName"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:hint="默认 passport;agent:main:&lt;名字&gt;"
+                android:inputType="text"
+                android:autofillHints="none"
+                android:textColor="#FFFFFF"
+                android:textColorHint="#9E9E9E"
+                android:background="@drawable/bg_input"
+                android:padding="10dp" />
+
+            <com.google.android.material.materialswitch.MaterialSwitch
+                android:id="@+id/checkUseTls"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="10dp"
+                android:text="使用 HTTPS/WSS"
+                android:textColor="#DDDDDD" />
+
+            <!-- 仅调试:OpenClaw 的 wss 自签证书开关(默认关闭,只作用于本通道) -->
+            <com.google.android.material.materialswitch.MaterialSwitch
+                android:id="@+id/checkOpenclawAllowInsecure"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="允许自签证书(仅调试,默认关闭,信任所有证书有中间人风险)"
+                android:textColor="#DDDDDD" />
+        </LinearLayout>
+
+        <!-- Hermes:OpenAI 兼容 HTTP API server,Bearer key -->
+        <LinearLayout
+            android:id="@+id/groupHermes"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical"
+            android:visibility="gone">
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="Hermes(OpenAI 兼容 HTTP)"
+                android:textStyle="bold"
+                android:textColor="#4FC3F7"
+                android:layout_marginTop="8dp" />
+
+            <TextView
+                style="@style/FieldLabel"
+                android:text="域名" />
+
+            <EditText
+                android:id="@+id/inputHermesHost"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:hint="域名、内网名或 Tailscale 名"
+                android:inputType="textUri"
+                android:autofillHints="url"
+                android:textColor="#FFFFFF"
+                android:textColorHint="#9E9E9E"
+                android:background="@drawable/bg_input"
+                android:padding="10dp" />
+
+            <TextView
+                style="@style/FieldLabel"
+                android:text="端口" />
+
+            <EditText
+                android:id="@+id/inputHermesPort"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:hint="默认 8642"
+                android:inputType="number"
+                android:autofillHints="none"
+                android:textColor="#FFFFFF"
+                android:textColorHint="#9E9E9E"
+                android:background="@drawable/bg_input"
+                android:padding="10dp" />
+
+            <TextView
+                style="@style/FieldLabel"
+                android:text="API Base Path" />
+
+            <EditText
+                android:id="@+id/inputHermesBasePath"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:hint="反代场景,如 /hermes;默认空"
+                android:inputType="textUri"
+                android:autofillHints="none"
+                android:textColor="#FFFFFF"
+                android:textColorHint="#9E9E9E"
+                android:background="@drawable/bg_input"
+                android:padding="10dp" />
+
+            <TextView
+                style="@style/FieldLabel"
+                android:text="Token(API_SERVER_KEY)" />
+
+            <EditText
+                android:id="@+id/inputHermesToken"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:hint="Bearer,只存本机"
+                android:inputType="textVisiblePassword"
+                android:autofillHints="none"
+                android:textColor="#FFFFFF"
+                android:textColorHint="#9E9E9E"
+                android:background="@drawable/bg_input"
+                android:padding="10dp" />
+
+            <TextView
+                style="@style/FieldLabel"
+                android:text="模型名" />
+
+            <EditText
+                android:id="@+id/inputHermesModel"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:hint="默认 hermes-agent,仅展示用途"
+                android:inputType="text"
+                android:autofillHints="none"
+                android:textColor="#FFFFFF"
+                android:textColorHint="#9E9E9E"
+                android:background="@drawable/bg_input"
+                android:padding="10dp" />
+
+            <TextView
+                style="@style/FieldLabel"
+                android:text="会话名(conversation)" />
+
+            <EditText
+                android:id="@+id/inputHermesConversation"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:hint="留空 = 用设备名/deviceId"
+                android:inputType="text"
+                android:autofillHints="none"
+                android:textColor="#FFFFFF"
+                android:textColorHint="#9E9E9E"
+                android:background="@drawable/bg_input"
+                android:padding="10dp" />
+
+            <com.google.android.material.materialswitch.MaterialSwitch
+                android:id="@+id/checkHermesUseTls"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="10dp"
+                android:text="使用 HTTPS"
+                android:textColor="#DDDDDD" />
+
+            <com.google.android.material.materialswitch.MaterialSwitch
+                android:id="@+id/checkHermesAllowInsecure"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="允许自签证书(仅调试,默认关闭)"
+                android:textColor="#DDDDDD" />
+
+            <com.google.android.material.materialswitch.MaterialSwitch
+                android:id="@+id/checkHermesServerSideConversation"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="服务端会话(conversation 名,服务端存历史)"
+                android:textColor="#DDDDDD" />
+
+            <com.google.android.material.materialswitch.MaterialSwitch
+                android:id="@+id/checkHermesStream"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="流式回复(SSE)"
+                android:textColor="#DDDDDD" />
+        </LinearLayout>
+
+        <!-- Echo:本地回环不需要任何字段 -->
+
+        <!-- 自定义 OpenAI 兼容:POST {basePath}/chat/completions,Bearer key,每次带历史 -->
+        <LinearLayout
+            android:id="@+id/groupOpenai"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical"
+            android:visibility="gone">
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="自定义 OpenAI 兼容(HTTP,每次请求带历史)"
+                android:textStyle="bold"
+                android:textColor="#4FC3F7"
+                android:layout_marginTop="8dp" />
+
+            <TextView
+                style="@style/FieldLabel"
+                android:text="域名" />
+
+            <EditText
+                android:id="@+id/inputOpenaiHost"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:hint="域名、内网名或 Tailscale 名"
+                android:inputType="textUri"
+                android:autofillHints="url"
+                android:textColor="#FFFFFF"
+                android:textColorHint="#9E9E9E"
+                android:background="@drawable/bg_input"
+                android:padding="10dp" />
+
+            <TextView
+                style="@style/FieldLabel"
+                android:text="端口" />
+
+            <EditText
+                android:id="@+id/inputOpenaiPort"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:hint="默认 8080"
+                android:inputType="number"
+                android:autofillHints="none"
+                android:textColor="#FFFFFF"
+                android:textColorHint="#9E9E9E"
+                android:background="@drawable/bg_input"
+                android:padding="10dp" />
+
+            <TextView
+                style="@style/FieldLabel"
+                android:text="Base Path" />
+
+            <EditText
+                android:id="@+id/inputOpenaiBasePath"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:hint="默认 /v1;空 = 根路径"
+                android:inputType="textUri"
+                android:autofillHints="none"
+                android:textColor="#FFFFFF"
+                android:textColorHint="#9E9E9E"
+                android:background="@drawable/bg_input"
+                android:padding="10dp" />
+
+            <TextView
+                style="@style/FieldLabel"
+                android:text="API Key" />
+
+            <EditText
+                android:id="@+id/inputOpenaiApiKey"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:hint="Bearer,明文,只存本机;本地服务可留空"
+                android:inputType="textVisiblePassword"
+                android:autofillHints="none"
+                android:textColor="#FFFFFF"
+                android:textColorHint="#9E9E9E"
+                android:background="@drawable/bg_input"
+                android:padding="10dp" />
+
+            <TextView
+                style="@style/FieldLabel"
+                android:text="模型名" />
+
+            <EditText
+                android:id="@+id/inputOpenaiModel"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:hint="必填,如 gpt-4o-mini"
+                android:inputType="text"
+                android:autofillHints="none"
+                android:textColor="#FFFFFF"
+                android:textColorHint="#9E9E9E"
+                android:background="@drawable/bg_input"
+                android:padding="10dp" />
+
+            <TextView
+                style="@style/FieldLabel"
+                android:text="系统提示词" />
+
+            <EditText
+                android:id="@+id/inputOpenaiSystemPrompt"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:hint="system,可留空"
+                android:inputType="textMultiLine"
+                android:autofillHints="none"
+                android:textColor="#FFFFFF"
+                android:textColorHint="#9E9E9E"
+                android:background="@drawable/bg_input"
+                android:padding="10dp" />
+
+            <TextView
+                style="@style/FieldLabel"
+                android:text="历史条数上限" />
+
+            <EditText
+                android:id="@+id/inputOpenaiMaxHistory"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:hint="默认 20 条"
+                android:inputType="number"
+                android:autofillHints="none"
+                android:textColor="#FFFFFF"
+                android:textColorHint="#9E9E9E"
+                android:background="@drawable/bg_input"
+                android:padding="10dp" />
+
+            <com.google.android.material.materialswitch.MaterialSwitch
+                android:id="@+id/checkOpenaiUseTls"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="10dp"
+                android:text="使用 HTTPS"
+                android:textColor="#DDDDDD" />
+
+            <!-- 仅调试:自定义 OpenAI 兼容通道的自签证书开关(默认关闭,只作用于本通道) -->
+            <com.google.android.material.materialswitch.MaterialSwitch
+                android:id="@+id/checkOpenaiAllowInsecure"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="允许自签证书(仅调试,默认关闭,信任所有证书有中间人风险)"
+                android:textColor="#DDDDDD" />
+
+            <com.google.android.material.materialswitch.MaterialSwitch
+                android:id="@+id/checkOpenaiStream"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="流式回复(SSE)"
+                android:textColor="#DDDDDD" />
+        </LinearLayout>
+
+        <!-- 语音附加提示:只在【语音输入】时自动追加到发给网关的文本末尾(文字输入不追加)。
+             与网关类型无关,所有通道共用;清空即关闭。校验通过才落盘,与其它字段一致。 -->
+        <TextView
+            style="@style/FieldLabel"
+            android:layout_marginTop="12dp"
+            android:text="语音附加提示（仅语音输入时追加）" />
 
         <EditText
-            android:id="@+id/inputPort"
+            android:id="@+id/inputVoicePromptSuffix"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:hint="端口(如 8035)"
-            android:inputType="number"
+            android:hint="默认：请用不超过 200 字回复，不要使用 emoji 表情，也不要使用 Markdown 表格。"
+            android:inputType="textMultiLine"
             android:autofillHints="none"
             android:textColor="#FFFFFF"
             android:textColorHint="#9E9E9E"
             android:background="@drawable/bg_input"
             android:padding="10dp" />
 
-        <CheckBox
-            android:id="@+id/checkUseTls"
-            android:layout_width="wrap_content"
+        <!-- App 调试展示开关:默认开。开启时对话列表展示完整回传流(状态/步骤/工具输出… 弱化小字),一条不丢;
+             关掉后 App 也只显示 body(设备/TTS 用的正确正文),适合正式演示。
+             纯 App 展示开关,与网关连接无关,因此【切换即落盘】,不走「保存网关设置」的校验-落盘闸门。 -->
+        <com.google.android.material.materialswitch.MaterialSwitch
+            android:id="@+id/checkShowRawStream"
+            android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:text="使用 HTTPS/WSS"
+            android:layout_marginTop="10dp"
+            android:text="App 显示完整回传流（调试）"
             android:textColor="#DDDDDD" />
 
-        <EditText
-            android:id="@+id/inputToken"
+        <!-- 设备朗读(下行 TTS):把网关回复合成成音频下发设备播放。
+             默认【关】—— M1 先把通路与设置项做齐,等真机验收(固件 TTS 播放通路)后再考虑默认开。
+             与网关连接无关,因此【切换即落盘】,不走「保存网关设置」的校验-落盘闸门。 -->
+        <com.google.android.material.materialswitch.MaterialSwitch
+            android:id="@+id/checkTtsEnabled"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:hint="网关访问令牌(运行时 secret,只存本机)"
-            android:inputType="textPassword"
-            android:autofillHints="password"
-            android:textColor="#FFFFFF"
-            android:textColorHint="#9E9E9E"
-            android:background="@drawable/bg_input"
-            android:padding="10dp" />
+            android:layout_marginTop="10dp"
+            android:text="设备朗读回复（TTS）"
+            android:textColor="#DDDDDD" />
 
-        <EditText
-            android:id="@+id/inputWsPath"
+        <!-- 设备朗读引擎:android=系统 TTS(M1 唯一实现);http=OpenAI 兼容 / 自建服务(只留骨架)。
+             同样【切换即落盘】。 -->
+        <TextView
+            style="@style/FieldLabel"
+            android:layout_marginTop="10dp"
+            android:text="设备朗读引擎" />
+
+        <Spinner
+            android:id="@+id/spinnerTtsEngine"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:hint="WS 对话路径(默认 /message/messages/ws)"
-            android:inputType="textUri"
-            android:autofillHints="none"
-            android:textColor="#FFFFFF"
-            android:textColorHint="#9E9E9E"
-            android:background="@drawable/bg_input"
-            android:padding="10dp" />
+            android:spinnerMode="dropdown" />
 
+        <!-- 保存即校验:先按当前输入框的草稿值探活(OpenClaw=WS 鉴权 / Hermes=/health),
+             校验通过才落盘;失败不写任何字段并在对话框里显示原因。
+             原来的「测试连接」按钮已删除(与保存重复,且保存不再预写草稿)。
+             语音桥服务常驻(主界面 onStart 自动拉起),因此不再提供启动/停止按钮。 -->
         <Button
             android:id="@+id/btnSave"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
+            android:layout_marginTop="12dp"
             android:text="保存网关设置" />
-
-        <Button
-            android:id="@+id/btnHealth"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:text="探活 /health" />
-
-        <Button
-            android:id="@+id/btnStartService"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:text="启动语音桥服务" />
-
-        <Button
-            android:id="@+id/btnStopService"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:text="停止语音桥服务" />
 
         <TextView
             android:layout_width="wrap_content"

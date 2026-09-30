@@ -28,4 +28,17 @@
             android:textIsSelectable="true"
             android:layout_gravity="start" />
     </FrameLayout>
+
+    <!-- 语音输入专用:实际附加给网关的提示词(弱化小字,用户侧靠右)。
+         用户气泡只显示 STT 原文,这一行才对应「实际发给网关的完整文本」。 -->
+    <TextView
+        android:id="@+id/chatSuffix"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_gravity="end"
+        android:paddingHorizontal="4dp"
+        android:paddingTop="2dp"
+        android:textSize="11sp"
+        android:textColor="#9E9E9E"
+        android:visibility="gone" />
 </LinearLayout>

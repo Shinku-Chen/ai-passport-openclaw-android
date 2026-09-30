@@ -7,7 +7,9 @@ import android.view.ViewGroup
 import androidx.fragment.app.Fragment
 import com.google.gson.JsonParser
 import com.shinku.aipassport.openclaw.databinding.FragmentOverviewBinding
-import com.shinku.aipassport.openclaw.gateway.GatewayClient
+import com.shinku.aipassport.openclaw.gateway.OpenClawConfig
+import com.shinku.aipassport.openclaw.gateway.OpenClawGateway
+import com.shinku.aipassport.openclaw.gateway.OpenClawGatewayRegistry
 import com.shinku.aipassport.openclaw.gateway.GatewaySettings
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -18,10 +20,12 @@ import kotlinx.coroutines.launch
 /**
  * 网关完整控制台:Agent / 模型 / 会话 / 概览 / Cron / 渠道 / 技能 / 用量。
  *
- * 数据全部走 WebSocket RPC(GatewayClient.rpc*),因为该网关 REST 报表端点只返回
+ * 数据全部走 WebSocket RPC(OpenClawGateway.rpc*),因为该网关 REST 报表端点只返回
  * 控制台 HTML,只有 /health 是 JSON。实测可用 method:agent.identity.get(agents)、
  * health(models+commands)、sessions.list、system.info、cron.list、directory.list;
  * 需 operator.admin 的:skills / usage / channels / nodes / devices(拉不到显示原因)。
+ *
+ * 注意:这套 RPC 只有 OpenClaw 网关提供,Hermes/Echo 模式下本页没有数据(见 bindConsoleHint)。
  */
 class OverviewFragment : Fragment() {
 
@@ -29,7 +33,7 @@ class OverviewFragment : Fragment() {
     private val binding get() = _binding!!
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
 
-    private lateinit var client: GatewayClient
+    private lateinit var client: OpenClawGateway
 
     override fun onCreateView(
         inflater: LayoutInflater,
@@ -42,9 +46,32 @@ class OverviewFragment : Fragment() {
 
     override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
         super.onViewCreated(view, savedInstanceState)
-        client = GatewayClient(requireContext(), GatewaySettings(requireContext()))
+        // 控制台 RPC 与语音桥服务共用同一条 WS(引用计数复用,不另开连接):
+        // 以前这里 new 一个 OpenClawGateway,每次进概览页都会多一条同名连接,
+        // 网关侧互相顶掉后表现为「每 ~6s 一次 WS 失败」。
+        client = OpenClawGatewayRegistry.acquire(
+            requireContext(),
+            OpenClawConfig.of(GatewaySettings(requireContext())),
+        )
         binding.btnRefreshOverview.setOnClickListener { refresh() }
+        bindConsoleHint()
         refresh()
+    }
+
+    /**
+     * 控制台 RPC(agents/models/sessions/cron…)是 OpenClaw 独有能力。
+     * 其它网关类型下本页仍会尝试请求(逻辑不变),但先说明原因,不留看起来像坏了的空白页。
+     */
+    private fun bindConsoleHint() {
+        val hint = when (GatewaySettings(requireContext()).type) {
+            GatewaySettings.TYPE_HERMES -> "网关控制台当前仅支持 OpenClaw;Hermes 模式下本页无数据"
+            GatewaySettings.TYPE_OPENAI ->
+                "网关控制台当前仅支持 OpenClaw;自定义 OpenAI 兼容模式下本页无数据"
+            GatewaySettings.TYPE_ECHO -> "网关控制台当前仅支持 OpenClaw;本地回显模式下本页无数据"
+            else -> null
+        }
+        binding.textConsoleHint.visibility = if (hint == null) View.GONE else View.VISIBLE
+        if (hint != null) binding.textConsoleHint.text = hint
     }
 
     private fun refresh() {
@@ -169,7 +196,7 @@ class OverviewFragment : Fragment() {
         binding.textUsage.text = renderResult(r) { payload -> payload }
     }
 
-    private fun renderResult(r: GatewayClient.RpcResult, render: (String) -> String): String {
+    private fun renderResult(r: OpenClawGateway.RpcResult, render: (String) -> String): String {
         if (!r.ok) {
             return "不可用: ${r.error ?: "网关未响应"}"
         }
@@ -184,7 +211,8 @@ class OverviewFragment : Fragment() {
     private fun truncate(s: String): String = if (s.length > 1200) s.take(1200) + "…" else s
 
     override fun onDestroyView() {
-        client.close()
+        // 只释放一次引用:服务/对话页还在用时不会把健康 socket 关掉
+        OpenClawGatewayRegistry.release(client)
         _binding = null
         super.onDestroyView()
     }

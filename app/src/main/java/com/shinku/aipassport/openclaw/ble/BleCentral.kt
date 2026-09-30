@@ -97,6 +97,9 @@ class BleCentral(
     private var targetDevice: BluetoothDevice? = null
     private var running = false
 
+    /** code=1(SCAN_FAILED_ALREADY_STARTED) 连续次数:扫到设备后重置,见 [ScanRetry]。 */
+    private var alreadyStartedAttempts = 0
+
     /** 上次连接设备地址持久化(记住设备,App 重启后自动重连)。 */
     private val prefs =
         context.getSharedPreferences("ble_central", Context.MODE_PRIVATE)
@@ -129,16 +132,24 @@ class BleCentral(
             // 兜底:即便广播过滤失效,也按名字前缀再过滤一次
             if (name?.startsWith(BleNus.DEVICE_NAME_PREFIX) != true) return
             Log.i(tag, "发现设备 ${device.address} $name")
+            alreadyStartedAttempts = 0   // 扫到了:重置 code=1 计数
             stopScan()
             connectTo(device)
         }
 
         override fun onScanFailed(errorCode: Int) {
-            Log.e(tag, "扫描失败 code=$errorCode")
-            listener.onError("BLE 扫描失败(code=$errorCode)")
-            // 扫描失败(常因 Android 限制扫描频率)不立即高频重试,退避后再扫一次。
-            // 若持续失败则不自动重连,等用户在设备页再点"扫描"。
-            if (running) scheduleReconnect(backoffMs = 8_000L)
+            val attemptsBefore = alreadyStartedAttempts
+            if (errorCode == ScanRetry.ERROR_ALREADY_STARTED) alreadyStartedAttempts++
+            Log.e(tag, "扫描失败 code=$errorCode(已连续 ALREADY_STARTED $alreadyStartedAttempts 次)")
+            // code=1(SCAN_FAILED_ALREADY_STARTED)不是致命错误:通常是上一轮扫描没停就再 startScan。
+            // 旧实现不看错误码一律退避 8s 再 startScan → 永远 code=1 自锁,必须重启 App 才能恢复。
+            val decision = ScanRetry.decide(errorCode, attemptsBefore)
+            if (ScanRetry.shouldSurfaceToUser(errorCode, alreadyStartedAttempts)) {
+                listener.onError("BLE 扫描失败(code=$errorCode)")
+            }
+            if (decision.needsStopScan) stopScan()
+            val delay = decision.retryDelayMs ?: return
+            if (running) scheduleReconnect(backoffMs = delay)
         }
     }
 
@@ -295,7 +306,19 @@ class BleCentral(
         try { gatt?.close() } catch (_: Exception) {}
         gatt = null
         targetDevice = null
-        if (running) startScan()
+        // 旧实现只有 `if (running) startScan()`:
+        // 用户点过「断开设备」后 BleCentral.stop() 已把 running 置 false,
+        // 于是「断开 → 再点扫描」是空操作,只能重启 App 才恢复(真机复现过)。
+        // 这里补回:没在跑就重新 start()(它会重新拿 scanner/权限检查),然后才扫描。
+        if (!running) {
+            Log.i(tag, "rescan(): 链路未运行,先重新初始化")
+            start()
+        }
+        if (running) {
+            startScan()
+        } else {
+            listener.onError("蓝牙未就绪,无法扫描")
+        }
     }
 
     fun stop() {
@@ -315,6 +338,30 @@ class BleCentral(
 
     /** 单次 ATT 写安全片长(MTU256-3≈253,留余量用 240)。 */
     private val WRITE_CHUNK = 240
+
+    /**
+     * 单块写入等待 onCharacteristicWrite 回调的上限。
+     * 原来 500ms 在设备忙(渲染长文本/音频)或手机射频排队时会误判超时,
+     * 实测长回复(1271B,6 块)会在第一块就报「写回调超时 status=257」而整帧丢弃。
+     */
+    private val WRITE_CALLBACK_TIMEOUT_MS = 2000L
+
+    /** 单块重试次数:丢回调/设备忙很常见,重试一次比把整条回复丢掉合理。 */
+    private val MAX_CHUNK_RETRIES = 1
+
+    /** 写入调用失败(非 GATT 回调失败)的同一块最大重试次数与间隔。 */
+    private val MAX_CALL_RETRIES = 3
+    private val CALL_RETRY_DELAY_MS = 120L
+    private var chunkRetries = 0
+
+    /**
+     * `writeCharacteristic()` **调用本身** 失败的短退避重试计数(同一块)。
+     *
+     * 真机实测:按下 OK 那一瞬间的第一枪常因设备忙/协议栈抖动而失败,
+     * 旧实现【直接丢整帧】→ `turn_ready` 要等上层约 4 秒重发才到设备 → 「等好久才变绿」。
+     * 这里改成同一块短退避重试,超限才丢整帧。
+     */
+    private var callFailRetries = 0
 
     /** 所有 App→设备逻辑帧共用串行队列,避免长回复分片交错。 */
     private val writeQueue = ArrayDeque<ByteArray>()
@@ -368,6 +415,8 @@ class BleCentral(
         if (currentWrite == null) {
             currentWrite = writeQueue.removeFirstOrNull() ?: return
             currentOffset = 0
+            chunkRetries = 0
+            callFailRetries = 0
         }
         val g = gatt ?: run { currentWrite = null; return }
         val service = g.getService(BleNus.SERVICE_UUID) ?: run { currentWrite = null; return }
@@ -383,20 +432,45 @@ class BleCentral(
         val end = minOf(currentOffset + WRITE_CHUNK, frame.size)
         val slice = frame.copyOfRange(currentOffset, end)
         val offset = currentOffset
-        currentOffset = end
         if (!writeOne(rx, slice)) {
-            Log.e(tag, "GATT 写入调用失败 offset=$offset/${frame.size}")
-            currentWrite = null
-            pumpWriteQueue()
+            // 调用本身失败:同一块短退避重试(不前进 offset→ 下次还是这块);超限才丢整帧。
+            callFailRetries++
+            if (callFailRetries <= MAX_CALL_RETRIES) {
+                Log.w(
+                    tag,
+                    "GATT 写入调用失败 offset=$offset/${frame.size}," +
+                        "${CALL_RETRY_DELAY_MS}ms 后重试第 $callFailRetries 次",
+                )
+                bleHandler.postDelayed({ pumpWriteQueue() }, CALL_RETRY_DELAY_MS)
+            } else {
+                Log.e(
+                    tag,
+                    "GATT 写入调用失败 offset=$offset/${frame.size}(已重试 $callFailRetries 次,丢弃本帧)",
+                )
+                callFailRetries = 0
+                currentWrite = null
+                currentOffset = 0
+                pumpWriteQueue()
+            }
             return
         }
+        currentOffset = end
+        callFailRetries = 0
         writeInProgress = true
         pendingWriteContinuation = { status ->
             writeInProgress = false
             if (status == BluetoothGatt.GATT_SUCCESS) {
+                chunkRetries = 0
+                pumpWriteQueue()
+            } else if (chunkRetries < MAX_CHUNK_RETRIES) {
+                // 单块失败先重试同一块:设备忙/回调丢失时,重试比丢整帧合理。
+                chunkRetries++
+                Log.w(tag, "GATT 写 status=$status,重试第 $chunkRetries 次 offset=$offset/${frame.size}")
+                currentOffset = offset
                 pumpWriteQueue()
             } else {
-                Log.e(tag, "GATT 写失败 status=$status offset=$offset/${frame.size}")
+                Log.e(tag, "GATT 写失败 status=$status offset=$offset/${frame.size}(已重试 $chunkRetries 次)")
+                chunkRetries = 0
                 currentWrite = null
                 currentOffset = 0
                 pumpWriteQueue()
@@ -409,7 +483,7 @@ class BleCentral(
             }
         }
         pendingWriteTimeout = timeout
-        bleHandler.postDelayed(timeout, 500)
+        bleHandler.postDelayed(timeout, WRITE_CALLBACK_TIMEOUT_MS)
     }
 
     private fun writeOne(rx: BluetoothGattCharacteristic, data: ByteArray): Boolean {
@@ -432,6 +506,9 @@ class BleCentral(
 
     private fun startScan() {
         val s = scanner ?: return
+        // 先停掉可能残留的扫描:否则 Android 会回 SCAN_FAILED_ALREADY_STARTED(code=1),
+        // 旧实现就是在这里自锁的(rescan() 直接 startScan,上一次一直没被停)。
+        stopScan()
         Log.i(tag, "开始扫描 ${BleNus.DEVICE_NAME_PREFIX}*")
         try {
             s.startScan(listOf(scanFilter), scanSettings, scanCallback)

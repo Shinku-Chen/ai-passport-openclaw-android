@@ -4,10 +4,12 @@ import com.google.gson.JsonArray
 import com.google.gson.JsonParser
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
-import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
-import okhttp3.RequestBody.Companion.toRequestBody
+import java.io.IOException
+import java.net.ConnectException
+import java.net.SocketTimeoutException
+import java.net.UnknownHostException
 import java.util.concurrent.TimeUnit
 
 /**
@@ -51,47 +53,27 @@ class GatewayApi(
             }
         } catch (e: Exception) {
             // 网关不可达/URL 非法/证书不信任:返回失败结果,不向 UI 抛异常。
-            ApiResult(ok = false, body = "请求失败: ${e.message}", code = 0)
+            // 原因用中文描述:状态卡会直接展示它,不能漏裸英文异常。
+            ApiResult(ok = false, body = describeNetworkError(e), code = 0)
         }
     }
 
     /**
-     * POST(带 Bearer token 鉴权)。用于调需鉴权端点(如 /tools/invoke 验证 token)。
-     * 网络/URL 异常统一捕获,不崩溃。
+     * 网络/URL 异常 → 可读中文原因(设置页/状态卡直接展示)。
+     * 与适配器里的错误文案保持同一套说法:超时/连接被拒/域名解析失败/TLS/明文被拦。
      */
-    private fun post(path: String, body: String, probeToken: String? = null): ApiResult {
-        return try {
-            val url = GatewayConfig.baseUrl(settings) + path
-            val builder = Request.Builder().url(url)
-                .post(body.toRequestBody("application/json; charset=utf-8".toMediaType()))
-            val token = probeToken ?: settings.token
-            if (token.isNotBlank()) {
-                builder.header("Authorization", "Bearer $token")
-            }
-            client.newCall(builder.build()).execute().use { resp ->
-                ApiResult(
-                    ok = resp.isSuccessful,
-                    body = resp.body?.string().orEmpty(),
-                    code = resp.code,
-                )
-            }
-        } catch (e: Exception) {
-            ApiResult(ok = false, body = "请求失败: ${e.message}", code = 0)
-        }
-    }
-
-    /**
-     * 校验网关 token 是否有效。调 /tools/invoke(需 Bearer 鉴权,实测):
-     *  - 有效 token → 非 401(鉴权通过,返回 ok:false 是缺参数的业务错)
-     *  - 无效/缺失 token → 401(鉴权失败)
-     * @param probeToken 待校验的 token(不持久化);null 时用 settings.token。
-     * 返回 true 表示 token 有效(鉴权通过),false 表示无效/网关不可达。
-     */
-    suspend fun verifyToken(probeToken: String? = null): Boolean = withContext(Dispatchers.IO) {
-        val token = probeToken ?: settings.token
-        if (token.isBlank()) return@withContext false
-        val r = post("/tools/invoke", "{}", probeToken = probeToken)
-        r.code != 401 && r.code != 0
+    private fun describeNetworkError(e: Exception): String = when (e) {
+        is SocketTimeoutException ->
+            "连接超时:${settings.host}:${settings.port} 无响应(网络/Tailscale 未就绪,或该端点未启用)"
+        is ConnectException ->
+            "连接被拒绝:${settings.host}:${settings.port} 不可达(服务未启动或端口不对)"
+        is UnknownHostException -> "无法解析主机名 ${settings.host}"
+        is java.net.UnknownServiceException ->
+            "明文连接被网络安全策略拦截(http:// 未放行):请改用 https:// 或调整 network_security_config"
+        is javax.net.ssl.SSLHandshakeException -> "TLS 证书校验失败(自签证书需在设置里允许)"
+        is java.security.cert.CertificateException -> "证书校验失败(自签证书需在设置里允许)"
+        is IOException -> "网络错误:${e.message ?: e.javaClass.simpleName}"
+        else -> "请求失败:${e.message ?: e.javaClass.simpleName}"
     }
 
     suspend fun health(): ApiResult = withContext(Dispatchers.IO) { get("/health") }
