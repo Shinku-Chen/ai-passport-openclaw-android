@@ -83,6 +83,16 @@ fun awaitingPairingStatus(
     recoverable = true,
 )
 
+/** 网关错误码/文案是否表示「token 不匹配/未授权」(换 token 后旧值失效就走这条)。 */
+fun isTokenMismatch(code: String?, message: String?): Boolean {
+    val msg = message?.trim().orEmpty().lowercase()
+    val c = code?.trim().orEmpty().lowercase()
+    return msg.contains("token mismatch") ||
+        msg.contains("unauthorized") ||
+        (msg.contains("token") && msg.contains("invalid")) ||
+        c == "unauthorized"
+}
+
 /** deviceId 前 8 位(传入完整 deviceId 时也安全;不足 8 位则原样返回)。 */
 fun shortDeviceId(deviceId: String?): String = deviceId?.trim()?.take(8).orEmpty()
 
@@ -105,6 +115,13 @@ fun mapRpcError(code: String?, message: String?, deviceIdShort: String): Gateway
         ?: HTTP_STATUS.find(msg)?.groupValues?.get(1)?.toIntOrNull()
 
     return when {
+        // 0) token 不匹配/未授权:换 token 后旧值失效就走这条。
+        //    必须先于「未配对」判定:网关对这两种情况的文案里都可能带 device/gateway 词。
+        isTokenMismatch(code, msg) -> GatewayStatus(
+            state = GatewayStatus.STATE_OFFLINE,
+            detail = "网关 token 不匹配:旧 token 已失效,请在设置页更新 Token 后保存",
+        )
+
         // 1) 设备未配对/未批准:独立的「等待授权」状态,可恢复(批准后下一次重试自动恢复)
         isPairingRequired(code, msg) -> awaitingPairingStatus(short)
 

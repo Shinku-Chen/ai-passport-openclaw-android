@@ -926,8 +926,17 @@ class OpenClawGateway(
                     // 已播报「等待网关授权:…」:不要再被通用的「鉴权失败」文案盖掉(否则用户看不出该去批准)
                     Log.w(tag, "网关 connect 未通过:设备等待授权(deviceId=${identity.deviceId})")
                 } else {
-                    Log.w(tag, "网关 connect 鉴权失败(设备可能未在网关 approve)")
-                    onStatus("网关鉴权失败:请在网关主机 openclaw devices approve 设备")
+                    // 区分两种失败:token 不匹配(换 token 后旧值失效)与设备未批准。
+                    // 旧实现一律报「请在网关主机 openclaw devices approve 设备」——真机实测 token 失效时
+                    // 也会走到这里,把用户引向错误的操作。
+                    val mismatch = isTokenMismatch(null, lastRpcError)
+                    if (mismatch) {
+                        Log.w(tag, "网关 connect 鉴权失败:token 不匹配(请在设置页更新 Token)")
+                        onStatus("网关 token 不匹配:旧 token 已失效,请在设置页更新 Token 后保存")
+                    } else {
+                        Log.w(tag, "网关 connect 鉴权失败(设备可能未在网关 approve)")
+                        onStatus("网关鉴权失败:请在网关主机 openclaw devices approve 设备")
+                    }
                 }
             }
         }

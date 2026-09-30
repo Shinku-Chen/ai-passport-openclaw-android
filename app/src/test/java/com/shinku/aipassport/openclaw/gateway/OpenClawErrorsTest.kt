@@ -151,4 +151,27 @@ class OpenClawErrorsTest {
         assertTrue(mapRpcError("NOT_PAIRED", null, full).detail.contains("deviceId 01234567…"))
         assertFalse(mapRpcError("NOT_PAIRED", null, full).detail.contains(full))
     }
+
+    /** 换 token 后旧值失效:必须报「token 不匹配」,不能被引导去批准设备。 */
+    @Test
+    fun token_mismatch_maps_to_update_token_not_device_approval() {
+        val st = mapRpcError(
+            "INVALID_REQUEST",
+            "unauthorized: gateway token mismatch (open the dashboard URL and paste the token in Control UI settings)",
+            "8b87594d",
+        )
+        assertEquals("offline", st.state)
+        assertTrue("应点明 token: ${st.detail}", st.detail.contains("token"))
+        assertTrue("应引导去设置页更新: ${st.detail}", st.detail.contains("设置页"))
+        assertFalse("不得再引导去批准设备: ${st.detail}", st.detail.contains("approve"))
+        assertFalse("token 失效不是等待授权", st.awaitingPairing)
+    }
+
+    @Test
+    fun token_mismatch_detector_covers_gateway_wording() {
+        assertTrue(isTokenMismatch(null, "unauthorized: gateway token mismatch"))
+        assertTrue(isTokenMismatch("unauthorized", null))
+        assertTrue(isTokenMismatch(null, "invalid token"))
+        assertFalse(isTokenMismatch("INVALID_REQUEST", "pairing required: device is not approved yet"))
+    }
 }
