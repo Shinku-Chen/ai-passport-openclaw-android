@@ -28,8 +28,13 @@ jobs:
           distribution: temurin
           java-version: "21"
 
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
+      # 不用 android-actions/setup-android:它仍会去装已废弃的 `tools` 包并直接失败
+      # (Warning: Failed to find package 'tools')。GitHub 的 ubuntu runner 预装 Android SDK,
+      # ANDROID_HOME / ANDROID_SDK_ROOT 已就绪,直接用即可。
+      - name: Show Android SDK
+        run: |
+          echo "ANDROID_HOME=$ANDROID_HOME"
+          ls "$ANDROID_HOME/build-tools" | tail -3
 
       - name: Decode release keystore
         env:
