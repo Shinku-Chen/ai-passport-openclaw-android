@@ -35,8 +35,8 @@ android {
         applicationId = "com.shinku.aipassport.openclaw"
         minSdk = 26          // BLE 前台 Service + 后台扫描需要
         targetSdk = 35
-        versionCode = 1
-        versionName = "0.1.0"
+        versionCode = 2
+        versionName = "0.1.1"
     }
 
     signingConfigs {

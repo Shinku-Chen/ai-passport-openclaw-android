@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+## 0.1.1
+
+- 打包与签名改由 GitHub Actions 完成：keystore 与口令存放在仓库 Secrets，推送 `v*` 标签即产出并附上签名 APK。
+- 修复：进设置页时网关类型下拉显示已保存的类型；保存网关设置只写当前类型那一组。
+- 修复：BLE 扫描 code=1 自锁、断开设备后重扫失效；GATT 写入调用失败改为短退避重试。
+- 修复：轮换网关 token 后提示「更新 Token」，不再误导向「批准设备」。
+
 - 改进：**「自定义 OpenAI 兼容」支持直接填完整请求路径**（不再写死 `/chat/completions`）。
   - 设置页 `Base Path` 改名 **`请求路径`**（prefs key `openai_base_path` 与输入框 id 不变，旧配置继续生效）：
     填 `/v1` 仍按老行为自动补成 `/v1/chat/completions`；直接填完整端点（如 `/openai/v1/chat/completions`）
@@ -415,3 +422,4 @@
   SpeechRecognizerStt(系统 STT)、TtsEngine(系统 TTS)、GatewayClient(OpenClaw WS 对话,
   Ed25519 设备鉴权+chat)、GatewaySettings/MainActivity(网关域名/token 设置)、
   VoiceBridgeService(前台编排)。设备需在网关主机 `openclaw devices approve` 配对后方可对话。
+
