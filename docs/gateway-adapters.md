@@ -277,17 +277,26 @@ Hermes 的接入方式是 **OpenAI 兼容 HTTP API server**（由 `hermes gatewa
 ## 4. 自定义 OpenAI 兼容（新增）
 
 面向任意实现了 OpenAI 兼容 HTTP API 的服务（vLLM / llama.cpp server / LM Studio / Ollama 的 `/v1` / 各家中转）：
-只要 `POST {basePath}/chat/completions` 能返回 `choices[0].message.content` 就能用。
+只要 `POST {请求路径}` 能返回 `choices[0].message.content` 就能用。
+
+**请求路径**：设置页「请求路径」直接填端点路径，由纯逻辑 `gateway/OpenAiPath.kt` 解析（规则写在该文件 KDoc）：
+
+- 填 `/v1`（旧默认）→ 自动补成 `/v1/chat/completions`，与历史行为一致；
+- 填完整端点 `/openai/v1/chat/completions` → 原样使用，适配任意布局的服务；
+- 以 `/chat/completions` 结尾（允许结尾多余斜杠）→ 原样，否则按「前缀」补 `/chat/completions`；
+- 带查询串时只对 `?` 之前的部分判定与拼接，查询串原样保留在末尾；
+- 归一化：去首尾空白、合并连续 `/`、补前导 `/`、结尾不留 `/`。
 
 | 项 | 取值 |
 | --- | --- |
-| 基址 | `{scheme}://{host}:{port}{basePath}`，端口默认 **8080**，`basePath` 默认 **`/v1`**（空串 = 根路径） |
+| 基址 | `{scheme}://{host}:{port}`（origin，不含路径），端口默认 **8080** |
+| 请求路径 | 设置页「请求路径」，默认 `/v1`（解析为 `/v1/chat/completions`）；可直接填完整端点（如 `/openai/v1/chat/completions`）。解析规则见 `OpenAiPath` |
 | 鉴权 | `Authorization: Bearer <apiKey>`（本地服务不校验时可留空） |
-| 对话 | `POST {basePath}/chat/completions`，body `{"model":…, "messages":[…], "stream":false}` → 取 `choices[0].message.content` |
+| 对话 | `POST {请求路径}`，body `{"model":…, "messages":[…], "stream":false}` → 取 `choices[0].message.content` |
 | 流式 | 同端点 `stream:true` → SSE 增量拼接（与 Hermes 共用 `OpenAiCompat.readSse`；未知事件按畸形事件丢弃，不影响正文） |
 | model | **必填**：服务端按它选模型（与 Hermes 的"仅展示用途"不同） |
 | 历史 | 每次请求都带：`messages = [可选 system] + ConversationStore 历史(user/assistant) + 本轮用户文本`，历史按 `maxHistory`（默认 20 条）截断 |
-| 保存前校验 | 优先 `GET {basePath}/models`；404/405 时退化为一次最小 `chat/completions`；失败给出可读原因且不落盘 |
+| 保存前校验 | 优先 `GET {请求路径所在目录}/models`（由 `OpenAiPath.modelsPath` 推导）；404/405 时退化为一次最小 `chat/completions`；失败给出可读原因且不落盘 |
 
 实现要点：
 
@@ -295,8 +304,10 @@ Hermes 的接入方式是 **OpenAI 兼容 HTTP API server**（由 `hermes gatewa
    （可选 system 在最前、历史保持原序、`maxHistory` 只截断历史、历史末尾已含本轮文本时不重复追加）。
    调用方（`GatewayFactory.conversationHistory`）不再自带截断，避免两处上限互相覆盖。
 2. **中断与错误映射**与 Hermes 同一套：`interrupt()` 真正 cancel 在途 OkHttp Call；
-   401/403 = API Key 错，404 = Base Path/服务不对，超时/连接失败/明文被拦/TLS 失败都给可读 `lastError`。
-3. **不含 Android 依赖**，可在 JVM 单测里用 MockWebServer 覆盖（见 `OpenAiCompatibleGatewayTest`）。
+   401/403 = API Key 错，404 = 请求路径/服务不对，超时/连接失败/明文被拦/TLS 失败都给可读 `lastError`。
+3. **路径拼装**：URL = `origin()`（`http(s)://host:port`，不含路径）+ `OpenAiPath.resolveChatPath(basePath)`；
+   探活 `/models` 由 `OpenAiPath.modelsPath(chatPath)` 推导（不再有写死的 `/chat/completions`）。
+4. **不含 Android 依赖**，可在 JVM 单测里用 MockWebServer 覆盖（见 `OpenAiCompatibleGatewayTest`）。
 
 ## 5. 设置页字段
 
@@ -306,12 +317,12 @@ Hermes 的接入方式是 **OpenAI 兼容 HTTP API server**（由 `hermes gatewa
 | Host | 域名或 IP | 域名、内网名或 Tailscale 名 | 同左 |
 | Port | 默认 8035 | 默认 8642 | 默认 8080 |
 | TLS | 开关 + 「允许自签证书」调试开关 | 开关 + 「允许自签证书」调试开关 | 开关 + 「允许自签证书」调试开关 |
-| Path | `wsPath`（默认 `/message/messages/ws`） | 基址路径前缀（反代场景可配） | 基址路径前缀（默认 `/v1`） |
+| Path | `wsPath`（默认 `/message/messages/ws`） | 基址路径前缀（反代场景可配） | 请求路径（默认 `/v1`，自动补 `/chat/completions`；也可填完整路径如 `/openai/v1/chat/completions`） |
 | 回复等待上限 | 「回复等待上限 秒」（默认 180） | — | — |
 | Token | 网关 token | `API_SERVER_KEY` | `apiKey`（Bearer，明文输入框，可留空） |
 | Model / 会话 | 固定 `agent:main:main` | `model`（默认 `hermes-agent`）+ `conversation` 名 | `model`（**必填**）+ 可选 `systemPrompt` + `maxHistory`（默认 20） |
 | 流式 | — | 「流式回复(SSE)」开关 | 「流式回复(SSE)」开关 |
-| 保存前校验 | WS connect 鉴权（草稿值，失败不落盘） | `GET /health`（草稿值，失败不落盘） | `GET {basePath}/models`，404 时退化最小对话（草稿值，失败不落盘） |
+| 保存前校验 | WS connect 鉴权（草稿值，失败不落盘） | `GET /health`（草稿值，失败不落盘） | `GET {请求路径所在目录}/models`，404 时退化最小对话（草稿值，失败不落盘） |
 | 明文 HTTP | `network_security_config.xml` 里 `<base-config cleartextTrafficPermitted="true">` 统一放行内网 `http://` / `ws://`（存在该文件时 manifest 的 `usesCleartextTraffic` 会被忽略，所以只留这一套配置）；设置页给出**非阻断**提示：host 填了 `http://` 或关掉 TLS 时提示「明文连接：token 会以明文发送，建议仅在局域网/自签环境使用」。放行明文**不**等于放宽 TLS 校验，`trust-anchors` 仍只信任系统 CA | 同 | 同 |
 
 「保存网关设置」= 先用输入框里的草稿值校验连接，通过才把各套字段与网关类型写进 SharedPreferences；

@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- 改进：**「自定义 OpenAI 兼容」支持直接填完整请求路径**（不再写死 `/chat/completions`）。
+  - 设置页 `Base Path` 改名 **`请求路径`**（prefs key `openai_base_path` 与输入框 id 不变，旧配置继续生效）：
+    填 `/v1` 仍按老行为自动补成 `/v1/chat/completions`；直接填完整端点（如 `/openai/v1/chat/completions`）
+    则原样使用；带查询串、连续斜杠、结尾多余斜杠都会归一化。
+  - 新增纯逻辑 `gateway/OpenAiPath.kt`（`resolveChatPath` / `modelsPath`，KDoc 写明规则）；
+    网关 URL 拼装改为 `origin()`（`http(s)://host:port`，不含路径）+ 解析后的完整路径，
+    不再用带 basePath 的 `baseUrl()` 拼接；探活 `GET …/models` 由 chat 路径推导。
+  - JVM 单测 `OpenAiPathTest`：空/前缀补全/完整路径/结尾多余斜杠/查询串/连续斜杠 + `modelsPath` 推导。
+
 - 新增：**设备朗读回复（下行 TTS）：手机合成音频 → `TTS_OPUS`(0x06) 帧推给设备播放**（M1）。
   - 网关回复仍照旧经 `TEXT('A')` 上屏（既有行为不变），**上屏之后**再触发一次 TTS 下发；
     默认 **关**（设置项 `tts_enabled`），等真机验收（固件播放通路就绪）后再考虑默认开。

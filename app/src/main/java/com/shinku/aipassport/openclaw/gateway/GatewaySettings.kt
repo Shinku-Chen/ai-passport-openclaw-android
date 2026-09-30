@@ -10,7 +10,7 @@ import com.shinku.aipassport.openclaw.tts.TtsEngines
  * 支持四类网关(见 docs/gateway-adapters.md):
  *  - `openclaw`:自建 OpenClaw 网关(WebSocket + Ed25519 设备鉴权)
  *  - `hermes`:Hermes 的 OpenAI 兼容 HTTP API server(Bearer key)
- *  - `openai`:自定义 OpenAI 兼容 HTTP 服务(`POST {basePath}/chat/completions`,每次带历史)
+ *  - `openai`:自定义 OpenAI 兼容 HTTP 服务(`POST {请求路径}`,每次带历史)
  *  - `echo`:本地回显(无网关联调用)
  *
  * 各套配置用不同 key 前缀分别持久化(OpenClaw 沿用历史 `gateway_*` 键,Hermes 用 `hermes_*`,
@@ -213,7 +213,10 @@ class GatewaySettings(context: Context) {
         get() = prefs.getBoolean(KEY_OPENAI_ALLOW_INSECURE_TLS, false)
         set(value) = prefs.edit().putBoolean(KEY_OPENAI_ALLOW_INSECURE_TLS, value).apply()
 
-    /** 基址路径前缀(默认 `/v1`,即 OpenAI 兼容端点前缀);空串 = 根路径。 */
+    /**
+     * 请求路径(默认 `/v1`,解析为 `/v1/chat/completions`);可直接填完整端点路径
+     * (如 `/openai/v1/chat/completions`),解析规则见 [OpenAiPath]。prefs key 仍为 `openai_base_path`。
+     */
     var openaiBasePath: String
         get() = prefs.getString(KEY_OPENAI_BASE_PATH, DEFAULT_OPENAI_BASE_PATH) ?: DEFAULT_OPENAI_BASE_PATH
         set(value) = prefs.edit().putString(KEY_OPENAI_BASE_PATH, value.trim()).apply()

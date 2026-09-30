@@ -372,13 +372,13 @@
 
             <TextView
                 style="@style/FieldLabel"
-                android:text="Base Path" />
+                android:text="请求路径" />
 
             <EditText
                 android:id="@+id/inputOpenaiBasePath"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
-                android:hint="默认 /v1;空 = 根路径"
+                android:hint="默认 /v1/chat/completions；也可只填 /v1，会自动补 /chat/completions"
                 android:inputType="textUri"
                 android:autofillHints="none"
                 android:textColor="#FFFFFF"

@@ -29,7 +29,8 @@ import javax.net.ssl.SSLHandshakeException
  *  - 多了可选的 `systemPrompt` 与可配的历史条数上限 [maxHistory]
  *
  * 字段语义:
- *  - [basePath] 基址路径前缀,默认 `/v1`(OpenAI 兼容端点),空串表示根路径
+ *  - [basePath] 用户填的请求路径:默认 `/v1`(解析为 `/v1/chat/completions`);也可直接填完整
+ *    端点路径(如 `/openai/v1/chat/completions`);空串表示根路径。解析规则见 [OpenAiPath]
  *  - [apiKey] Bearer token,明文输入框、只存本机(部分本地服务不校验,留空即不带 Authorization)
  *  - [allowInsecureTls] 仅调试用:允许自签证书(默认关闭,生产必须关闭)
  *  - [stream] true 时走 SSE 增量拼接,false 时取 choices[0].message.content
@@ -52,25 +53,36 @@ data class OpenAiConfig(
     /** Host/端口/模型名是否都填了(model 必填,缺了无法发出合法请求)。 */
     fun isConfigured(): Boolean = host.isNotBlank() && port > 0 && model.isNotBlank()
 
-    /** 根基址,形如 `http://host:8080/v1`(basePath 已归一化,无结尾斜杠)。 */
+    /** 服务 origin(`http(s)://host:port`,**不含任何路径**):请求 URL = origin + 解析后的完整请求路径。 */
+    fun origin(): String = "${scheme()}://$host:$port"
+
+    /**
+     * 根基址(origin + 用户填的 basePath),形如 `http://host:8080/v1`。
+     *
+     * **仅供展示/诊断**:实际请求请用 [origin] + [OpenAiPath.resolveChatPath] 的结果
+     * (baseUrl 自带 basePath,与解析后的完整路径拼在一起会重复)。
+     */
     fun baseUrl(): String {
-        val scheme = if (useTls) "https" else "http"
         val path = basePath.trim().trim('/').let { if (it.isEmpty()) "" else "/$it" }
-        return "$scheme://$host:$port$path"
+        return origin() + path
     }
+
+    private fun scheme(): String = if (useTls) "https" else "http"
 }
 
 /**
  * 「自定义 OpenAI 兼容」网关实现。
  *
- * 请求:`POST {scheme}://{host}:{port}{basePath}/chat/completions`,
- * `Authorization: Bearer <apiKey>`,body `{model, messages, stream}`。
+ * 请求:`POST {origin}{请求路径}`,`Authorization: Bearer <apiKey>`,body `{model, messages, stream}`。
+ * 请求路径 = [OpenAiPath.resolveChatPath]`(basePath)`:填 `/v1` 自动补成 `/v1/chat/completions`,
+ * 直接填完整端点(如 `/openai/v1/chat/completions`)则原样使用。
  * messages = `[可选 system] + ConversationStore 历史(user/assistant) + 本轮用户文本`,
  * 历史按 [OpenAiConfig.maxHistory] 截断;拼装复用 [OpenAiCompat.buildClientMessages]
  * (与 Hermes 的客户端历史模式同一份实现)。
  *
- * 保存前校验(见 [GatewaySaveGuard])在本类的 [connect] 里:优先 `GET {basePath}/models`,
- * 服务端没有该端点(404/405)时退化为一次最小 `chat/completions`,成功即视为可用。
+ * 保存前校验(见 [GatewaySaveGuard])在本类的 [connect] 里:优先 `GET {请求路径所在目录}/models`
+ * (由 [OpenAiPath.modelsPath] 从请求路径推导),服务端没有该端点(404/405)时退化为一次最小
+ * `chat/completions`,成功即视为可用。
  *
  * 边界与约定与 Hermes 一致:任何失败都不抛异常,统一写进 [lastError] 并让 [chat] 返回 null;
  * [interrupt] 真正 cancel 在途 OkHttp Call;不含 Android 依赖,便于 JVM 单测(MockWebServer)。
@@ -86,6 +98,12 @@ class OpenAiCompatibleGateway(
 
     private val ownsClient = client == null
     private val http: OkHttpClient = client ?: buildClient(config)
+
+    /** 用户填的 basePath 解析出的完整 chat 路径(如 `/v1/chat/completions`)。 */
+    private val chatPath: String = OpenAiPath.resolveChatPath(config.basePath)
+
+    /** 探活用的 `/models` 路径(由 [chatPath] 推导)。 */
+    private val modelsPath: String = OpenAiPath.modelsPath(chatPath)
 
     /** 在途请求;interrupt()/close() 靠它真正取消。 */
     @Volatile
@@ -117,7 +135,7 @@ class OpenAiCompatibleGateway(
             return@withContext false
         }
         // 1) 先试 GET /models(大多数 OpenAI 兼容服务都有;不必消费 token)
-        val models = execute(http.newCall(request(MODELS_PATH).get().build()), coroutineContext[Job])
+        val models = execute(http.newCall(request(modelsPath).get().build()), coroutineContext[Job])
         when {
             models == null -> return@withContext false                 // 网络/URL 异常,lastError 已写
             models.ok -> {
@@ -144,7 +162,7 @@ class OpenAiCompatibleGateway(
             stream = false,
         )
         val chat = execute(
-            http.newCall(request(CHAT_PATH).post(minimalBody.toRequestBody(JSON_MEDIA_TYPE)).build()),
+            http.newCall(request(chatPath).post(minimalBody.toRequestBody(JSON_MEDIA_TYPE)).build()),
             coroutineContext[Job],
         )
         when {
@@ -184,7 +202,7 @@ class OpenAiCompatibleGateway(
         val body = OpenAiCompat.requestBody(config.model, messages, config.stream)
         val call = try {
             http.newCall(
-                request(CHAT_PATH)
+                request(chatPath)
                     .post(body.toRequestBody(JSON_MEDIA_TYPE))
                     .build()
             )
@@ -286,7 +304,8 @@ class OpenAiCompatibleGateway(
     }
 
     private fun request(path: String): Request.Builder {
-        val b = Request.Builder().url(config.baseUrl() + path)
+        // origin 不含路径;path 已是 OpenAiPath 解析出的完整路径,避免与 basePath 重复
+        val b = Request.Builder().url(config.origin() + path)
         if (config.apiKey.isNotBlank()) {
             b.header("Authorization", "Bearer ${config.apiKey}")
         }
@@ -335,12 +354,6 @@ class OpenAiCompatibleGateway(
     }
 
     companion object {
-        /** 模型列表端点(探活优先项,相对基址)。 */
-        const val MODELS_PATH = "/models"
-
-        /** OpenAI 兼容对话端点(相对基址)。 */
-        const val CHAT_PATH = "/chat/completions"
-
         private val JSON_MEDIA_TYPE = "application/json; charset=utf-8".toMediaType()
 
         /** 按配置构造 OkHttpClient;流式要放宽读超时(增量之间可能间隔较久)。 */
