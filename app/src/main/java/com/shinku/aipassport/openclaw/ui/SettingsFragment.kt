@@ -82,13 +82,16 @@ class SettingsFragment : Fragment() {
         super.onViewCreated(view, savedInstanceState)
         settings = GatewaySettings(requireContext())
         xzSettings = XiaozhiSettings()
+        // 先装网关类型下拉的 adapter,再回填字段。
+        // 真机 bug:旧顺序是 loadSettings() -> 然后才 adapter = …,而 loadSettings() 里的
+        // bindTypeSpinner() 会 setSelection(idx) —— 作用在【空 adapter】上会被忽略,
+        // 装上 adapter 后默认落回第 0 项 → 无论保存的是哪种网关,进设置页永远显示 OpenClaw。
+        binding.spinnerType.adapter =
+            ArrayAdapter(requireContext(), R.layout.item_spinner_option, typeLabels)
         loadSettings()
         bindCleartextHint()
 
-        // 网关类型下拉:切换只切可见分组:类型本身也要等「保存」校验通过才落盘。
-        // 否则草稿校验失败时,类型已经被写进设置、服务被换成不可用后端,原配置就不再生效了。
-        binding.spinnerType.adapter =
-            ArrayAdapter(requireContext(), R.layout.item_spinner_option, typeLabels)
+        // 监听在回填之后挂:避免回填触发的选中回调被当成“用户切换”
         binding.spinnerType.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
             override fun onItemSelected(
                 parent: AdapterView<*>?,
