@@ -254,43 +254,59 @@ class SettingsFragment : Fragment() {
      * 把界面上的两套字段与网关类型写入 SharedPreferences;只在校验通过后被调用。
      * 写入的值来自 [FormSnapshot],因此「校验的」与「落盘的」逐字一致。
      */
+    /**
+     * 落盘:只写【当前类型这一组】字段 + 跨类型共用的语音附加提示词。
+     *
+     * 修的真机 bug:旧实现把三套网关字段【全写一遍】✗ —— 切换网关类型后点保存时,
+     * 那些没在编辑的分组(表单值是空/默认的)会把已保存的配置覆盖成默认值
+     * (用户报告的原话:「网关类型在切换的时候恢复为默认设置」)。
+     * 类型下拉本来就只影响可见分组,落盘也应只写这一组。
+     */
     private fun persistForm(form: FormSnapshot) {
         settings.type = form.type
-        settings.save(
-            host = form.openclawHost,
-            port = form.openclawPort,
-            useTls = form.openclawUseTls,
-            allowInsecureTls = form.openclawAllowInsecureTls,
-            token = form.openclawToken,
-            wsPath = form.openclawWsPath,
-            replyTimeoutSeconds = form.openclawReplyTimeout,
-            sessionName = form.openclawSessionName,
-            voicePromptSuffix = form.voicePromptSuffix,
-        )
-        settings.saveHermes(
-            host = form.hermesHost,
-            port = form.hermesPort,
-            useTls = form.hermesUseTls,
-            allowInsecureTls = form.hermesAllowInsecureTls,
-            basePath = form.hermesBasePath,
-            token = form.hermesToken,
-            model = form.hermesModel,
-            conversation = form.hermesConversation,
-            useServerSideConversation = form.hermesServerSideConversation,
-            stream = form.hermesStream,
-        )
-        settings.saveOpenAi(
-            host = form.openaiHost,
-            port = form.openaiPort,
-            useTls = form.openaiUseTls,
-            allowInsecureTls = form.openaiAllowInsecureTls,
-            basePath = form.openaiBasePath,
-            apiKey = form.openaiApiKey,
-            model = form.openaiModel,
-            systemPrompt = form.openaiSystemPrompt,
-            maxHistory = form.openaiMaxHistory,
-            stream = form.openaiStream,
-        )
+        // 跨类型共用:语音输入末尾附加的提示词(所有网关通道都走语音链路)
+        settings.voicePromptSuffix = form.voicePromptSuffix
+        when (form.type) {
+            GatewaySettings.TYPE_HERMES -> settings.saveHermes(
+                host = form.hermesHost,
+                port = form.hermesPort,
+                useTls = form.hermesUseTls,
+                allowInsecureTls = form.hermesAllowInsecureTls,
+                basePath = form.hermesBasePath,
+                token = form.hermesToken,
+                model = form.hermesModel,
+                conversation = form.hermesConversation,
+                useServerSideConversation = form.hermesServerSideConversation,
+                stream = form.hermesStream,
+            )
+
+            GatewaySettings.TYPE_OPENAI -> settings.saveOpenAi(
+                host = form.openaiHost,
+                port = form.openaiPort,
+                useTls = form.openaiUseTls,
+                allowInsecureTls = form.openaiAllowInsecureTls,
+                basePath = form.openaiBasePath,
+                apiKey = form.openaiApiKey,
+                model = form.openaiModel,
+                systemPrompt = form.openaiSystemPrompt,
+                maxHistory = form.openaiMaxHistory,
+                stream = form.openaiStream,
+            )
+
+            GatewaySettings.TYPE_ECHO -> Unit   // 本地回环无字段
+
+            else -> settings.save(        // OpenClaw
+                host = form.openclawHost,
+                port = form.openclawPort,
+                useTls = form.openclawUseTls,
+                allowInsecureTls = form.openclawAllowInsecureTls,
+                token = form.openclawToken,
+                wsPath = form.openclawWsPath,
+                replyTimeoutSeconds = form.openclawReplyTimeout,
+                sessionName = form.openclawSessionName,
+                voicePromptSuffix = form.voicePromptSuffix,
+            )
+        }
     }
 
     /**
@@ -401,6 +417,10 @@ class SettingsFragment : Fragment() {
                     is SaveValidation.Ok -> {
                         // 只在真正通过时落盘:校验不通过绝不落盘(含等待授权)
                         persistForm(form)
+                        // 落盘后用 prefs 回填一遍表单:保证可见分组显示的就是已保存值
+                        // (不再是陈旧值,也避免下一个人手误改到别的分组)。
+                        // 视图可能已被销毁(重试循环跨页面),所以先判 view 是否还在。
+                        if (view != null) loadSettings()
                         saved = true
                     }
 
