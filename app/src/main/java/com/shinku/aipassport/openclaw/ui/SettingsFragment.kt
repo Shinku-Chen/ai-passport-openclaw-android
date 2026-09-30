@@ -23,7 +23,6 @@ import com.shinku.aipassport.openclaw.gateway.GatewaySettings
 import com.shinku.aipassport.openclaw.gateway.OpenClawConfig
 import com.shinku.aipassport.openclaw.service.VoiceBridgeService
 import com.shinku.aipassport.openclaw.stt.XiaozhiSettings
-import com.shinku.aipassport.openclaw.tts.TtsEngines
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -50,7 +49,10 @@ import kotlinx.coroutines.launch
  * 与回复等待上限(180s 可配)无关,是两个独立常量。
  *
  * 三个「与网关无关」的开关/下拉走**切换即落盘**(不参与网关校验):
- * 「App 显示完整回传流（调试）」、「设备朗读回复（TTS）」、「设备朗读引擎」。
+ * 「App 显示完整回传流（调试）」。
+ *
+ * 设备朗读(下行 TTS)的设置项已移除(项目暂不考虑文字转语音);
+ * `tts_enabled`/`tts_engine` 仍保留在 prefs(默认 false / android),代码作为休眠能力保留。
  */
 class SettingsFragment : Fragment() {
 
@@ -123,9 +125,6 @@ class SettingsFragment : Fragment() {
     /** 已向用户播报过的类型(避免回填触发选中回调时误报「已切换」)。 */
     private var lastSelectedType: String? = null
 
-    /** 已向用户播报过的设备朗读引擎(避免回填触发选中回调时误报「已切换」)。 */
-    private var lastTtsEngine: String? = null
-
     /** 按 settings.type 回填下拉框(不写回设置,供初次加载/界面同步)。 */
     private fun bindTypeSpinner() {
         val idx = typeValues.indexOf(settings.type).coerceAtLeast(0)
@@ -134,40 +133,7 @@ class SettingsFragment : Fragment() {
         applyTypeVisibility()
     }
 
-    // ---- 设备朗读(TTS)引擎选择 ----
-
-    /** 设备朗读引擎下拉选项(下标即 [TtsEngines.ALL])。 */
-    private val ttsEngineValues = TtsEngines.ALL
-
-    /**
-     * 回填设备朗读引擎下拉框并挂选中监听:切换即落盘(与网关校验无关,保存即生效),
-     * 不重建服务 —— 服务每次下发都实时读 `tts_engine`。
-     */
-    private fun bindTtsEngineSpinner() {
-        val labels = ttsEngineValues.map { TtsEngines.label(it) }
-        binding.spinnerTtsEngine.adapter =
-            ArrayAdapter(requireContext(), R.layout.item_spinner_option, labels)
-        val idx = ttsEngineValues.indexOf(settings.ttsEngine).coerceAtLeast(0)
-        // 回填也会触发一次选中回调:用实际值去重,避免误报「已切换」
-        lastTtsEngine = ttsEngineValues[idx]
-        binding.spinnerTtsEngine.setSelection(idx)
-        binding.spinnerTtsEngine.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
-            override fun onItemSelected(
-                parent: AdapterView<*>?,
-                v: View?,
-                position: Int,
-                id: Long,
-            ) {
-                val engine = ttsEngineValues.getOrElse(position) { TtsEngines.ANDROID }
-                if (engine == lastTtsEngine) return
-                lastTtsEngine = engine
-                settings.ttsEngine = engine
-                log("设备朗读引擎已切换为 $engine(${TtsEngines.label(engine)})")
-            }
-
-            override fun onNothingSelected(parent: AdapterView<*>?) = Unit
-        }
-    }
+    // ---- 网关类型下拉 ----
 
     /** 按当前选中的类型显示/隐藏三套字段分组(Echo 不需要任何字段)。 */
     private fun applyTypeVisibility() {
@@ -248,15 +214,9 @@ class SettingsFragment : Fragment() {
             settings.showRawStream = checked
         }
 
-        // 设备朗读(下行 TTS):默认关,切换即落盘(与网关连接无关,不参与网关校验)。
-        // 开关/引擎都实时读同一份 prefs(见 VoiceBridgeService 的 DeviceTtsSession),
-        // 因此保存即生效,无需重启服务。
-        binding.checkTtsEnabled.isChecked = settings.ttsEnabled
-        binding.checkTtsEnabled.setOnCheckedChangeListener { _, checked ->
-            settings.ttsEnabled = checked
-            log("设备朗读回复(TTS)已" + if (checked) "开启" else "关闭")
-        }
-        bindTtsEngineSpinner()
+        // 设备朗读(下行 TTS)的设置项已移除(项目暂不考虑文字转语音):
+        // prefs 里的 tts_enabled 保持默认 false,代码作为休眠能力保留。
+        // 注意:不要因为删掉开关就把 tts_enabled 改写成 true。
 
         // Hermes
         binding.inputHermesHost.setText(settings.hermesHost)
