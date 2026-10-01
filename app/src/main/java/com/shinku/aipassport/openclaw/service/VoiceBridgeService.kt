@@ -719,7 +719,7 @@ class VoiceBridgeService : Service() {
      *
      * 目前只用于 `{"ev":"turn_ready"}`:App **真的开始录音/识别**之后才发(见
      * `VoicePipeline.onRecordingReady`),设备据此把「按下即红(准备中)」变绿(可以说话)。
-     * 设备未连接/未初始化时丢弃并记 DEBUG —— 不假装发成功,设备侧另有 2.5s 兜底超时。
+     * 设备未连接/未初始化时丢弃并记 DEBUG —— 不假装发成功,设备侧另有 800ms 兜底超时。
      *
      * @return 是否已交给 BLE 写队列(false = 设备未连接,没发)
      */

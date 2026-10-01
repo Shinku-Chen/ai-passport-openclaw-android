@@ -13,9 +13,11 @@ import okhttp3.Response
 import okhttp3.WebSocket
 import okhttp3.WebSocketListener
 import java.util.UUID
+import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
 import java.util.concurrent.ScheduledFuture
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * 小智(xiaozhi.me)云端流式中文识别 —— App 作小智 WebSocket 客户端,只取 ASR(stt)文本。
@@ -48,12 +50,22 @@ import java.util.concurrent.TimeUnit
  *  - [turnRunning] 在 [startTurn] 一开始就置 true,按下起的 PCM/Opus 立即累积并上送(绝不丢开头);
  *  - `onReady` 仍然只在**本轮识别会话真的建立**(`listen.start` 已发出)时回调(见 [WarmLink.sessionEstablished]);
  *  - 连接/预热失败只记日志,退回「按下才连」的既有行为,不让整轮失败。
+ *
+ * **本轮无结果时的补救(重连重放)**:热连接的闲置超时必须**短于服务端会话寿命** ——
+ * 小智服务端闲置约 60s 后静默废弃连接上的识别会话(传输层 ping/pong 仍通、不报 error、也不立刻断链),
+ * 此时若用户按下,整轮音频会被发进一个死会话:等满超时也拿不到 `stt`,只能回「无语音」——
+ * 用户说的话就丢了。两层防护:
+ *  - **预防**:[WarmLink.IDLE_TIMEOUT_MS] 取 45s(实测闲置 ≤53.8s 正常、≥64s 全失败),不让死会话留到下一轮;
+ *  - **兜底**(见 [TurnRecovery]):本轮每一帧 Opus 都留一份缓存,一旦「已上送音频却一条 stt 都没等到」,
+ *    就重连并**把这一轮重放**上去 —— 结果只是晚 1–2s,而不是变成「无语音」。
  */
 class XiaozhiStt(
     private val serverUrl: String,          // 如 wss://api.tenclass.net/xiaozhi/v1/
     private val token: String,              // 如 test-token
     private val deviceId: String,           // 设备 MAC(小智按 Device-Id 白名单登记)
     onPartial: ((String) -> Unit)? = null,
+    /** 重连重放的等待预算:默认取 [TurnRecovery] 的实机常量(见 [TurnRecovery.Budget]),单测可缩短。 */
+    private val recovery: TurnRecovery.Budget = TurnRecovery.Budget(),
 ) : SttEngine {
 
     private val tag = "XiaozhiStt"
@@ -107,6 +119,29 @@ class XiaozhiStt(
     /** 本轮因热连接复用失败而自动重连的次数(最多一次,见 [WarmLink.shouldFallbackReconnect])。 */
     @Volatile
     private var warmFallbackAttempts = 0
+
+    // ---- 本轮音频缓存(重连重放兜底,见 [TurnRecovery]) ----
+
+    /**
+     * 本轮已上送的 Opus 帧缓存(重连重放用):按下起每一帧都留一份,上限 [TurnRecovery.MAX_BUFFER_FRAMES]。
+     * 400 帧 ≈ 24s 语音 ≈ 50KB,正常一轮几 KB。
+     */
+    private val turnFrames = ArrayList<ByteArray>()
+
+    /** turnFrames 的锁(BLE 线程缓存、IO 线程取快照并清空)。 */
+    private val turnFramesLock = Any()
+
+    /** 本轮是否收到过任何 `stt`(重试判据之一:收到过就说明链路是好的,不改动它)。 */
+    @Volatile
+    private var sttSeenThisTurn = false
+
+    /** 轮次序号:startTurn / barge / onLinkDown / release 递增;在途的重连重放据此自行放弃,不插队到新一轮。 */
+    @Volatile
+    private var turnSeq = 0
+
+    /** 本轮是否已经重连重放过(每轮最多一次,见 [TurnRecovery.shouldRetry])。 */
+    @Volatile
+    private var turnRetried = false
 
     // ---- 会话状态 ----
 
@@ -179,6 +214,10 @@ class XiaozhiStt(
         // 立即允许 feedPcm/feedOpus 累积编码上送(不等握手,避免开头 PCM 丢失)
         listening = false
         turnRunning = true          // 先置 true:闲置超时定时器据此不动热连接
+        turnSeq++                   // 新一轮:在途的重连重放(上一轮)据此自行放弃
+        turnRetried = false
+        sttSeenThisTurn = false
+        clearTurnFrames()
         lastStt = ""
         pcmLen = 0
         warmFallbackAttempts = 0
@@ -210,7 +249,7 @@ class XiaozhiStt(
             Log.w(tag, "热连接不可用,重连中:listen.start 发送失败")
             dropWarmLink()
             if (!WarmLink.shouldFallbackReconnect(warmFallbackAttempts)) {
-                Log.w(tag, "本轮已重连过,不再重试(等设备侧 2.5s 兜底)")
+                Log.w(tag, "本轮已重连过,不再重试(等设备侧 800ms 兜底)")
                 return
             }
             warmFallbackAttempts++
@@ -223,7 +262,7 @@ class XiaozhiStt(
         }
 
         // ② 冷路径(与未预热时完全一致):现连现握手,hello 回包后发 listen.start 再回调 onReady。
-        // 失败:listening 保持 false,endTurn 已 guard 返回 null;设备侧另有 2.5s 兜底超时。
+        // 失败:listening 保持 false,endTurn 已 guard 返回 null;设备侧另有 800ms 兜底超时。
         // 若预热握手刚好已回来(warmReady 变 true),connectAndHello 直接当就绪,不再建第二条 socket。
         connectAndHello { ok ->
             if (!ok) return@connectAndHello
@@ -252,7 +291,9 @@ class XiaozhiStt(
                 opusEncoder = enc
                 Log.i(tag, "Opus 编码器已初始化 16k/mono")
             }
-        } catch (e: Exception) {
+        } catch (e: Throwable) {
+            // 连 Throwable 一起兜:libopus 是 JNI(aar 里的 .so),加载失败是 Error 不是 Exception,
+            // 不能让它把整轮识别带崩(拿不到编码器时退化为不上行,而不是进程/任务崩)。
             Log.e(tag, "Opus 编码器初始化失败", e)
             opusEncoder = null
         }
@@ -260,7 +301,6 @@ class XiaozhiStt(
 
     override fun feedPcm(pcm: ByteArray) {
         // 兜底路径:固件给的是【原始 PCM int16 16k】;App 累积到 60ms(960 samples/1920B)编成 Opus 帧上送小智。
-        val socket = ws ?: return
         val enc = opusEncoder ?: return
         if (!turnRunning) return   // 用 turnRunning(不等 hello 回包),避免开头 PCM 丢失
         try {
@@ -279,7 +319,7 @@ class XiaozhiStt(
                     val frame = pcmBuffer.copyOfRange(0, opusFrameBytes)
                     val opusData = enc.encode(frame, Constants.FrameSize._960())
                     if (opusData != null && opusData.isNotEmpty()) {
-                        socket.send(okio.ByteString.of(*opusData))   // 二进制帧(opcode 0x2)
+                        emitOpus(opusData)   // 二进制帧(opcode 0x2)
                     }
                     // 挪走已编码的前 1920B
                     System.arraycopy(pcmBuffer, opusFrameBytes, pcmBuffer, 0, pcmLen - opusFrameBytes)
@@ -296,36 +336,132 @@ class XiaozhiStt(
      * 直接作为 WebSocket 二进制帧原样上送小智,不再本地解码/重编码。
      */
     override fun feedOpus(packet: ByteArray) {
-        val socket = ws ?: return
         if (!turnRunning) return   // 与 feedPcm 一致:不等 hello 回包,避免开头丢帧
+        emitOpus(packet)
+    }
+
+    /**
+     * 上送一帧 Opus,同时给「重连重放」留一份缓存。
+     *
+     * 与之前直接 `ws.send` 的关键区别:连接不在(或已经死掉)时**仍然缓存** —— 正是靠这份缓存,
+     * 本轮才能在一分钟后重连重放,不然用户的语音就真丢了。
+     */
+    private fun emitOpus(packet: ByteArray) {
         if (packet.isEmpty()) return
+        synchronized(turnFramesLock) {
+            if (!TurnRecovery.bufferFull(turnFrames.size)) turnFrames.add(packet)
+        }
+        val socket = ws ?: return
         try {
             socket.send(okio.ByteString.of(*packet))   // 二进制帧(opcode 0x2)
         } catch (e: Exception) {
-            Log.e(tag, "feedOpus 上送失败", e)
+            Log.e(tag, "Opus 上送失败", e)
         }
     }
 
+    private fun snapshotTurnFrames(): List<ByteArray> =
+        synchronized(turnFramesLock) { ArrayList(turnFrames) }
+
+    private fun clearTurnFrames() {
+        synchronized(turnFramesLock) { turnFrames.clear() }
+    }
+
     override suspend fun endTurn(): String? = withContext(Dispatchers.IO) {
-        if (!listening) {
-            // 本轮识别会话没建立(热连接与重连都失败):本轮无结果,但不影响 socket 现状
-            turnRunning = false
-            return@withContext null
+        val mySeq = turnSeq
+        val frames = snapshotTurnFrames()
+        val wasListening = listening
+        if (wasListening) {
+            // 发 listen.stop 结束本段,小智会停止本次识别;socket **不关**(保留做热连接)。
+            stopListening()
+            listening = false
         }
-        // 发 listen.stop 结束本段,小智会停止本次识别;socket **不关**(保留做热连接)。
-        stopListening()
-        listening = false
         turnRunning = false
-        // 循环等待 stt 文本到达(小智识别可能需要几百 ms~几秒),直到收到或超时(6s)。
-        // 之前只等 500ms 太短,服务器识别慢时会错过 stt → 误判"未识别到语音"。
-        val deadline = System.currentTimeMillis() + 6_000
-        while (lastStt.isBlank() && System.currentTimeMillis() < deadline) {
-            kotlinx.coroutines.delay(200)
+        // 第一段只等 [TurnRecovery.FIRST_WAIT_MS]:正常一轮实测 ~0.2s 就回 stt,收到即返回(不白等)。
+        // 识别会话压根没建立时不必空等(本轮没上送过东西,等也不会有结果)。
+        var result = if (wasListening) awaitStt(recovery.firstWaitMs) else null
+        if (result == null &&
+            TurnRecovery.shouldRetry(frames.size, turnRetried, sttSeenThisTurn)
+        ) {
+            // 已上送音频却一条 stt 都没等到:典型是连接被服务端静默废弃(闲置超时的死会话)。
+            // 重连一次并重放本轮音频 —— 用户说的话不因为链路坏掉就丢失。
+            turnRetried = true
+            Log.w(tag, "本轮无识别结果(已上送 ${frames.size} 帧),重连并重放…")
+            result = reconnectAndReplay(mySeq, frames)
         }
-        val result = lastStt.takeIf { it.isNotBlank() }
+        clearTurnFrames()
         // 不再关 socket:保持热连接(hello 结果仍在),下一轮按下可直接 listen.start(毫秒级就绪)。
         keepWarm()
         result
+    }
+
+    /** 轮询等待 `stt` 文本(小智识别通常几百 ms);超时返回 null。 */
+    private suspend fun awaitStt(timeoutMs: Long): String? {
+        val deadline = System.currentTimeMillis() + timeoutMs
+        while (lastStt.isBlank() && System.currentTimeMillis() < deadline) {
+            kotlinx.coroutines.delay(200)
+        }
+        return lastStt.takeIf { it.isNotBlank() }
+    }
+
+    /**
+     * 兜底补救:重连(建链 + hello)后**把本轮音频原样重放**一遍,再等结果。
+     *
+     * 几条不变量:
+     *  - 每轮最多一次(由 [TurnRecovery.shouldRetry] 的 `alreadyRetried` 保证);
+     *  - 重连前先 `dropWarmLink()`:旧 socket 的迟到 `stt` 会被 `ws !== socket` 判定丢弃,不会串结果;
+     *  - 期间若用户又按了([turnSeq] 变了,新一轮已开始)立即放弃,不插队、不污染新一轮;
+     *  - 失败只记日志并返回 null:上层行为与「本轮没识别到」完全一致(设备仍会收到「无语音」)。
+     */
+    private suspend fun reconnectAndReplay(mySeq: Int, frames: List<ByteArray>): String? {
+        if (turnSeq != mySeq) return null
+        dropWarmLink()
+        val done = CountDownLatch(1)
+        val ok = AtomicBoolean(false)
+        connectAndHello { success ->
+            ok.set(success)
+            done.countDown()
+        }
+        val connected = try {
+            done.await(recovery.reconnectWaitMs, TimeUnit.MILLISECONDS) && ok.get()
+        } catch (e: InterruptedException) {
+            Thread.currentThread().interrupt()
+            false
+        }
+        if (!connected) {
+            Log.w(tag, "重连重放:重连失败,本轮无结果")
+            return null
+        }
+        if (turnSeq != mySeq) return null
+        // 新连接 = 新会话:清掉上一段的残留结果与判据,再重放(旧 socket 的迟到 stt 已被丢弃)。
+        lastStt = ""
+        sttSeenThisTurn = false
+        val sessionReady = synchronized(linkLock) { WarmLink.sessionEstablished(startListening()) }
+        if (!sessionReady) {
+            Log.w(tag, "重连重放:listen.start 未发出,本轮无结果")
+            return null
+        }
+        listening = true
+        var sent = 0
+        for (frame in frames) {
+            if (turnSeq != mySeq) break
+            val socket = ws ?: break
+            try {
+                socket.send(okio.ByteString.of(*frame))
+                sent++
+            } catch (e: Exception) {
+                Log.w(tag, "重连重放:第 $sent 帧发送失败", e)
+                break
+            }
+        }
+        stopListening()
+        listening = false
+        val text = awaitStt(recovery.replayWaitMs)
+        if (text != null) {
+            Log.i(tag, "重连重放成功(重放 $sent 帧): $text")
+        } else {
+            Log.w(tag, "重连重放仍未识别到语音(重放 $sent 帧)")
+        }
+        return text
     }
 
     override fun barge() {
@@ -334,6 +470,8 @@ class XiaozhiStt(
         val wasListening = listening
         listening = false
         turnRunning = false
+        turnSeq++             // 本轮作废:在途的重连重放立即放弃,不插队到新一轮
+        clearTurnFrames()     // 本轮音频不再需要(重放只服务于本轮的识别结果)
         if (wasListening) stopListening()
         pcmLen = 0   // 丢掉不满一帧的余量,不跨轮拼接
     }
@@ -342,6 +480,8 @@ class XiaozhiStt(
         // 设备链路断开(BLE 断开/掉线):留热连接没有意义,立即关闭。
         listening = false
         turnRunning = false
+        turnSeq++
+        clearTurnFrames()
         pcmLen = 0
         dropWarmLink()
     }
@@ -350,6 +490,8 @@ class XiaozhiStt(
         // 服务停止/引擎释放:立即关闭热连接并释放编码器(不留后台资源)。
         listening = false
         turnRunning = false
+        turnSeq++
+        clearTurnFrames()
         dropWarmLink()
         cancelWarmIdleTimer()
         warmIdleScheduler.shutdownNow()
@@ -432,6 +574,9 @@ class XiaozhiStt(
     private fun closeSocketLocked() {
         warmReady = false
         warmActiveAtMs = 0L
+        // 连接一旦丢弃,「正在建立」也随之作废:否则旧握手的回调可能被 ws 判定拦下,
+        // connecting 会永久停在 true,下一次 connectAndHello 就会误以为「已在建立中」而一直等。
+        connecting = false
         val socket = ws
         ws = null
         try { socket?.close(1000, "done") } catch (_: Exception) {}
@@ -457,6 +602,9 @@ class XiaozhiStt(
             alreadyWarm = warmReady && ws != null
             if (!alreadyWarm) {
                 connecting = true
+                // 必须先存回调再建 socket:hello 可能在 newWebSocket 返回后极快到达,
+                // 存晚了就会丢掉本次调用方(→ 冷路径永远收不到 onReady、设备收不到 turn_ready)。
+                onHelloCallback = onReady
                 ws = client.newWebSocket(buildRequest(), listener())
             }
         }
@@ -464,7 +612,6 @@ class XiaozhiStt(
             Log.i(tag, "已有可用热连接,跳过握手")
             onReady(true)
         }
-        // onReady 由 handleServerMessage 收到 hello 后触发(存于 onHelloCallback);此处只建连+发 hello
     }
 
     private fun buildRequest(): Request = Request.Builder()
@@ -584,6 +731,7 @@ class XiaozhiStt(
                     val textVal = obj.get("text")?.takeIf { it.isJsonPrimitive }?.asString
                     if (!textVal.isNullOrBlank()) {
                         lastStt = textVal
+                        sttSeenThisTurn = true
                         onPartial?.invoke(textVal)
                     }
                 }

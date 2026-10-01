@@ -41,7 +41,7 @@ class WarmLinkTest {
 
     @Test
     fun idle_timeout_reconnects() {
-        // 刚好到点就算超时(>= 语义,与「闲置满 90s 就关」一致)
+        // 刚好到点就算超时(>= 语义,与「闲置满 IDLE_TIMEOUT_MS 就关」一致)
         val atTimeout = connected(activeAt = now - WarmLink.IDLE_TIMEOUT_MS)
         assertEquals(WarmDecision.RECONNECT_IDLE_TIMEOUT, WarmLink.decide(atTimeout, now))
         assertFalse(WarmLink.shouldReuse(atTimeout, now))
@@ -86,10 +86,17 @@ class WarmLinkTest {
     }
 
     @Test
-    fun default_idle_timeout_is_within_suggested_range() {
+    fun default_idle_timeout_is_below_the_server_session_lifetime() {
+        // 真机实测:在本设备上闲置 ≤53.8s 识别正常,≥64.0s 全部静默失败(服务端会话被废弃、
+        // 传输层 ping/pong 却仍通)。所以热连接必须在 ~60s 之前就换掉:上界取 55s 留出余量,
+        // 下界 30s 避免把连接换得太勤(每次都多一次握手与服务器会话)。
         assertTrue(
-            "建议 60–120s,当前 ${WarmLink.IDLE_TIMEOUT_MS}ms",
-            WarmLink.IDLE_TIMEOUT_MS in 60_000L..120_000L,
+            "闲置超时 ${WarmLink.IDLE_TIMEOUT_MS}ms 太接近服务端 ~60s 的会话寿命,会漏进死会话",
+            WarmLink.IDLE_TIMEOUT_MS <= 55_000L,
+        )
+        assertTrue(
+            "闲置超时 ${WarmLink.IDLE_TIMEOUT_MS}ms 太短,连接会被无谓地反复重建",
+            WarmLink.IDLE_TIMEOUT_MS >= 30_000L,
         )
     }
 }

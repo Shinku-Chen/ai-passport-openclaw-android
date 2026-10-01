@@ -368,7 +368,7 @@ class VoicePipeline(
      *    复用常驻热连接时会话按下即建,因此回调可以很快(毫秒级)甚至同步到达 —— 那正是绿光及时的原因;
      *  - **同轮只发一次**:barge/重连可能让同一轮的就绪回调重复或迟到,由 [TurnReadyGate] 按轮号去重,
      *    旧轮一律丢弃(不会把上一轮的绿灯发到新一轮);
-     *  - **设备没连就不发**:只记 DEBUG 日志;设备侧有 2.5s 兜底超时,不会一直红屏。
+     *  - **设备没连就不发**:只记 DEBUG 日志;设备侧有 800ms 兜底超时,不会一直红屏。
      *
      * 回调可能来自 BLE/Binder/WS 线程:只调线程安全的发送口,不碰 UI。
      */
@@ -380,7 +380,7 @@ class VoicePipeline(
         if (sendEvent(TURN_READY_EVENT_JSON)) {
             Log.i(tag, "已通知设备: turn_ready(录音就绪)")
         } else {
-            Log.d(tag, "设备未连接,未下发 turn_ready(等设备侧 2.5s 兜底)")
+            Log.d(tag, "设备未连接,未下发 turn_ready(等设备侧 800ms 兜底)")
         }
     }
 

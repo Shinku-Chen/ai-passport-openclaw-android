@@ -497,10 +497,12 @@ OpenClaw 对每台设备做 ed25519 设备配对认证：新设备首次连接�
 | OpenClaw 回归 | 现有 WS 协议用例（握手/chat.send/全量 content 覆写）保持不变，改由 `chatMulti` 全部返回，`chat` 取第一条 |
 | 就绪去重：首轮放行 / 同轮只放一次 / barge 后旧轮迟到就绪一律丢弃 / 事件 JSON 契约 | `TurnReadyTest` |
 | 识别通道预热：热连接可用 → 复用（不重连）；已断开 → 重连；闲置超时 → 重新建连；超时可配置 / 禁用；时钟回拨不误杀；`onReady` 只在 `listen.start` 发出后放行；复用失败只允许一次兜底重连 | `WarmLinkTest` |
+| 本轮无结果时的补救（**重连重放**）：死会话（收下音频、不回 `stt`）后必须自动重连并把本轮原样重放、最终**仍拿到识别文本**；链路正常时绝不重连、绝不重复上送；每轮最多一次（不会变重连死循环）；本轮无音频可重放时不重连 | `XiaozhiSttRetryTest`（MockWebServer 假小智服务端） |
+| 重连重放的判定与预算：已上送音频 + 一条 `stt` 都没收到 + 未补救过 → 重试；空轮 / 已补救 / 已收到过 `stt` → 不重试；帧缓存上限；等待预算（可缩短用于单测） | `TurnRecoveryTest` |
 
 ## 8. 识别通道常驻预热（热连接）
 
-**问题**（真机现象）：设备按下 OK 后不是立刻能说话，而是先整屏红「准备中」（或 2.5s 后变绿）。
+**问题**（真机现象）：设备按下 OK 后不是立刻能说话，而是先整屏红「准备中」（或 800ms 后变绿）。
 原因是 App 每次按下都要跟小智云端重做一次 WebSocket 握手 + `hello` 往返（实测 **0.5–2s**），
 「按下 → 可说话」因此有明显空窗。
 
@@ -512,12 +514,39 @@ OpenClaw 对每台设备做 ed25519 设备配对认证：新设备首次连接�
 | 复用 | `XiaozhiStt.startTurn` 先判定热连接：可用 → 直接 `listen.start`，**不重连**，日志 `复用热连接,直接 listen.start(按下即可说话)` |
 | 重连 | 已断开 / 闲置超时 / 尚未预热 → 退回既有「按下才连」路径（`connectAndHello`，行为与未预热时完全一致），日志 `热连接不可用,重连中:<原因>` |
 | 预热时机 | ① 服务启动（`VoiceBridgeService.startBridge` → `pipeline.prewarm()`）；② BLE 链路就绪（`BleCentral.Listener.onReady`）；③ 每轮结束后保留（`XiaozhiStt.endTurn` → `keepWarm`）。握手完成时日志 `识别通道常驻预热已建立` |
-| 闲置超时 | 闲置 ≥ `WarmLink.IDLE_TIMEOUT_MS`（**90s**，60–120s 区间内）主动关闭，日志 `热连接闲置超时,已关闭`；有轮次在跑时定时器不关（只在真闲置时关） |
+| 闲置超时 | 闲置 ≥ `WarmLink.IDLE_TIMEOUT_MS`（**45s**，30–55s 区间内 —— **必须短于服务端会话寿命**，见下）主动关闭，日志 `热连接闲置超时,已关闭`；有轮次在跑时定时器不关（只在真闲置时关） |
 | 立即关闭 | 服务停止（`VoicePipeline.shutdown` → `release()`）与 BLE 断开（`VoicePipeline.onDisconnected` → `onLinkDown()`）立即关 socket；**`barge` 不关**（只发 `listen.stop`，保留热连接供下一轮复用） |
 | `onReady` 语义不变 | 仍只在**本轮识别会话真的建立**（`listen.start` 已进 OkHttp 写队列）时回调：复用热连接时按下即发 → 可能**同步**回调（毫秒级，这正是绿光及时的原因）；`send` 返回 false 时绝不回调（设备不能变绿） |
 | 音频不丢 | `turnRunning` 在 `startTurn` 一开始就置 true，按下起的 Opus/PCM 立即累积上送，与是否复用热连接无关 |
-| 失败兜底 | 复用热连接时 `listen.start` 发不出去 → 自动重连**一次**（`WarmLink.shouldFallbackReconnect`），再失败只记日志并等设备侧 2.5s 兜底；**预热失败绝不影响**「按下才连」 |
-| 纯函数 | `stt/WarmLink.kt`：`WarmLink.decide(state, nowMs, idleTimeoutMs)` → `REUSE` / `RECONNECT_DISCONNECTED` / `RECONNECT_IDLE_TIMEOUT`；`shouldReuse(state, nowMs, idleTimeoutMs)`；`shouldFallbackReconnect(attemptsThisTurn)`；`sessionEstablished(listenStartSent)`；JVM 单测 `WarmLinkTest`（9 个用例） |
+| 失败兜底 | 复用热连接时 `listen.start` 发不出去 → 自动重连**一次**（`WarmLink.shouldFallbackReconnect`），再失败只记日志并等设备侧 800ms 兜底；**预热失败绝不影响**「按下才连」 |
+| 本轮无结果兜底 | 已上送音频却一条 `stt` 都没等到 → 重连并把**本轮音频原样重放**（日志 `本轮无识别结果(已上送 N 帧),重连并重放…` → `重连重放成功(重放 N 帧): …`），每轮最多一次；用户说的话不会因为链路坏掉就丢成「无语音」 |
+| 纯函数 | `stt/WarmLink.kt`：`WarmLink.decide(state, nowMs, idleTimeoutMs)` → `REUSE` / `RECONNECT_DISCONNECTED` / `RECONNECT_IDLE_TIMEOUT`；`shouldReuse(state, nowMs, idleTimeoutMs)`；`shouldFallbackReconnect(attemptsThisTurn)`；`sessionEstablished(listenStartSent)`；JVM 单测 `WarmLinkTest`（9 个用例）。`stt/TurnRecovery.kt`：`shouldRetry(bufferedFrames, alreadyRetried, sawAnyStt)`；`bufferFull(frames)`；`Budget`（各段等待时限）；JVM 单测 `TurnRecoveryTest`（10 个用例） |
+
+### 8.1 为什么闲置超时是 45s（服务端会话寿命 ~60s）
+
+小智服务端会在连接**闲置约 60s** 后**静默废弃这条连接上的识别会话**：WebSocket 传输层还活着
+（OkHttp 的 ping/pong 仍通、服务端不报 `error`、也不立刻断链），但 `listen.start` 与音频**没有响应**。
+若此时用户按下，整轮音频会发进这个死会话：等满超时也拿不到 `stt`，最终只能回「无语音」——
+**用户说的话丢了**，且 App 直到 OkHttp 的 ping 超时（最长再等 40s）才知道链路早坏了。
+
+真机实测（单设备 20 轮，按「本轮前的闲置时长」分组，同一会话内首轮）：
+
+| 本轮前闲置 | 结果 |
+| --- | --- |
+| 8.1s / 13.4s / 15.5s / 28.5s | 识别正常 |
+| 50.3s / 53.8s | 识别正常 |
+| **64.0s / 79.3s / 79.9s / 83.9s** | **全部失败**，且该 socket 后续轮次继续失败，直到 ping/pong 超时才重连 |
+
+因此修法分两层：**预防**（`IDLE_TIMEOUT_MS` 压到 45s，在 53.8s 与 ~60s 之间留余量，
+不让死会话留到下一轮 —— 后台每 6s 一次的预热巡检会在 45s 后重建连接）+
+**兜底**（`TurnRecovery`：本轮音频留缓存，一旦「已上送音频却没等到任何 `stt`」就重连重放，
+代价只是晚 1–2s，而不是变成「无语音」）。
+
+> 附带修掉一个早就存在、但只有在**没有热连接**时才会暴露的回调丢失问题：
+> `connectAndHello` 之前只在「已有一条连接正在建立」时保存 `onHelloCallback`，
+> 冷路径（按下才连）与预热建连的回调都**从未被保存**过 —— 真机日志里 `识别通道预热中…` 出现 36 次、
+> `识别通道常驻预热已建立` **0 次**。后果是这两条路径永远不去回调 `onReady` →
+> 设备收不到 `turn_ready`，只能等它自己的 800ms 兜底变绿（按下会多等一拍）。现已修正并在单测里锁定。
 
 ## 9. 待定
 

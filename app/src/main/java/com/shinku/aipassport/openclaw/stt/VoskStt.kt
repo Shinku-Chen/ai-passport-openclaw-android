@@ -95,7 +95,7 @@ class VoskStt(
                 Log.w(tag, "startTurn reset 异常", e)
             }
             // 识别器可用 = 已经能吃音频(可以说话);模型/识别器不可用时不回调,
-            // 设备侧有 2.5s 兜底超时。
+            // 设备侧有 800ms 兜底超时。
             if (recognizer != null) onReady()
         }
     }

@@ -24,7 +24,7 @@ interface SttEngine {
      *      `listen.start` 真的发出去了才回调;
      *    - Vosk:识别器 reset 完成、可以吃音频;
      *    - 系统 SpeechRecognizer:`onReadyForSpeech`(麦克风已打开)。
-     *   永远不会就绪时可以不调用 —— 设备侧有 2.5s 兜底超时,不会一直红屏。
+     *   永远不会就绪时可以不调用 —— 设备侧有 800ms 兜底超时,不会一直红屏。
      */
     fun startTurn(onReady: () -> Unit = {})
 
