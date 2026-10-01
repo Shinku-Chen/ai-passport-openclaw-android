@@ -60,10 +60,40 @@ class OpenClawErrorsTest {
         assertTrue(mapRpcError("not_paired", null, short).awaitingPairing)
     }
 
+    /**
+     * 新加设备时不同网关版本会换别的错误码/文案:这些都必须落到「等待网关授权」,
+     * 而不是当配置错或网关故障报给用户(真机反馈:新加 OpenClaw 时报了别的错)。
+     */
+    @Test
+    fun other_device_approval_wording_also_maps_to_awaiting_pairing() {
+        val cases = listOf(
+            "DEVICE_NOT_APPROVED" to null,
+            "DEVICE_REQUIRED" to null,
+            "NOT_REGISTERED" to null,
+            null to "unrecognized device",
+            null to "unknown device",
+            null to "device not registered",
+            null to "device is not registered",
+            null to "please approve this device in the console",
+        )
+        for ((code, msg) in cases) {
+            val status = mapRpcError(code, msg, short)
+            assertTrue("$code / $msg 应识别为等待授权", status.awaitingPairing)
+            assertEquals(GatewayStatus.STATE_CONNECTING, status.state)
+            assertTrue(
+                "detail 应带授权提示: ${status.detail}",
+                status.detail.startsWith(AWAITING_PAIRING_PREFIX),
+            )
+            assertFalse("等待授权不是致命错误(要继续重试)", status.fatal)
+        }
+    }
+
     /** 2) INVALID_REQUEST + device(旧代码单独分支的那种):同样是要人去批准,不是配置错。 */
     @Test
     fun invalid_request_with_device_is_pairing() {
-        val status = mapRpcError("INVALID_REQUEST", "device not recognized: unknown device", short)
+        // 注意:这句文案不带「unknown device / not approved」等关键词,走的是 INVALID_REQUEST + device 分支
+        // (带那些关键词会先被 isPairingRequired 命中 → 通用等待授权文案,见下一个用例,两种对用户等价)。
+        val status = mapRpcError("INVALID_REQUEST", "device not recognized", short)
         assertTrue(status.awaitingPairing)
         assertEquals(GatewayStatus.STATE_CONNECTING, status.state)
         assertTrue(status.detail.startsWith(AWAITING_PAIRING_PREFIX))

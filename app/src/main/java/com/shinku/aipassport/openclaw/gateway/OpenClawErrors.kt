@@ -59,8 +59,19 @@ fun isPairingRequired(code: String?, message: String?): Boolean {
     val lower = message?.trim()?.lowercase().orEmpty()
     return c.equals("NOT_PAIRED", ignoreCase = true) ||
         c.equals("PAIRING_REQUIRED", ignoreCase = true) ||
+        // 新设备刚加上时,不同网关版本会换别的说法/错误码:下面这些同样是「等用户批准」,
+        // 必须走同一个可恢复的授权流程,不能当配置错或网关故障报给用户。
+        c.equals("DEVICE_NOT_APPROVED", ignoreCase = true) ||
+        c.equals("DEVICE_REQUIRED", ignoreCase = true) ||
+        c.equals("NOT_REGISTERED", ignoreCase = true) ||
         lower.contains("not approved") ||
-        lower.contains("pairing required")
+        lower.contains("pairing required") ||
+        lower.contains("not paired") ||
+        lower.contains("unrecognized device") ||
+        lower.contains("unknown device") ||
+        lower.contains("device not registered") ||
+        lower.contains("device is not registered") ||
+        lower.contains("approve") && lower.contains("device")
 }
 
 /** 网关回复是否只是「这条查询没权限」(链路本身可用,不是配对问题)。 */
