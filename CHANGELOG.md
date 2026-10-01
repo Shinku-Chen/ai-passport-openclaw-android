@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+## 0.1.2
+
+- 新增应用图标：以 AI Passport 设备外观为主体、屏幕里是 OpenClaw 的红色吉祥物；自适应图标（前景按 72dp 安全区缩放，圆形/圆角遮罩下主体完整）、圆形图标与各密度 PNG 一应俱全，并接上 `AndroidManifest` 的 `icon`/`roundIcon`（此前用的是系统默认图标）。
+
 - 修 bug：**切换网关（Hermes → OpenClaw）后误报「网关不可达」，重启 App 才正常**。
   - 真机现象（抓包原文）：`网关配置已重载: type=openclaw host=… port=18789`（重载成功、配置正确），紧接着
     `网关配置已重载,正在重连… — unknown method: usage`，并把这条 detail 下发给设备；重启 App 后一切正常。
