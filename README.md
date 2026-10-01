@@ -28,6 +28,8 @@
 
 适合的场景：做饭时问一句火候、出门前问一句要不要带伞、陪孩子随口问个为什么，或者把它放在桌上当"一句话就能用"的 AI 入口。
 
+> ⚠️ **当前版本没有接入语音生成（TTS），所以网关返回的文字不会转成语音**：回复只以**文字**显示在设备小屏和手机 App 上，设备**不会把回答念出来** ✗。语音合成属于可能后续加入的能力，但**现在没有**这个功能 ✗，请不要按"能出声"预期它。
+
 ## 功能
 
 **设备端（固件）**
@@ -39,6 +41,7 @@
 
 **手机端（本 App）**
 - 四个页签：**对话 / 概览 / 设备 / 设置**
+- ⚠️ **不含语音合成（TTS）**：App 也**不朗读**回复 ✗ —— 只有文字上屏；设置页也没有相关开关（相关代码作为休眠能力保留，默认关闭 ✓，以后若要加会以新版本形式提供 ✓）
 - **设备页**显示真实已连接设备（名称 + MAC + 链路状态），可扫描 / 连接 / 断开
 - **网关类型下拉**：OpenClaw · Hermes · 自定义 OpenAI 兼容 · Echo（本地回环自测）
 - **保存前先校验**：真的连一次，通过才落盘；失败弹出可读原因（token 不匹配 / 路径不对 / 需批准…）
@@ -121,6 +124,7 @@ idf.py -B build build      # 需要已激活 ESP-IDF 5.5.3
 | 「网关 token 不匹配」 | 网关侧换了令牌：在设置页更新 Token 后保存 |
 | 「等待网关授权」 | 网关需要先批准这台设备：按提示在网关控制台批准，再点保存 |
 | 回复一直是"流程汇报" | 这是**网关侧助理**的行为（例如它把"没有待处理任务"当成回答），与 App 无关；可在网关侧调整提示词或记忆 |
+| 设备没有声音 / 不朗读回复 | **当前版本本来就没有语音生成** ✓：回复只以文字显示（设备屏 + App）✗，设备不会念出来；这是已知限制，不是故障 ✓ |
 | 长回复看不全 | 设备会自动滚到底；用 UP / DOWN 上下翻看 |
 
 ## 技术说明（简）
@@ -132,6 +136,8 @@ idf.py -B build build      # 需要已激活 ESP-IDF 5.5.3
 ## English
 
 **AI Passport Pocket Intercom** — hold the OK button on the device, speak, and your phone hands the words to your own AI assistant; the answer comes back to the device screen and the phone app. The device itself needs no Wi-Fi: audio travels over Bluetooth only.
+
+> ⚠️ **This version has no text-to-speech: replies are text only.** The device will **not speak the answer aloud** — the reply is shown as text on the device screen and in the phone app. Voice synthesis may be added later, but it is **not** part of the current release, so please do not expect audio output.
 
 - **Firmware**: flash `FoloToy-AI-Passport-full.bin` from the firmware repository's [Releases page](https://github.com/Shinku-Chen/ai-passport/releases) — pick the **latest release whose name contains `intercom`** (releases look like `v1.8.0-intercom`; the repository also hosts other apps) — or use the [web flasher](https://ai-passport.folotoy.cn/tools/web-flasher/). The source is at [Shinku-Chen/ai-passport @ feature/openclaw-intercom](https://github.com/Shinku-Chen/ai-passport/tree/feature/openclaw-intercom), built with ESP-IDF 5.5.3.
 - **App**: install `app-release.apk` from [Releases](https://github.com/Shinku-Chen/ai-passport-openclaw-android/releases/latest) (Android 8+).
