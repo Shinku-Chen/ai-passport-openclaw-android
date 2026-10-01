@@ -82,7 +82,7 @@ OpenClaw 首次 connect 需网关主机 `openclaw devices approve` 批准本设�
 ## 代码约定
 
 - Kotlin,包名 `com.shinku.aipassport.openclaw`,命名遵循 Kotlin 惯例。
-- **版本号硬约定**：App `versionName` 必须与固件发布 tag 里的 `X.Y.Z` 一致（固件 `vX.Y.Z-intercom` ↔ App `X.Y.Z`，例如固件 `v1.8.0-intercom` ↔ App `1.8.0`）；社区作品说明里也注明同一版本号。三处一致才能保证“固件/App/社区”功能一致，发新版时一起升。
+- **版本号硬约定**：App `versionName` 必须与固件发布 tag 里的 `X.Y.Z` 一致（固件 `vX.Y-intercom` ↔ App `X.Y`（两段式，例如固件 `v1.10-intercom` ↔ App `1.10`））；社区作品说明里也注明同一版本号。三处一致才能保证“固件/App/社区”功能一致，发新版时一起升。
 - 线协议 `VbFrame.kt` 与固件 `voice_bridge_frame.h` 必须逐字一致;改协议两边同改。
 - BLE 回调(后台线程)只做轻量派发;STT/TTS/网关调用在协程里,不阻塞 BLE 线程。
 - 网关 token 是运行时 secret:绝不写进提交的代码;域名/端口可提交(BuildConfig/设置读),token 从 App 内设置读。

@@ -1,6 +1,8 @@
 # Changelog
 
-## 1.9.0
+## 1.10
+
+> 版本号约定更新为**两段式**：固件 tag `vX.Y-intercom` ↔ App `versionName X.Y` ↔ 社区标题/说明（例如 `v1.10`）。
 
 - 新增：**固件与 App 互报版本，不一致就双向提示**（配对后即检查，不阻断对话）。
   - 设备 → App：设备 `hello` 已带 `fw`（固件版本），补 `minApp`（最低 App 版本）；
@@ -566,4 +568,6 @@
   SpeechRecognizerStt(系统 STT)、TtsEngine(系统 TTS)、GatewayClient(OpenClaw WS 对话,
   Ed25519 设备鉴权+chat)、GatewaySettings/MainActivity(网关域名/token 设置)、
   VoiceBridgeService(前台编排)。设备需在网关主机 `openclaw devices approve` 配对后方可对话。
+
+## 1.9.0
 

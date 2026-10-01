@@ -183,7 +183,7 @@ OpenClaw 网关要求**每台设备**先被批准一次（它用设备身份 + �
 - **设备 ↔ 手机**：自定义帧协议（`A5 5A` 头 + 类型 + 长度 + 载荷），音频用 **Opus 60ms 帧**（16 kHz 采集、约 3 KB/s），另有文本 / 控制 / 事件三条通道；配对使用 BLE 的 LE Secure Connections（6 位码确认）。协议细节见固件仓文档 `docs/development/engineering/intercom-wire-protocol.md`。
 - **手机侧**：语音识别走小智云端（WebSocket，常驻预热，按下即可说）；网关通道抽象成 `GatewayAdapter`，OpenClaw 使用 ed25519 设备身份 + WebSocket RPC，另外三种走 OpenAI 兼容 HTTP。
 - **不采集额外数据**：App 不做分析上报；网关 token / 密钥只保存在本机 SharedPreferences。
-- **版本号三处一致**：固件 release tag `v1.8.0-intercom` ↔ App `versionName 1.8.0` ↔ 社区作品说明里注明的同一版本号；发新版时三处一起升，保证固件/App/社区功能对得上。
+- **版本号三处一致**：固件 release tag `v1.10-intercom` ↔ App `versionName 1.10` ↔ 社区作品标题/说明里的同一版本号（两段式）；发新版时三处一起升，保证固件/App/社区功能对得上。
 
 ## English
 
@@ -193,7 +193,7 @@ OpenClaw 网关要求**每台设备**先被批准一次（它用设备身份 + �
 
 - **App icon** — the launcher icon is the device itself with the OpenClaw crayfish on its screen. The source artwork is [`docs/design/app-icon-source.png`](docs/design/app-icon-source.png) (2048×2048) and [`tools/make_android_icons.py`](tools/make_android_icons.py) regenerates every `res/mipmap*` asset (adaptive XML, foreground/background layers, five densities for the square and round icons).
 - **Firmware**: flash `FoloToy-AI-Passport-full.bin` from the firmware repository's [Releases page](https://github.com/Shinku-Chen/ai-passport/releases) — pick the **latest release whose name contains `intercom`** (releases look like `v1.8.0-intercom`; the repository also hosts other apps) — or use the [web flasher](https://ai-passport.folotoy.cn/tools/web-flasher/). The source is at [Shinku-Chen/ai-passport @ feature/openclaw-intercom](https://github.com/Shinku-Chen/ai-passport/tree/feature/openclaw-intercom), built with ESP-IDF 5.5.3.
-- **Version pinning** — the firmware release tag (`vX.Y.Z-intercom`), the app's `versionName` (`X.Y.Z`) and the community listing all carry the same version; bump all three together so firmware, app and listing always describe the same features.
+- **Version pinning** — the firmware release tag (`vX.Y-intercom`), the app's `versionName` (`X.Y`) and the community listing all carry the same version; bump all three together so firmware, app and listing always describe the same features.
 - **App**: install `app-release.apk` from [Releases](https://github.com/Shinku-Chen/ai-passport-openclaw-android/releases/latest) (Android 8+).
 - **Pair**: Device tab → Scan and connect → type the 6-digit code shown on the device.
 - **Gateway**: Settings → pick OpenClaw / Hermes / custom OpenAI-compatible / Echo, fill the fields and save (the app validates before saving). With **OpenClaw**, the gateway usually asks you to **approve this device once** from the admin side — the app shows `Waiting for gateway approval … (deviceId …)`; approve it in the OpenClaw console (Devices) or run `openclaw devices approve <deviceId>` on the gateway host, then save again (the app also retries automatically for up to 180 s).
