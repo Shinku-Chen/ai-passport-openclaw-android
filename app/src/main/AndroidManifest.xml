@@ -56,7 +56,9 @@
             android:exported="false" />
 
         <!-- 开机自启：收到开机广播后按用户设置拉起前台服务。
-             exported 必须为 true 才能收到系统广播；小米/HyperOS 还需用户在系统里开本应用的「自启动」。 -->
+             exported 必须为 true 才能收到系统广播；小米/HyperOS 还需用户在系统里开本应用的「自启动」。
+             同时收应用更新广播（MY_PACKAGE_REPLACED）：更新会杀进程、可能清掉闹钟，
+             要按用户更新前的意愿把桥恢复起来（这也是 Android 12+ 允许启动前台服务的官方豁免之一）。 -->
         <receiver
             android:name=".service.BootReceiver"
             android:enabled="true"
@@ -64,6 +66,7 @@
             <intent-filter>
                 <action android:name="android.intent.action.BOOT_COMPLETED" />
                 <action android:name="android.intent.action.QUICKBOOT_POWERON" />
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
             </intent-filter>
         </receiver>
     </application>

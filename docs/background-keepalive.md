@@ -89,6 +89,10 @@ ServiceRecord: isForeground=true types=00000010 foregroundNoti=Notification(chan
   该标记只在**用户主动启动/停止**时改（`VoiceBridgeService.start/stop`、`ACTION_STOP`），
   服务被系统停掉时**不动**它；
 - 开机广播（`BootReceiver`）也会排一次看门狗 —— 重启会清空所有闹钟，而开机后的服务启动同样可能被拒。
+- **应用更新后**（`Intent.ACTION_MY_PACKAGE_REPLACED`，同一个接收器）按用户**更新前**的意愿恢复桥
+  （`KeepAliveState.bridgeWanted`，而不是开机自启开关：更新不该按开机配置决定）并补排看门狗 ——
+  更新会换 APK、杀进程、可能清掉闹钟，不处理的话用户不主动打开 App 就再也不会恢复。
+  该广播也是 Android 12+ **允许启动前台服务**的官方豁免之一。
 
 ## 5. 让用户看得见
 
