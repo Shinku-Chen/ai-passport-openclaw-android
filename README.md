@@ -28,6 +28,12 @@
 
 适合的场景：做饭时问一句火候、出门前问一句要不要带伞、陪孩子随口问个为什么，或者把它放在桌上当"一句话就能用"的 AI 入口。
 
+<p align="center">
+  <img src="docs/images/device.jpg" alt="真机实拍：按住 OK 说话，回复上屏" width="400">
+  <br>
+  <em>真机实拍：设备屏顶部「设备 就绪 / 网关 就绪」，下面是这一轮问答</em>
+</p>
+
 > ⚠️ **当前版本没有接入语音生成（TTS），所以网关返回的文字不会转成语音**：回复只以**文字**显示在设备小屏和手机 App 上，设备**不会把回答念出来** ✗。语音合成属于可能后续加入的能力，但**现在没有**这个功能 ✗，请不要按"能出声"预期它。
 
 ## 功能
@@ -120,6 +126,14 @@ OpenClaw 网关要求**每台设备**先被批准一次（它用设备身份 + �
 
 ## 界面
 
+**真机实拍**（设备屏，实际一轮对话）：
+
+<p align="center">
+  <img src="docs/images/device.jpg" alt="真机实拍" width="380">
+</p>
+
+**手机 App**（下面的图都是实际截图）：
+
 | 对话 | 设备 | 设置 |
 | --- | --- | --- |
 | ![对话](docs/images/chat.png) | ![设备](docs/images/devices.png) | ![设置](docs/images/settings.png) |
@@ -148,7 +162,7 @@ OpenClaw 网关要求**每台设备**先被批准一次（它用设备身份 + �
 
 ## English
 
-**AI Passport Pocket Intercom** — hold the OK button on the device, speak, and your phone hands the words to your own AI assistant; the answer comes back to the device screen and the phone app. The device itself needs no Wi-Fi: audio travels over Bluetooth only.
+**AI Passport Pocket Intercom** — hold the OK button on the device, speak, and your phone hands the words to your own AI assistant; the answer comes back to the device screen and the phone app. The device itself needs no Wi-Fi: audio travels over Bluetooth only. A real device photo is in [`docs/images/device.jpg`](docs/images/device.jpg), and the app screenshots are in `docs/images/`.
 
 > ⚠️ **This version has no text-to-speech: replies are text only.** The device will **not speak the answer aloud** — the reply is shown as text on the device screen and in the phone app. Voice synthesis may be added later, but it is **not** part of the current release, so please do not expect audio output.
 
