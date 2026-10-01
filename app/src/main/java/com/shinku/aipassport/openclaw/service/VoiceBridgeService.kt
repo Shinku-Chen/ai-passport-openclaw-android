@@ -99,6 +99,14 @@ class VoiceBridgeService : Service() {
 
         /** 状态广播(供 UI 展示) */
         const val ACTION_STATUS = "com.shinku.aipassport.openclaw.action.STATUS"
+
+        /**
+         * 常驻通知被用户划掉时重新挂上（后台保活服务的通知不该因为误划而消失）。
+         *
+         * Android 14 起前台服务的通知允许被用户划掉（系统行为，App 无法直接禁止），
+         * 所以用 setDeleteIntent 监听“被划掉”事件，服务还在跑就重新上报一次前台通知。
+         */
+        const val ACTION_REPOST_NOTIFICATION = "com.shinku.aipassport.openclaw.action.REPOST_NOTIFICATION"
         const val EXTRA_STATUS = "status"
 
         /** 当前(或最近一次)连接设备的名称(广播名,如 Passport-1234);断开后保留。 */
@@ -194,6 +202,8 @@ class VoiceBridgeService : Service() {
         // 前台服务被系统杀死后 START_STICKY 重启(intent 为 null)也要拉起桥
         when (intent?.action) {
             ACTION_STOP -> stopSelf()
+            // 通知被划掉 → 重新挂上（服务还在跑才会收到这个 intent）
+            ACTION_REPOST_NOTIFICATION -> startForegroundCompat()
             ACTION_SCAN -> {
                 startBridge()
                 if (::ble.isInitialized) {
@@ -1219,6 +1229,15 @@ class VoiceBridgeService : Service() {
             .setSmallIcon(R.drawable.ic_stat_voice)
             .setContentIntent(pi)
             .setOngoing(true)
+            // 被划掉也重新挂上:后台保活通知消失会让用户误以为服务停了(也确实是排查窗口)
+            .setDeleteIntent(
+                PendingIntent.getService(
+                    this, 1,
+                    Intent(this, VoiceBridgeService::class.java)
+                        .setAction(ACTION_REPOST_NOTIFICATION),
+                    PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
+                )
+            )
             .build()
     }
 
