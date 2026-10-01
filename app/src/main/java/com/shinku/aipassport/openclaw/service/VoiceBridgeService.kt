@@ -576,6 +576,8 @@ class VoiceBridgeService : Service() {
             reportedGatewayError = reason
             publishGatewayStatus("$reason — 正在重连…")
         }
+        // 未就绪时也保持同步:重连原因/详情会变，设备屏不能停在旧文案上（同一内容由 3 秒去抖拦掉）。
+        syncGatewayStateToDevice(force = false)
         if (gatewayReconnectInFlight) return
         val delayMs = gatewayBackoff.nextDelayMs()
         Log.i(TAG, "网关重连排队:${delayMs}ms 后第 ${gatewayBackoff.attempts} 次重试,原因: $reason")
