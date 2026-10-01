@@ -144,6 +144,26 @@ OpenClaw 网关要求**每台设备**先被批准一次（它用设备身份 + �
   <img src="docs/images/gateway-types.png" alt="网关类型下拉" width="300">
 </p>
 
+### 图标（含原图与生成脚本）
+
+桌面图标画的是**设备本身**，屏幕里是 **OpenClaw 的龙虾**：
+
+<p align="center">
+  <img src="docs/design/app-icon-source.png" alt="App 图标原图" width="300">
+  <br>
+  <em>图标原图：[<code>docs/design/app-icon-source.png</code>](docs/design/app-icon-source.png)（2048×2048，256 色，AI 生成后定稿）</em>
+</p>
+
+- **原图**：[`docs/design/app-icon-source.png`](docs/design/app-icon-source.png) —— 仓库内保留的就是生成所有安卓图标资源的**母版**（完整无损版为 AI 生成稿，未入库）。
+- **生成脚本**：[`tools/make_android_icons.py`](tools/make_android_icons.py) —— 一条命令重新生成 `app/src/main/res` 里的整套图标（自适应图标 XML + 前景/背景图层 + 五个密度的方图与圆图）：
+
+  ```bash
+  python tools/make_android_icons.py            # 用仓库内母版
+  python tools/make_android_icons.py 别的母版.png  # 也可以换自己的 2048×2048 图
+  ```
+
+- **屏幕里的龙虾标记**：[`docs/design/openclaw-logo.png`](docs/design/openclaw-logo.png) —— 属于 OpenClaw，商标归属见文末说明。
+
 ## 常见问题
 
 | 现象 | 原因与处理 |
@@ -168,6 +188,7 @@ OpenClaw 网关要求**每台设备**先被批准一次（它用设备身份 + �
 
 > ⚠️ **This version has no text-to-speech: replies are text only.** The device will **not speak the answer aloud** — the reply is shown as text on the device screen and in the phone app. Voice synthesis may be added later, but it is **not** part of the current release, so please do not expect audio output.
 
+- **App icon** — the launcher icon is the device itself with the OpenClaw crayfish on its screen. The source artwork is [`docs/design/app-icon-source.png`](docs/design/app-icon-source.png) (2048×2048) and [`tools/make_android_icons.py`](tools/make_android_icons.py) regenerates every `res/mipmap*` asset (adaptive XML, foreground/background layers, five densities for the square and round icons).
 - **Firmware**: flash `FoloToy-AI-Passport-full.bin` from the firmware repository's [Releases page](https://github.com/Shinku-Chen/ai-passport/releases) — pick the **latest release whose name contains `intercom`** (releases look like `v1.8.0-intercom`; the repository also hosts other apps) — or use the [web flasher](https://ai-passport.folotoy.cn/tools/web-flasher/). The source is at [Shinku-Chen/ai-passport @ feature/openclaw-intercom](https://github.com/Shinku-Chen/ai-passport/tree/feature/openclaw-intercom), built with ESP-IDF 5.5.3.
 - **App**: install `app-release.apk` from [Releases](https://github.com/Shinku-Chen/ai-passport-openclaw-android/releases/latest) (Android 8+).
 - **Pair**: Device tab → Scan and connect → type the 6-digit code shown on the device.
