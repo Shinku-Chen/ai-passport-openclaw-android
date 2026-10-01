@@ -196,6 +196,9 @@ class VoicePipeline(
         scope.launch(Dispatchers.Default) { stt.prewarm() }
     }
 
+    /** 识别通道是否已预热可用（通知栏「语音」状态用）。 */
+    fun recognizerWarm(): Boolean = stt.isWarmReady()
+
     /**
      * 设置保存后由服务调用:把网关适配器换成按新配置重建的实例。
      * 不触碰 BLE/STT/TTS;在途的一轮对话仍会走旧适配器自然结束(下一轮用新实例)。

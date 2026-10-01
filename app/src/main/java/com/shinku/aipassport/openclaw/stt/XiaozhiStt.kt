@@ -85,6 +85,9 @@ class XiaozhiStt(
     @Volatile
     private var warmReady = false
 
+    /** 对外暴露热连接状态(通知栏「语音」行用)。 */
+    override fun isWarmReady(): Boolean = warmReady
+
     /** 热连接最近一次活动(建立/复用/一轮结束)的时刻,用于闲置超时判定。 */
     @Volatile
     private var warmActiveAtMs = 0L

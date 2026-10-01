@@ -790,6 +790,8 @@ class VoiceBridgeService : Service() {
         lastGatewayState = state
         lastGatewayDetail = detail
         lastGatewayStateAtMs = now
+        // 通知栏的「网关」行跟着状态变（内容未变时 Android 会去重，不会刷屏）
+        if (::ble.isInitialized) updateNotification(lastStatusText ?: "")
         if (!::ble.isInitialized) return
         val json = JsonObject().apply {
             addProperty("cmd", "gateway")
@@ -1189,19 +1191,44 @@ class VoiceBridgeService : Service() {
         nm.createNotificationChannel(channel)
     }
 
+    /**
+     * 常驻通知：三行状态（设备 / 网关 / 语音）。
+     *
+     * 折叠时一行摘要，展开（BigTextStyle）三行 —— 锁屏/息屏时也能一眼看到链路、网关、
+     * 语音通道各自是否活着（也是排查"息屏掉连接"最直接的窗口）。
+     */
     private fun notification(status: String): Notification {
         val pi = PendingIntent.getActivity(
             this, 0,
             Intent(this, MainActivity::class.java),
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
         )
+        val device = lastStatusText ?: status
+        val gateway = gatewayNotificationLine()
+        val voice = BridgeStatusText.voiceLine(
+            linkReady = deviceLinkState == LINK_READY || deviceLinkState == LINK_ENCRYPTED,
+            warmReady = if (::pipeline.isInitialized) pipeline.recognizerWarm() else false,
+        )
         return NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle("AI Passport 语音桥")
-            .setContentText(status)
+            .setContentText(BridgeStatusText.summary(device, gateway, voice))
+            .setStyle(
+                NotificationCompat.BigTextStyle()
+                    .bigText(BridgeStatusText.detail(device, gateway, voice))
+            )
             .setSmallIcon(R.drawable.ic_stat_voice)
             .setContentIntent(pi)
             .setOngoing(true)
             .build()
+    }
+
+    /** 通知里的网关状态行（四态词转中文；类型由状态卡与设备页展示，通知里不重复）。 */
+    private fun gatewayNotificationLine(): String = when (lastGatewayState) {
+        "ready" -> "就绪"
+        "connecting" -> "连接中"
+        "working" -> "工作中"
+        "offline" -> "离线"
+        else -> "未知"
     }
 
     private fun startForegroundCompat() {

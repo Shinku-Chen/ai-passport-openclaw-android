@@ -330,6 +330,16 @@ class MainActivity : AppCompatActivity() {
             if (!has(Manifest.permission.ACCESS_FINE_LOCATION)) needed += Manifest.permission.ACCESS_FINE_LOCATION
         }
         if (!has(Manifest.permission.RECORD_AUDIO)) needed += Manifest.permission.RECORD_AUDIO
+        // Android 13+ 通知需要运行时权限：没有它前台服务的常驻通知用户完全看不到
+        // (状态可视化、息屏保活的可见入口都依赖它)。这里单独请求且不阻断启动：
+        // 拒绝也不影响服务运行，只是看不到通知。
+        if (Build.VERSION.SDK_INT >= 33 && !has(Manifest.permission.POST_NOTIFICATIONS)) {
+            try {
+                requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 1001)
+            } catch (e: Exception) {
+                Log.w("MainActivity", "请求通知权限失败(忽略):${e.message}")
+            }
+        }
 
         if (needed.isEmpty()) {
             VoiceBridgeService.start(this)

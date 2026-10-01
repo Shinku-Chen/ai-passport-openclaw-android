@@ -67,6 +67,13 @@ interface SttEngine {
      */
     fun prewarm() {}
 
+    /**
+     * 识别通道是否已经预热可用（通知栏「语音」状态用）。
+     *
+     * 默认 false：不支持预热的引擎一律当作"没预热"，通知里显示「预热中…」而不是谎报可用。
+     */
+    fun isWarmReady(): Boolean = false
+
     /** 释放资源。 */
     fun release()
 
