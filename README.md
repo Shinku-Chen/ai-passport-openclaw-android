@@ -11,7 +11,7 @@
 | **下载手机 App** | [Releases](https://github.com/Shinku-Chen/ai-passport-openclaw-android/releases/latest) → `app-release.apk`（已签名） |
 | **给设备刷固件** | [**Shinku-Chen/ai-passport（分支 feature/openclaw-intercom）**](https://github.com/Shinku-Chen/ai-passport/tree/feature/openclaw-intercom) → [Releases 列表](https://github.com/Shinku-Chen/ai-passport/releases) → 找**名字里带 `intercom` 的最新一版**（发布命名形如 `v1.8.0-intercom`）→ 下载 `FoloToy-AI-Passport-full.bin`（可直接烧录的合并镜像） |
 | **在线刷机**（不用装工具） | <https://ai-passport.folotoy.cn/tools/web-flasher/> |
-| **看别人做了什么** | [AI Passport 社区](https://ai-passport.folotoy.cn/plays/)（本项目已投稿，审核中） |
+| **看别人做了什么** | [AI Passport 社区](https://ai-passport.folotoy.cn/plays/) —— 本项目已在社区上架：[**随身 AI 对讲机 · Pocket Intercom**](https://ai-passport.folotoy.cn/plays/799/) |
 
 <p align="center">
   <img src="docs/images/icon.png" alt="桌面图标" width="420">
@@ -184,7 +184,7 @@ OpenClaw 网关要求**每台设备**先被批准一次（它用设备身份 + �
 
 ## English
 
-**AI Passport Pocket Intercom** — hold the OK button on the device, speak, and the phone app — acting as the middleman — carries the words to your backend AI, then brings the answer back to the device screen and the phone app. The backend can be **OpenClaw**, an **OpenAI-compatible Hermes** endpoint, or any other OpenAI-compatible API. The device itself needs no Wi-Fi: audio travels over Bluetooth only. A real device photo is in [`docs/images/device.jpg`](docs/images/device.jpg), and the app screenshots are in `docs/images/`.
+**AI Passport Pocket Intercom** — hold the OK button on the device, speak, and the phone app — acting as the middleman — carries the words to your backend AI, then brings the answer back to the device screen and the phone app. The backend can be **OpenClaw**, an **OpenAI-compatible Hermes** endpoint, or any other OpenAI-compatible API. The device itself needs no Wi-Fi: audio travels over Bluetooth only. A real device photo is in [`docs/images/device.jpg`](docs/images/device.jpg), and the app screenshots are in `docs/images/`. This project is published on the AI Passport community: <https://ai-passport.folotoy.cn/plays/799/>.
 
 > ⚠️ **This version has no text-to-speech: replies are text only.** The device will **not speak the answer aloud** — the reply is shown as text on the device screen and in the phone app. Voice synthesis may be added later, but it is **not** part of the current release, so please do not expect audio output.
 
