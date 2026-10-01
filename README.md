@@ -8,6 +8,7 @@
 | --- | --- |
 | **下载手机 App** | [Releases](https://github.com/Shinku-Chen/ai-passport-openclaw-android/releases/latest) → `app-release.apk`（已签名） |
 | **给设备刷固件** | 固件仓 [Shinku-Chen/ai-passport](https://github.com/Shinku-Chen/ai-passport) → Release [`v1.8.0-intercom`](https://github.com/Shinku-Chen/ai-passport/releases/tag/v1.8.0-intercom) → 下载 `FoloToy-AI-Passport-full.bin`（可直接烧录的合并镜像） |
+| **看/改固件源码** | 同上仓库，**分支 [`feature/openclaw-intercom`](https://github.com/Shinku-Chen/ai-passport/tree/feature/openclaw-intercom)**（本应用的全部固件代码都在这个分支上，`main` 上还没有） |
 | **在线刷机**（不用装工具） | <https://ai-passport.folotoy.cn/tools/web-flasher/> |
 | **看别人做了什么** | [AI Passport 社区](https://ai-passport.folotoy.cn/plays/)（本项目已投稿，审核中） |
 
@@ -53,6 +54,23 @@
 ### 1. 给设备刷固件
 
 下载 [`v1.8.0-intercom`](https://github.com/Shinku-Chen/ai-passport/releases/tag/v1.8.0-intercom) 里的 `FoloToy-AI-Passport-full.bin`，用[在线刷机工具](https://ai-passport.folotoy.cn/tools/web-flasher/)或 `esptool` 烧录（从 `0x0` 起烧合并镜像）。刷完设备会广播名形如 `Passport-XXXX`。
+
+**固件源码位置**（想自己编译或改）：
+
+| 项 | 值 |
+| --- | --- |
+| 仓库 | <https://github.com/Shinku-Chen/ai-passport>（上游为 `FoloToy/ai-passport` 的 fork） |
+| **分支** | **`feature/openclaw-intercom`** |
+| 标签（本版） | `v1.8.0-intercom` |
+| 构建 | ESP-IDF **5.5.3**，`idf.py -B build build`（构建与烧录细节见固件仓 `docs/development/engineering/build-and-test.md`） |
+| 协议文档 | 固件仓 `docs/development/engineering/intercom-wire-protocol.md`（中英各一份） |
+
+```bash
+# 取固件源码(本应用对应的分支)
+git clone --branch feature/openclaw-intercom https://github.com/Shinku-Chen/ai-passport.git
+cd ai-passport
+idf.py -B build build      # 需要已激活 ESP-IDF 5.5.3
+```
 
 ### 2. 安装手机 App
 
@@ -115,13 +133,13 @@
 
 **AI Passport Pocket Intercom** — hold the OK button on the device, speak, and your phone hands the words to your own AI assistant; the answer comes back to the device screen and the phone app. The device itself needs no Wi-Fi: audio travels over Bluetooth only.
 
-- **Firmware**: flash `FoloToy-AI-Passport-full.bin` from the [`v1.8.0-intercom` release](https://github.com/Shinku-Chen/ai-passport/releases/tag/v1.8.0-intercom) (or use the [web flasher](https://ai-passport.folotoy.cn/tools/web-flasher/)).
+- **Firmware**: flash `FoloToy-AI-Passport-full.bin` from the [`v1.8.0-intercom` release](https://github.com/Shinku-Chen/ai-passport/releases/tag/v1.8.0-intercom) (or use the [web flasher](https://ai-passport.folotoy.cn/tools/web-flasher/)). The firmware source lives in [Shinku-Chen/ai-passport](https://github.com/Shinku-Chen/ai-passport) on branch **`feature/openclaw-intercom`** (tag `v1.8.0-intercom`), built with ESP-IDF 5.5.3.
 - **App**: install `app-release.apk` from [Releases](https://github.com/Shinku-Chen/ai-passport-openclaw-android/releases/latest) (Android 8+).
 - **Pair**: Device tab → Scan and connect → type the 6-digit code shown on the device.
 - **Gateway**: Settings → pick OpenClaw / Hermes / custom OpenAI-compatible / Echo, fill the fields and save (the app validates before saving).
 - **Talk**: press and hold OK (screen turns red, then green — you may speak), release to send.
 
-Screenshots are under `docs/images/`. The wire protocol and firmware live in [Shinku-Chen/ai-passport](https://github.com/Shinku-Chen/ai-passport).
+Screenshots are under `docs/images/`. The wire protocol and firmware live in [Shinku-Chen/ai-passport](https://github.com/Shinku-Chen/ai-passport) — branch `feature/openclaw-intercom`.
 
 ## 说明与许可
 
