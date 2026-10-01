@@ -9,6 +9,7 @@ import android.os.Bundle
 import android.view.LayoutInflater
 import android.view.View
 import android.view.ViewGroup
+import androidx.appcompat.app.AlertDialog
 import androidx.fragment.app.Fragment
 import androidx.recyclerview.widget.LinearLayoutManager
 import com.shinku.aipassport.openclaw.databinding.FragmentDevicesBinding
@@ -66,6 +67,26 @@ class DevicesFragment : Fragment() {
             )
             binding.deviceStatusText.text = "已断开"
             adapter.set(emptyList())
+        }
+        binding.btnForget.setOnClickListener {
+            // 忘记设备:本机停链路 + 清掉记住的地址(并尽力解除系统绑定)。
+            // Android 不允许 App 自行解除绑定，所以同时把要用户做的事说清楚。
+            requireContext().startService(
+                Intent(requireContext(), VoiceBridgeService::class.java)
+                    .setAction(VoiceBridgeService.ACTION_FORGET_DEVICE)
+            )
+            binding.deviceStatusText.text = "已忘记,等待重新配对"
+            adapter.set(emptyList())
+            AlertDialog.Builder(requireContext())
+                .setTitle("忘记设备 / 重新配对")
+                .setMessage(
+                    "已在本 App 里忘记这台设备（并尝试解除系统绑定）。\n\n" +
+                        "如果系统里还保留着配对，请再到：设置 → 蓝牙 → 找到本设备 → 取消配对；\n" +
+                        "然后回到这里点「扫描并连接」，按设备小屏新显示的 6 位码完成配对。\n\n" +
+                        "（也可以直接在设备上长按 UP → 重新配对，设备侧会清掉自己的配对信息。）"
+                )
+                .setPositiveButton("知道了", null)
+                .show()
         }
     }
 

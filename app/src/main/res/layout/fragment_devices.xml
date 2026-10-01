@@ -31,6 +31,14 @@
         android:layout_marginHorizontal="12dp"
         android:layout_marginBottom="8dp" />
 
+    <Button
+        android:id="@+id/btnForget"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="忘记设备 / 重新配对"
+        android:layout_marginHorizontal="12dp"
+        android:layout_marginBottom="8dp" />
+
     <TextView
         android:id="@+id/deviceStatusText"
         android:layout_width="match_parent"

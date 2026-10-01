@@ -362,6 +362,28 @@ class BleCentral(
         }
     }
 
+    /**
+     * 忘记设备:停链路、清掉记住的地址，并尽力解除系统绑定。
+     *
+     * Android 不给普通 App 直接取消配对的 API（`removeBond` 是 @SystemApi），这里反射尝试一次，
+     * 失败也不影响功能 —— 界面会同时告诉用户去系统蓝牙里取消配对（或直接在设备上长按 UP → 重新配对）。
+     */
+    fun forgetDevice() {
+        val addr = lastDeviceAddr ?: targetDevice?.address
+        stop()
+        prefs.edit().remove(KEY_LAST_DEVICE).apply()
+        if (addr == null) return
+        try {
+            val dev = adapter?.getRemoteDevice(addr) ?: return
+            if (dev.bondState != BluetoothDevice.BOND_NONE) {
+                val ok = dev.javaClass.getMethod("removeBond").invoke(dev) as? Boolean ?: false
+                Log.i(tag, "忘记设备:$addr removeBond=$ok")
+            }
+        } catch (e: Exception) {
+            Log.w(tag, "removeBond 不可用(需用户到系统蓝牙里取消配对):${e.message}")
+        }
+    }
+
     fun stop() {
         running = false
         bleHandler.removeCallbacksAndMessages(null)

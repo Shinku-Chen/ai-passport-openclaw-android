@@ -84,6 +84,9 @@ class VoiceBridgeService : Service() {
         const val ACTION_SCAN = "com.shinku.aipassport.openclaw.action.SCAN"
         /** 设备页:断开当前设备 */
         const val ACTION_DISCONNECT = "com.shinku.aipassport.openclaw.action.DISCONNECT"
+
+        /** 忘记设备:断开 + 清掉记住的地址(并尽力解除系统绑定),之后需重新配对。 */
+        const val ACTION_FORGET_DEVICE = "com.shinku.aipassport.openclaw.action.FORGET_DEVICE"
         /** 设备页:请求重发一次当前状态(新进页面立即拿到真实状态,不必等下一次变化) */
         const val ACTION_REQUEST_STATUS = "com.shinku.aipassport.openclaw.action.REQUEST_STATUS"
 
@@ -203,6 +206,12 @@ class VoiceBridgeService : Service() {
                 userDisconnected = true
                 if (::ble.isInitialized) ble.stop()
                 publishLinkStatus(LINK_DISCONNECTED, "已断开")
+            }
+            ACTION_FORGET_DEVICE -> {
+                // 忘记设备:与断开一样不再自动重连,此外清掉记住的地址(下次必须重新扫描配对)
+                userDisconnected = true
+                if (::ble.isInitialized) ble.forgetDevice()
+                publishLinkStatus(LINK_DISCONNECTED, "已忘记设备,等待重新配对")
             }
             // 设备页刚进来时问一次当前状态:广播只在状态变化时发,不能指望它刚好发生。
             // 同时走 startBridge(),保证服务未跑时也能被这次请求正常拉起(不靠后台 startService)。
