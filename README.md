@@ -91,10 +91,23 @@ idf.py -B build build      # 需要已激活 ESP-IDF 5.5.3
 
 | 类型 | 需要填 |
 | --- | --- |
-| **OpenClaw** | 域名 / 端口 / token；会话名默认 `passport` |
+| **OpenClaw** | 域名 / 端口 / token；会话名默认 `passport`。**首次连接时可能需要在管理端「批准本设备」**（见下） |
 | **Hermes** | 域名 / 端口 / 密钥 / 模型名 |
 | **自定义 OpenAI 兼容** | 域名 / 端口 / 请求路径（默认 `/v1/chat/completions`，只填 `/v1` 会自动补全）/ 密钥 / 模型名 |
 | **Echo** | 什么都不用填，用于本地自测链路 |
+
+#### 用 OpenClaw 时：首次连接需要在管理端授权同意
+
+OpenClaw 网关要求**每台设备**先被批准一次（它用设备身份 + 签名鉴权）；未获批时 App 会直接告诉你，而不是抱成"连接失败"：
+
+1. 点保存后，App / 设备屏会显示：**「等待网关授权：请在 OpenClaw 控制台批准本设备 (deviceId 8b87594d…)」**（设备屏上以状态气泡形式出现，App 顶部横幅同时显示）；
+2. 到管理端批准这台设备，二选一：
+   - **OpenClaw 控制台**：在电脑浏览器打开 `http://<网关地址>:<端口>/`（例如 `http://192.168.31.5:18789/`）→ 登录 → 进 **Devices / 设备** → 找到前面那串 `deviceId` 开头对应的设备（client 为 `openclaw-android`）→ **批准**；
+   - **在网关主机跑 CLI**：`openclaw devices list` 找到待批设备，再 `openclaw devices approve <deviceId>`；
+3. 批准后回到 App（等待期间它会**每 5 秒自动重试、最多等 180 秒**）——通常在等待界面里就自动完成并发提示「授权完成,网关设置已保存」；若已超时，再点一次「保存网关设置」即可；
+4. 之后同一台手机不用再批 ✓（设备身份存在本机，除非重置 App 数据或网关侧清除了设备列表）。
+
+> 没批准之前：语音识别、配对都是正常的 ✓，但**网关一直是"未授权"状态**✗，回复不会回来 ✗。
 
 保存成功后：设备屏 `网关` 一行变「就绪」，App 顶部显示「已就绪,长按设备 OK 说话」。
 
@@ -122,7 +135,7 @@ idf.py -B build build      # 需要已激活 ESP-IDF 5.5.3
 | 按下后一直不变绿 | 手机 App 没连上设备：检查蓝牙、看「设备」页是否显示已连接；必要时点「扫描并连接设备」 |
 | 设备屏「网关未配置」 | 到设置页填写并保存网关信息 |
 | 「网关 token 不匹配」 | 网关侧换了令牌：在设置页更新 Token 后保存 |
-| 「等待网关授权」 | 网关需要先批准这台设备：按提示在网关控制台批准，再点保存 |
+| 「等待网关授权」 | OpenClaw 要求**每台设备先被批准**（未批时 App 会显示 `deviceId` 开头那串）：到 OpenClaw 控制台 → **Devices / 设备** → 批准该设备，或在网关主机执行 `openclaw devices approve <deviceId>`；批准后 App 会自动继续（或再点一次保存）✓，详见上一节 |
 | 回复一直是"流程汇报" | 这是**网关侧助理**的行为（例如它把"没有待处理任务"当成回答），与 App 无关；可在网关侧调整提示词或记忆 |
 | 设备没有声音 / 不朗读回复 | **当前版本本来就没有语音生成** ✓：回复只以文字显示（设备屏 + App）✗，设备不会念出来；这是已知限制，不是故障 ✓ |
 | 长回复看不全 | 设备会自动滚到底；用 UP / DOWN 上下翻看 |
@@ -142,7 +155,7 @@ idf.py -B build build      # 需要已激活 ESP-IDF 5.5.3
 - **Firmware**: flash `FoloToy-AI-Passport-full.bin` from the firmware repository's [Releases page](https://github.com/Shinku-Chen/ai-passport/releases) — pick the **latest release whose name contains `intercom`** (releases look like `v1.8.0-intercom`; the repository also hosts other apps) — or use the [web flasher](https://ai-passport.folotoy.cn/tools/web-flasher/). The source is at [Shinku-Chen/ai-passport @ feature/openclaw-intercom](https://github.com/Shinku-Chen/ai-passport/tree/feature/openclaw-intercom), built with ESP-IDF 5.5.3.
 - **App**: install `app-release.apk` from [Releases](https://github.com/Shinku-Chen/ai-passport-openclaw-android/releases/latest) (Android 8+).
 - **Pair**: Device tab → Scan and connect → type the 6-digit code shown on the device.
-- **Gateway**: Settings → pick OpenClaw / Hermes / custom OpenAI-compatible / Echo, fill the fields and save (the app validates before saving).
+- **Gateway**: Settings → pick OpenClaw / Hermes / custom OpenAI-compatible / Echo, fill the fields and save (the app validates before saving). With **OpenClaw**, the gateway usually asks you to **approve this device once** from the admin side — the app shows `Waiting for gateway approval … (deviceId …)`; approve it in the OpenClaw console (Devices) or run `openclaw devices approve <deviceId>` on the gateway host, then save again (the app also retries automatically for up to 180 s).
 - **Talk**: press and hold OK (screen turns red, then green — you may speak), release to send.
 
 Screenshots are under `docs/images/`. The wire protocol and firmware live in [Shinku-Chen/ai-passport @ feature/openclaw-intercom](https://github.com/Shinku-Chen/ai-passport/tree/feature/openclaw-intercom).
