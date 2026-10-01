@@ -11,6 +11,7 @@ import com.shinku.aipassport.openclaw.gateway.RawLabel
 import com.shinku.aipassport.openclaw.gateway.VoicePrompt
 import com.shinku.aipassport.openclaw.protocol.VbFrame
 import com.shinku.aipassport.openclaw.protocol.VbFrameData
+import com.shinku.aipassport.openclaw.protocol.VersionCompat
 import com.shinku.aipassport.openclaw.stt.SttEngine
 import com.shinku.aipassport.openclaw.tts.DeviceTtsSession
 import com.shinku.aipassport.openclaw.tts.TtsEngine
@@ -111,9 +112,37 @@ class VoicePipeline(
      * 读设置里「App 显示完整回传流(调试)」开关,每次回复时取値(不缓存,改开关即时生效)。
      */
     private val showRawStream: () -> Boolean = { true },
+    /** 本 App 的 `versionName`(服务构造时从 PackageManager 读):用于固件/App 版本比对。 */
+    private val appVersion: String = "",
 ) {
     private val tag = "VoicePipeline"
     private val gson = Gson()
+
+    /** 本次连接是否已经检查过设备 hello 的版本(断开时重置,避免每次重连重复提示)。 */
+    private var helloChecked = false
+
+    /**
+     * 处理设备的 hello:核对固件/App 版本是否配套。
+     *
+     * 版本号按【同一版本号成对发布】的约定比对([VersionCompat]);不一致时向用户提示两处:
+     *  - App 侧:走 [onState] 上抛,状态卡显示可读原因;
+     *  - 设备侧:回一条文字气泡(`sendText`),设备屏也能看到。
+     * 信息不足(老固件不上报 fw/proto)不提示;每次连接只提示一次。
+     */
+    private fun onDeviceHello(obj: JsonObject?) {
+        if (helloChecked) return
+        helloChecked = true
+        val fw = obj?.get("fw")?.takeIf { it.isJsonPrimitive }?.asString
+        val proto = obj?.get("proto")?.takeIf { it.isJsonPrimitive }?.asInt
+        val notice = VersionCompat.check(appVersion, fw, proto)
+        if (notice == null) {
+            Log.i(tag, "版本一致:App $appVersion / 固件 ${fw ?: "未上报"}")
+            return
+        }
+        Log.w(tag, "版本不配套: $notice")
+        onState(notice)
+        sendText('A', "版本提示：$notice")
+    }
 
     /**
      * 当前使用的网关适配器。设置页保存后由 [updateGateway] 换成新配置重建的实例
@@ -205,6 +234,7 @@ class VoicePipeline(
         tts.stop()
         deviceTts.onCancel()
         stt.onLinkDown()
+        helloChecked = false   // 新一次连接:版本提示重新计一次
     }
 
     /** 服务销毁:停止 TTS 并释放识别引擎。 */
@@ -274,6 +304,9 @@ class VoicePipeline(
         when {
             ev == "turn_start" -> onTurnStart()
             ev == "turn_end" -> onTurnEnd()
+            // 设备的 hello:带上固件版本与协议版本 —— 与本 App 比对(同一版本号成对发布),
+            // 不一致时双侧提示用户更新(只提示、不阻断对话)。
+            ev == "hello" -> onDeviceHello(obj)
             // 设备侧 TTS 播放回报(见 docs/wire-protocol.md 的 TTS 下行):只记日志并与
             // 本地「已发送」对账(设备可能因队列溢出/解码失败丢掉一些包)。
             ev != null && ev in TtsPlaybackReport.ALL -> onTtsPlayback(ev, obj)

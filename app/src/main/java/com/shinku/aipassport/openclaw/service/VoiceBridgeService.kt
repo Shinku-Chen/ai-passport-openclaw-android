@@ -28,6 +28,7 @@ import com.shinku.aipassport.openclaw.gateway.OpenClawGateway
 import com.shinku.aipassport.openclaw.gateway.OpenClawGatewayRegistry
 import com.shinku.aipassport.openclaw.gateway.ReconnectBackoff
 import com.shinku.aipassport.openclaw.gateway.isUnknownMethod
+import com.shinku.aipassport.openclaw.protocol.VersionCompat
 import com.shinku.aipassport.openclaw.gateway.needsGatewayReload
 import com.shinku.aipassport.openclaw.pipeline.VoicePipeline
 import com.shinku.aipassport.openclaw.ui.ConversationStore
@@ -285,6 +286,7 @@ class VoiceBridgeService : Service() {
             sendText = { role, text -> sendTextFrame(role, text) },
             // 录音/识别真的就绪 → 下发 EVENT {"ev":"turn_ready"}(设备侧「按下即红、就绪变绿」)
             sendEvent = { json -> sendEventFrame(json) },
+            appVersion = appVersionName(),
             onState = { status ->
                 // 流水线状态也上状态卡;同时把与网关有关的那几条(已就绪/中断原因)同步给设备:
                 // 否则一轮跑完后设备会停在「网关 工作中」,直到下一次状态变化才纠正。
@@ -318,6 +320,8 @@ class VoiceBridgeService : Service() {
                 }
                 override fun onReady() {
                     publishLinkStatus(LINK_READY, "已就绪,长按设备 OK 说话")
+                    // 向设备上报本 App 版本(设备据此检查固件/App 是否配套,不一致时设备屏会提示)
+                    sendDeviceHello()
                     // 识别通道常驻预热:链路一就绪就先建一条小智热连接(后台静默、不影响 UI),
                     // 用户按下 OK 时就能直接 listen.start → turn_ready 毫秒级到达(修「按下后要等准备中」)。
                     if (::pipeline.isInitialized) pipeline.prewarm()
@@ -1087,6 +1091,31 @@ class VoiceBridgeService : Service() {
                 .putExtra(EXTRA_DEVICE_ADDR, lastDeviceAddr)
                 .putExtra(EXTRA_DEVICE_STATE, deviceLinkState)
         )
+    }
+
+    /**
+     * 向设备上报本 App 的版本(hello)。
+     *
+     * 设备侧拿它做两件事:① 检查固件/App 是否配套(同一版本号成对发布,不一致时设备屏提示更新 App);
+     * ② 显示在设备信息页(长按 UP → 设备信息)。每次链路就绪后发一次即可。
+     */
+    private fun sendDeviceHello() {
+        if (!::ble.isInitialized) return
+        val json = JsonObject().apply {
+            addProperty("cmd", "hello")
+            addProperty("proto", VersionCompat.PROTO_VERSION)
+            addProperty("app", appVersionName())
+        }.toString()
+        Log.i(TAG, "向设备上报 App 版本:${appVersionName()}(协议 v${VersionCompat.PROTO_VERSION})")
+        ble.writeBytes(vbEncodeFrame(VbFrame.TYPE_CONTROL, 0, json.toByteArray(Charsets.UTF_8)))
+    }
+
+    /** 本 App 的 versionName(运行时读取,不依赖 BuildConfig —— AGP 8 默认不生成它)。 */
+    private fun appVersionName(): String = try {
+        packageManager.getPackageInfo(packageName, 0).versionName ?: "0"
+    } catch (e: Exception) {
+        Log.w(TAG, "读取 App 版本号失败:${e.message}")
+        "0"
     }
 
     // ---- 前台通知 ----
