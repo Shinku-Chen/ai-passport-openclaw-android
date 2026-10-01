@@ -1,6 +1,8 @@
-# AI Passport 随身对讲机 · Pocket Intercom
+# AI Passport 随身AI对讲机 · Pocket Intercom
 
-把 [AI Passport](https://github.com/Shinku-Chen/ai-passport) 变成一台随身对讲机：**按住 OK 说话 → 手机上的 App 把话交给你的 AI 助理 → 回答同时回到设备小屏和手机里**。设备本身不用联网，语音只在「设备 ↔ 手机」之间走蓝牙。
+把 [AI Passport](https://github.com/Shinku-Chen/ai-passport) 变成一台随身 AI 对讲机：**按住 OK 说话 → 手机端 App 作为中介，把你的话交给后端 AI → 回答同时回到设备小屏和手机里**。
+
+手机端作为中介，连接你的对讲机和后端 AI：后端**可以是 OpenClaw**，**也可以是兼容 OpenAI 的 Hermes 等接口**（同一套 App 里切换 ✓）。设备本身不用联网，语音只在「设备 ↔ 手机」之间走蓝牙。
 
 > 本仓库是**项目入口**：包含手机端 App（本仓）与设备端固件的引用、下载入口、功能说明与使用方法。
 
@@ -162,7 +164,7 @@ OpenClaw 网关要求**每台设备**先被批准一次（它用设备身份 + �
 
 ## English
 
-**AI Passport Pocket Intercom** — hold the OK button on the device, speak, and your phone hands the words to your own AI assistant; the answer comes back to the device screen and the phone app. The device itself needs no Wi-Fi: audio travels over Bluetooth only. A real device photo is in [`docs/images/device.jpg`](docs/images/device.jpg), and the app screenshots are in `docs/images/`.
+**AI Passport Pocket Intercom** — hold the OK button on the device, speak, and the phone app — acting as the middleman — carries the words to your backend AI, then brings the answer back to the device screen and the phone app. The backend can be **OpenClaw**, an **OpenAI-compatible Hermes** endpoint, or any other OpenAI-compatible API. The device itself needs no Wi-Fi: audio travels over Bluetooth only. A real device photo is in [`docs/images/device.jpg`](docs/images/device.jpg), and the app screenshots are in `docs/images/`.
 
 > ⚠️ **This version has no text-to-speech: replies are text only.** The device will **not speak the answer aloud** — the reply is shown as text on the device screen and in the phone app. Voice synthesis may be added later, but it is **not** part of the current release, so please do not expect audio output.
 
