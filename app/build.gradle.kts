@@ -35,10 +35,10 @@ android {
         applicationId = "com.shinku.aipassport.openclaw"
         minSdk = 26          // BLE 前台 Service + 后台扫描需要
         targetSdk = 35
-        versionCode = 4
+        versionCode = 5
         // 版本号与固件/社区保持一致(硬约定):固件 tag vX.Y.Z-intercom ↔ App versionName X.Y.Z。
-        // 1.8.0 = 对应固件 v1.8.0-intercom(含社区上架的那一版)。
-        versionName = "1.8.0"
+        // 1.9.0 = 对应固件 v1.9.0-intercom(配对面板修复 + 设置菜单重新配对 + 版本号显示)。
+        versionName = "1.9.0"
     }
 
     signingConfigs {

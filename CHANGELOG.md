@@ -1,6 +1,8 @@
 # Changelog
 
-## Unreleased
+## 1.9.0
+
+> 版本号从此改为与固件/社区一致：固件 tag `vX.Y.Z-intercom` ↔ App `X.Y.Z`（旧版为 0.1.x 序列）。
 
 - 新增：**设备页「忘记设备 / 重新配对」按钮** + **设备设置菜单里的「重新配对」**。
   - App 侧：设备页新增按钮 —— 断开链路、清掉记住的设备地址，并尽力反射调用 `removeBond`
@@ -52,8 +54,8 @@
   - 修复：`isPairingRequired()` 扩展覆盖上述错误码与文案（含「approve + device」兜底），
     一律走可恢复的「等待网关授权：请在 OpenClaw 控制台批准本设备 (deviceId …)」；
     新增单测覆盖 8 种新写法。
-- 变更：**版本号与固件/社区对齐到 `1.8.0`**。
-  - App `versionName` `0.1.2 → 1.8.0`（`versionCode 4`），对应固件 release tag `v1.8.0-intercom`；
+- 变更：**版本号与固件/社区对齐到 `1.9.0`**。
+  - App `versionName` `1.8.0 → 1.9.0`（`versionCode 5`），对应固件 release tag `v1.9.0-intercom`；
     约定写进 `AGENTS.md`：固件 `vX.Y.Z-intercom` ↔ App `X.Y.Z`，社区作品说明里注明同一版本号。
 
 - 修 bug：**配对输完 6 位密码后卡在「已连接,等待加密」，设备屏的配对码面板也不消失**。
