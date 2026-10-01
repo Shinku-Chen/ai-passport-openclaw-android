@@ -2,6 +2,14 @@
 
 ## 1.10
 
+- 新增：**开机自动启动**（默认开，设置页可关，切换即落盘）。
+  - 清单新增 `RECEIVE_BOOT_COMPLETED` + `BootReceiver`（同时兼容 `BOOT_COMPLETED` 与
+    `QUICKBOOT_POWERON`）；收到开机广播且开关为开时拉起前台服务。
+    Android 12+ 允许从开机广播启动前台服务（官方豁免），本服务类型为 `connectedDevice`，不受
+    "相机/麦克风/定位"那类后台启动限制。
+  - 设置页加「开机自动启动（默认开）」开关 + 一行提示：小米/HyperOS 还需在
+    系统设置 → 应用管理 → 本应用 → 自启动 里打开（OEM 白名单，App 无法代替）。
+
 - 改进：**通知渠道重要性 LOW → DEFAULT**（新渠道 id `voice_bridge_v2`，旧的 `voice_bridge` 自动删除）。
   原来用 `IMPORTANCE_LOW` 时，MIUI/HyperOS 会把它当"静默通知"：既不显示系统侧的「常驻通知」开关，
   也更容易被系统收起。渠道重要性**创建后只能降不能升**，所以只能换新渠道 id 并把旧的删掉。

@@ -504,6 +504,24 @@
             android:text="App 显示完整回传流（调试）"
             android:textColor="#DDDDDD" />
 
+        <!-- 开机自启:App 侧能从 BOOT_COMPLETED 拉起前台服务,但小米/HyperOS 等还需用户在
+             系统里把本应用的「自启动」打开,否则开机广播不会送到 App。 -->
+        <com.google.android.material.materialswitch.MaterialSwitch
+            android:id="@+id/checkBootAutoStart"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="10dp"
+            android:text="开机自动启动（默认开）"
+            android:textColor="#DDDDDD" />
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="4dp"
+            android:text="小米/HyperOS 还需在 系统设置 → 应用管理 → 本应用 → 自启动 里打开；电池策略建议设为「无限制」。"
+            android:textColor="#9E9E9E"
+            android:textSize="12sp" />
+
         <!-- 设备朗读(下行 TTS)的设置项当前【不提供】:项目暂不考虑文字转语音。
              代码与协议能力(0x06 下行帧 + 固件播放通路)保留为休眠能力,
              `tts_enabled` 默认 false,需要时可把开关加回来。 -->

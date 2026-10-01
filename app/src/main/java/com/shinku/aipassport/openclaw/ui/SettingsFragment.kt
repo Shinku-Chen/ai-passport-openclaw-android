@@ -217,6 +217,14 @@ class SettingsFragment : Fragment() {
             settings.showRawStream = checked
         }
 
+        // 开机自启（与网关无关，切换即落盘）：重启后由 BootReceiver 拉起前台服务。
+        // 小米/HyperOS 还需用户在系统里开本应用的「自启动」，布局里已给提示。
+        binding.checkBootAutoStart.isChecked = settings.bootAutoStart
+        binding.checkBootAutoStart.setOnCheckedChangeListener { _, checked ->
+            settings.bootAutoStart = checked
+            log("开机自动启动：${if (checked) "开" else "关"}")
+        }
+
         // 设备朗读(下行 TTS)的设置项已移除(项目暂不考虑文字转语音):
         // prefs 里的 tts_enabled 保持默认 false,代码作为休眠能力保留。
         // 注意:不要因为删掉开关就把 tts_enabled 改写成 true。

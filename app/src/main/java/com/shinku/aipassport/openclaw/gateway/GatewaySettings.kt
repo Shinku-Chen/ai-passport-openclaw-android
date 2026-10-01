@@ -122,6 +122,16 @@ class GatewaySettings(context: Context) {
         get() = prefs.getBoolean(KEY_SHOW_RAW_STREAM, true)
         set(value) = prefs.edit().putBoolean(KEY_SHOW_RAW_STREAM, value).apply()
 
+    /**
+     * 开机自动启动：重启后由 [com.shinku.aipassport.openclaw.service.BootReceiver] 拉起前台服务。
+     *
+     * 默认开（这个应用本身就是常连设备）。能否真的生效还取决于系统是否放行开机广播：
+     * 小米/HyperOS 需要用户在本应用的「自启动」里打开，属 OEM 白名单，App 无法代替。
+     */
+    var bootAutoStart: Boolean
+        get() = prefs.getBoolean(KEY_BOOT_AUTO_START, true)
+        set(value) = prefs.edit().putBoolean(KEY_BOOT_AUTO_START, value).apply()
+
     // ---- 设备朗读(下行 TTS:手机合成 → Opus → 设备播放回复)----
 
     /**
@@ -500,6 +510,9 @@ class GatewaySettings(context: Context) {
 
         // App 调试展示开关(与网关类型无关;存同一份 gateway_settings prefs)
         private const val KEY_SHOW_RAW_STREAM = "show_raw_stream"
+
+        /** 开机自启开关（默认开）。 */
+        private const val KEY_BOOT_AUTO_START = "boot_auto_start"
 
         // 设备朗读(下行 TTS)开关与引擎(与网关类型无关)
         private const val KEY_TTS_ENABLED = "tts_enabled"
