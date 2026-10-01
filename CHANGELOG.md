@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- 新增：**点「保存网关设置」需要授权时弹出等待框**。
+  - 保存校验进入「等待网关授权」状态即弹对话框：显示原文（含 deviceId）、控制台 Devices 页路径、
+    `openclaw devices list` + `openclaw devices approve <deviceId>`，并说明批准后会自动继续校验保存；
+    批准成功 / 超时 / 失败时自动关闭，重试循环不受影响。
+- 修 bug：**设备的网关状态更新不及时（一直停在「网关 连接中」）**。
+  - 根因：`monitorGateway()` 在「尚未就绪、且没有失败原因」时**直接 return**，从不主动探活；
+    而 OpenAI 兼容 / Hermes 适配器是“一问才会连”的，不主动发请求就永远不 ready ——
+    于是设备屏与状态卡长期停在 connecting。
+  - 修复：新增 `maybeProbeGateway()`，未就绪且无错误时**每 10 秒主动探活一次**，
+    探通即播报「网关已就绪」并强制同步给设备；探活失败只记日志，不污染 `lastError` 语义。
+
 - 修 bug：**设备屏的「网关 就绪」与 App 状态刷新不及时**。
   - 根因：`monitorGateway()` 在网关 `isReady()` 时，只在前一次报过错的情况下才播报「网关已恢复连接」；
     首次由 connecting → ready 的转变什么都不下发，于是设备屏一直停在「网关 连接中」，

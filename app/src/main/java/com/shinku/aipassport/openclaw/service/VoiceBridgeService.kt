@@ -552,6 +552,35 @@ class VoiceBridgeService : Service() {
         forwardGatewayState(status)
     }
 
+    /** 「未就绪且无错误」时主动探活的节流时刻。 */
+    private var lastGatewayProbeAtMs = 0L
+
+    /**
+     * 网关未就绪、且还没有失败原因时的主动探活。
+     *
+     * OpenAI 兼容与 Hermes 适配器是“一问才会连”:不主动发请求就永远不会 ready，
+     * 设备屏/状态卡就会一直停在「网关 连接中」（真机反馈的“设备网关状态更新不及时”）。
+     * 这里每 10 秒最多探一次，探通就立即播报并同步到设备。
+     */
+    private fun maybeProbeGateway() {
+        val now = System.currentTimeMillis()
+        if (now - lastGatewayProbeAtMs < 10_000L) return
+        lastGatewayProbeAtMs = now
+        scope.launch {
+            try {
+                if (gateway.connect()) {
+                    Log.i(TAG, "网关探活成功,状态置为就绪")
+                    reportedGatewayError = null
+                    syncGatewayStateToDevice(force = true)
+                } else {
+                    Log.i(TAG, "网关探活未就绪:${gateway.lastError ?: "无原因"}")
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "网关探活异常:${e.message}")
+            }
+        }
+    }
+
     private fun monitorGateway() {
         if (!::gateway.isInitialized) return
         if (gateway.isReady()) {
@@ -567,8 +596,14 @@ class VoiceBridgeService : Service() {
             syncGatewayStateToDevice(force = false)
             return
         }
-        // 还没有失败原因(如尚未首次对话)时不播报,避免误报「网关断开」
-        val reason = gateway.lastError ?: lastReconnectReason ?: return
+        // 还没有失败原因(如尚未首次对话)时不再直接 return —— 那会让 OpenAI 兼容/Hermes 这类
+        // “不主动请求就不会 ready”的网关永远停在 connecting，设备屏一直显示「网关 连接中」。
+        // 改为主动探活(10 秒节流)，探通就立刻播报就绪并同步到设备。
+        val reason = gateway.lastError ?: lastReconnectReason
+        if (reason == null) {
+            maybeProbeGateway()
+            return
+        }
         // 双保险:「网关不认识这个方法」与连接无关(能力缺失),不播报、也不驱动重连。
         // 只拦这一个原因 —— 权限不足之类的仍要重试/播报(重连循环绝不能停在那上面)。
         if (isUnknownMethod(null, reason)) return

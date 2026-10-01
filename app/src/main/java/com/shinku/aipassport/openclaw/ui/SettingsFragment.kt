@@ -399,6 +399,43 @@ class SettingsFragment : Fragment() {
      *    按钮改显示「等待授权…」;批准后自动落盘并提示「授权完成,网关设置已保存」;
      *  - 其余失败立刻停手,一个字段都不落盘(原配置继续生效),原因用对话框展示。
      */
+    /** 等待网关授权时弹出的等待框(批准成功/超时/失败时关闭)。 */
+    private var approvalDialog: AlertDialog? = null
+
+    /**
+     * 保存时遇到「等待网关授权」弹出等待框。
+     *
+     * 真机反馈:点「保存网关设置」后只看到按钮变字，不知道要去干什么。
+     * 这里把原文(含 deviceId)与两条批准路径直接摆出来；不阻塞重试循环，批准后会自动关掉。
+     */
+    private fun showApprovalDialog(reason: String) {
+        if (!isAdded || view == null) return
+        if (approvalDialog?.isShowing == true) return
+        val message = buildString {
+            appendLine(reason.ifBlank { "$AWAITING_PAIRING_PREFIX$AWAITING_PAIRING_HINT" })
+            appendLine()
+            appendLine("怎么批准（二选一）：")
+            appendLine("1) 浏览器打开网关 Web 控制台 → Devices / 设备 → 找到上面这串 deviceId → 批准；")
+            appendLine("2) 在网关主机执行：openclaw devices list 找到待批设备，再 openclaw devices approve <deviceId>。")
+            appendLine()
+            append("批准后 App 会自动继续校验并保存（每 5 秒重试，最多等 180 秒）。")
+        }
+        approvalDialog = AlertDialog.Builder(requireContext())
+            .setTitle("等待网关授权")
+            .setMessage(message)
+            .setPositiveButton("知道了", null)
+            .show()
+    }
+
+    private fun dismissApprovalDialog() {
+        try {
+            approvalDialog?.dismiss()
+        } catch (_: Exception) {
+            // 视图已销毁等情况直接忽略
+        }
+        approvalDialog = null
+    }
+
     private fun saveSettings() {
         val form = snapshotForm()
         val draft = buildDraft(form) ?: return
@@ -430,6 +467,8 @@ class SettingsFragment : Fragment() {
                     is SaveValidation.AwaitingPairing -> {
                         reason = result.reason
                         awaiting = true
+                        // 需要授权就弹等待框（含 deviceId 与批准步骤），不用等超时才明白发生了什么
+                        showApprovalDialog(result.reason)
                     }
 
                     is SaveValidation.Failed -> {
@@ -464,6 +503,7 @@ class SettingsFragment : Fragment() {
                 b.btnSave.isEnabled = true
                 b.btnSave.text = "保存网关设置"
             }
+            dismissApprovalDialog()
             if (saved) {
                 // 第 1 次就通过 = 普通保存;多次才通过 = 等过授权的自动重试
                 if (attempt > 1) {
