@@ -2,6 +2,14 @@
 
 ## 1.10
 
+- 修复/加固：**锁屏或息屏后小智语音长连接可能断开**。
+  - 原因：小智通道本身已有 20 秒 ping，但黑屏后系统会 ① 让 CPU 休眠（协程与定时器停摆，ping 发不出去）
+    ② 让 Wi-Fi 进入省电模式（空闲 TCP 被中间设备回收），加上 MIUI/HyperOS 的后台限制。
+  - 服务侧保活：`VoiceBridgeService` 新增 `PARTIAL_WAKE_LOCK`（只保 CPU，不亮屏）+
+    `WifiLock(WIFI_MODE_FULL_HIGH_PERF)`，随服务生命周期获取/释放；清单补 `WAKE_LOCK` 权限。
+  - 系统侧引导：`MainActivity` 首次启动若未获电池优化豁免，弹一次引导（只问一次）并直达
+    `REQUEST_IGNORE_BATTERY_OPTIMIZATIONS` 设置页 —— MIUI/HyperOS 上这一步是决定性的。
+
 > 版本号约定更新为**两段式**：固件 tag `vX.Y-intercom` ↔ App `versionName X.Y` ↔ 社区标题/说明（例如 `v1.10`）。
 
 - 新增：**固件与 App 互报版本，不一致就双向提示**（配对后即检查，不阻断对话）。

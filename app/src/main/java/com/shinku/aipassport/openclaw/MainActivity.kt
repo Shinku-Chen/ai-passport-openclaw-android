@@ -7,10 +7,14 @@ import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.graphics.Color
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.PowerManager
+import android.util.Log
 import android.view.View
 import android.widget.Toast
+import android.provider.Settings
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
@@ -82,6 +86,7 @@ class MainActivity : AppCompatActivity() {
 
         setupTabs()
         applyWindowInsets(binding.root)
+        askBatteryExemptionIfNeeded()
         binding.btnRefreshStatus.setOnClickListener {
             // 等待网关授权时这个按钮的含义变成“怎么做才能授权”,把步骤直接摆给用户看
             if (awaitingApproval) showApprovalDialog(binding.statusText.text.toString()) else refreshStatus()
@@ -126,6 +131,46 @@ class MainActivity : AppCompatActivity() {
         supportFragmentManager.beginTransaction()
             .replace(binding.fragmentContainer.id, createFragment(position), "tab_$position")
             .commit()
+    }
+
+    /**
+     * 息屏保活第一步:请求电池优化豁免（只问一次）。
+     *
+     * 服务侧已经拿了 PARTIAL_WAKE_LOCK + WifiLock，能顶住大部分情况；但 MIUI/HyperOS 这类系统
+     * 还会在后台限制应用的网络与唤醒，必须由用户把应用设为「无限制/允许后台活动」。
+     * 这里弹一次引导，之后不再打扰（无论用户选什么）。
+     */
+    private fun askBatteryExemptionIfNeeded() {
+        try {
+            val prefs = getSharedPreferences("keepalive", MODE_PRIVATE)
+            val pm = getSystemService(PowerManager::class.java) ?: return
+            if (pm.isIgnoringBatteryOptimizations(packageName)) return
+            if (prefs.getBoolean("battery_asked", false)) return
+            prefs.edit().putBoolean("battery_asked", true).apply()
+            AlertDialog.Builder(this)
+                .setTitle("让屏幕熄灭后连接不断")
+                .setMessage(
+                    "为了在锁屏/息屏后仍能保持与网关和语音服务的连接，请在系统设置里把本应用设为" +
+                        "「无限制 / 允许后台活动」（电池优化豁免）。\n\n" +
+                        "点「去设置」会直接打开该应用的电池优化页面；也可以稍后在系统设置里手动改。"
+                )
+                .setPositiveButton("去设置") { _, _ ->
+                    try {
+                        startActivity(
+                            Intent(
+                                Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
+                                Uri.parse("package:$packageName"),
+                            )
+                        )
+                    } catch (e: Exception) {
+                        Toast.makeText(this, "打不开电池优化设置:${e.message}", Toast.LENGTH_LONG).show()
+                    }
+                }
+                .setNegativeButton("以后再说", null)
+                .show()
+        } catch (e: Exception) {
+            Log.w("MainActivity", "电池优化豁免引导失败(忽略):${e.message}")
+        }
     }
 
     private fun createFragment(position: Int): Fragment = when (position) {

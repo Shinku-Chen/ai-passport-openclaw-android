@@ -9,8 +9,10 @@ import android.bluetooth.BluetoothManager
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
+import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.IBinder
+import android.os.PowerManager
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
@@ -185,6 +187,7 @@ class VoiceBridgeService : Service() {
     override fun onCreate() {
         super.onCreate()
         createChannel()
+        acquireKeepAliveLocks()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -236,6 +239,7 @@ class VoiceBridgeService : Service() {
         if (::gateway.isInitialized) gateway.close()
         if (::tts.isInitialized) tts.shutdown()
         if (::pipeline.isInitialized) pipeline.shutdown()
+        releaseKeepAliveLocks()
         releaseTtsEngine()
         initialized = false
         OpenClawGatewayRegistry.removeListener(gatewayStatusListener)
@@ -1116,6 +1120,61 @@ class VoiceBridgeService : Service() {
     } catch (e: Exception) {
         Log.w(TAG, "读取 App 版本号失败:${e.message}")
         "0"
+    }
+
+    // ---- 息屏保活 ----
+
+    private var wakeLock: PowerManager.WakeLock? = null
+    private var wifiLock: WifiManager.WifiLock? = null
+
+    /**
+     * 拿两把锁,保证**息屏后连接不断**。
+     *
+     * 小智语音通道是长连接(已带 20 秒 ping),但手机黑屏后会做两件事把长连接搞死:
+     *  ① CPU 休眠 —— 协程/定时器不再跑,ping 发不出去,对端判死连接;
+     *  ② Wi-Fi 进入省电模式 —— TCP 长时间空闲被中间设备/路由器回收。
+     * 所以这里保持 PARTIAL_WAKE_LOCK(不强亮屏、只让 CPU 能跑) +
+     * WifiLock(WIFI_MODE_FULL_HIGH_PERF,防止 Wi-Fi 省电断流)。两把锁随服务生命周期,
+     * onDestroy 释放;前台服务本来就在跑,所以额外的耗电有限(实测场景本来就是常连的设备)。
+     *
+     * 注:MIUI/HyperOS 等系统还要求把应用设为"无限制/允许后台活动"(电池优化豁免),
+     * 那是系统侧设置, App 侧只能引导用户去开(见设置页提示)。
+     */
+    private fun acquireKeepAliveLocks() {
+        try {
+            val pm = getSystemService(PowerManager::class.java)
+            wakeLock = pm?.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "$packageName:voice-bridge")?.apply {
+                setReferenceCounted(false)
+                acquire()
+            }
+            Log.i(TAG, "保活:PARTIAL_WAKE_LOCK 已获取")
+        } catch (e: Exception) {
+            Log.w(TAG, "获取 WakeLock 失败(息屏后连接可能被系统挂起):${e.message}")
+        }
+        try {
+            val wm = applicationContext.getSystemService(WifiManager::class.java)
+            wifiLock = wm?.createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, "$packageName:wifi-bridge")?.apply {
+                setReferenceCounted(false)
+                acquire()
+            }
+            Log.i(TAG, "保活:WifiLock(HIGH_PERF) 已获取")
+        } catch (e: Exception) {
+            Log.w(TAG, "获取 WifiLock 失败(息屏后 Wi-Fi 可能省电断流):${e.message}")
+        }
+    }
+
+    private fun releaseKeepAliveLocks() {
+        try {
+            wakeLock?.takeIf { it.isHeld }?.release()
+        } catch (_: Exception) {
+        }
+        wakeLock = null
+        try {
+            wifiLock?.takeIf { it.isHeld }?.release()
+        } catch (_: Exception) {
+        }
+        wifiLock = null
+        Log.i(TAG, "保活锁已释放")
     }
 
     // ---- 前台通知 ----
