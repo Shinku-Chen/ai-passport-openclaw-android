@@ -1,5 +1,7 @@
 # AI Passport 随身AI对讲机 · Pocket Intercom
 
+🎉 本项目已在 **AI Passport 社区**上架：[**随身 AI 对讲机 · Pocket Intercom**](https://ai-passport.folotoy.cn/plays/799/) · <https://ai-passport.folotoy.cn/plays/799/>
+
 把 [AI Passport](https://github.com/Shinku-Chen/ai-passport) 变成一台随身 AI 对讲机：**按住 OK 说话 → 手机端 App 作为中介，把你的话交给后端 AI → 回答同时回到设备小屏和手机里**。
 
 手机端作为中介，连接你的对讲机和后端 AI：后端**可以是 OpenClaw**，**也可以是兼容 OpenAI 的 Hermes 等接口**（同一套 App 里切换 ✓）。设备本身不用联网，语音只在「设备 ↔ 手机」之间走蓝牙。
