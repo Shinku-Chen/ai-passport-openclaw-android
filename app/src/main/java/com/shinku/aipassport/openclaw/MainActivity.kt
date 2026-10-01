@@ -12,6 +12,7 @@ import android.os.Bundle
 import android.view.View
 import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
 import androidx.core.view.ViewCompat
@@ -19,6 +20,7 @@ import androidx.core.view.WindowInsetsCompat
 import androidx.fragment.app.Fragment
 import com.google.android.material.tabs.TabLayout
 import com.shinku.aipassport.openclaw.databinding.ActivityMainBinding
+import com.shinku.aipassport.openclaw.gateway.AWAITING_PAIRING_PREFIX
 import com.shinku.aipassport.openclaw.gateway.GatewayFactory
 import com.shinku.aipassport.openclaw.gateway.GatewaySettings
 import com.shinku.aipassport.openclaw.service.VoiceBridgeService
@@ -46,6 +48,12 @@ class MainActivity : AppCompatActivity() {
     private lateinit var settings: GatewaySettings
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
 
+    /** 当前是否处于「等待网关授权」:按钮改为「去授权」并主动弹一次提醒。 */
+    private var awaitingApproval = false
+
+    /** 上一次弹过提醒的文案(同一个 deviceId 只提醒一次,避免反复弹窗)。 */
+    private var lastApprovalDetail: String? = null
+
     private val permissionLauncher =
         registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { grants ->
             val ok = grants.values.all { it }
@@ -61,6 +69,7 @@ class MainActivity : AppCompatActivity() {
             val s = intent.getStringExtra(VoiceBridgeService.EXTRA_STATUS) ?: return
             binding.statusText.text = s
             updateStatusDot(s)
+            updateApprovalAffordance(s)
         }
     }
 
@@ -73,7 +82,10 @@ class MainActivity : AppCompatActivity() {
 
         setupTabs()
         applyWindowInsets(binding.root)
-        binding.btnRefreshStatus.setOnClickListener { refreshStatus() }
+        binding.btnRefreshStatus.setOnClickListener {
+            // 等待网关授权时这个按钮的含义变成“怎么做才能授权”,把步骤直接摆给用户看
+            if (awaitingApproval) showApprovalDialog(binding.statusText.text.toString()) else refreshStatus()
+        }
         refreshStatus()
     }
 
@@ -121,6 +133,45 @@ class MainActivity : AppCompatActivity() {
         1 -> OverviewFragment()
         2 -> DevicesFragment()
         else -> SettingsFragment()
+    }
+
+    /**
+     * 「等待网关授权」时把提示做到位：按钮改成「去授权」并主动弹一次弹窗。
+     *
+     * 真机反馈：等待授权时只有一行灰字，用户不知道该做什么、也不知道要等哪台设备。
+     * 这里在状态变化时弹一次对话框（同一文案只弹一次），说明去哪里批准、批准哪台。
+     */
+    private fun updateApprovalAffordance(status: String) {
+        if (!status.startsWith(AWAITING_PAIRING_PREFIX)) {
+            awaitingApproval = false
+            lastApprovalDetail = null
+            binding.btnRefreshStatus.text = "刷新"
+            return
+        }
+        awaitingApproval = true
+        binding.btnRefreshStatus.text = "去授权"
+        if (status == lastApprovalDetail) return
+        lastApprovalDetail = status
+        showApprovalDialog(status)
+    }
+
+    /** 等待网关授权时的可操作弹窗：去哪批准、批准哪台、批准后会自己继续。 */
+    private fun showApprovalDialog(status: String) {
+        if (isFinishing || isDestroyed) return
+        val message = buildString {
+            appendLine(status)
+            appendLine()
+            appendLine("怎么批准（二选一）：")
+            appendLine("1) 浏览器打开网关 Web 控制台 → Devices / 设备 → 找到上面这串 deviceId → 批准；")
+            appendLine("2) 在网关主机执行：openclaw devices list 找到待批设备，再 openclaw devices approve <deviceId>。")
+            appendLine()
+            append("批准后 App 会自动继续（每 5 秒重试，最多等 180 秒）；超时的话再点「去授权」或重新保存一次网关设置。")
+        }
+        AlertDialog.Builder(this)
+            .setTitle("等待网关授权")
+            .setMessage(message)
+            .setPositiveButton("知道了", null)
+            .show()
     }
 
     /**

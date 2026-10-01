@@ -119,7 +119,7 @@ class DevicesFragment : Fragment() {
         return when (linkState) {
             VoiceBridgeService.LINK_SCANNING -> "正在扫描设备…"
             VoiceBridgeService.LINK_CONNECTING -> "正在连接设备…"
-            VoiceBridgeService.LINK_CONNECTED -> "已连接,等待加密"
+            VoiceBridgeService.LINK_CONNECTED -> "已连上,等待配对…"
             VoiceBridgeService.LINK_ENCRYPTED -> "已加密"
             VoiceBridgeService.LINK_READY -> "已就绪,长按设备 OK 说话"
             VoiceBridgeService.LINK_DISCONNECTED -> "未连接"
@@ -136,18 +136,29 @@ class DevicesFragment : Fragment() {
         deviceAddr: String?,
         linkState: String?,
     ): List<DeviceAdapter.DeviceItem> {
-        if (!isLinkUp(linkState) || deviceAddr.isNullOrBlank()) return emptyList()
+        if (!isLinkPresent(linkState) || deviceAddr.isNullOrBlank()) return emptyList()
         return listOf(
             DeviceAdapter.DeviceItem(
                 name = deviceName?.takeIf { it.isNotBlank() } ?: "AI Passport 设备",
                 address = deviceAddr,
-                state = linkState ?: "已连接",
+                // 必须用映射后的中文状态:真机反馈过「没配对却在列表里显示已连接」——
+                // 这里以前直接用了原始 linkState(值为「已连接」)，把"连上但未加密"写成了已连接。
+                state = when (linkState) {
+                    VoiceBridgeService.LINK_CONNECTED -> "未配对：等待配对完成"
+                    VoiceBridgeService.LINK_ENCRYPTED -> "已配对（已加密）"
+                    VoiceBridgeService.LINK_READY -> "已连接（已就绪）"
+                    else -> "未连接"
+                },
             )
         )
     }
 
-    /** 链路是否已建立(已连接/已加密/已就绪 才算;扫描与未连接都不算)。 */
-    private fun isLinkUp(linkState: String?): Boolean = linkState == VoiceBridgeService.LINK_CONNECTED ||
+    /** 卡片是否显示:连上(含尚未配对)、已配对、已就绪都显示，便于用户看到"正在配对"。 */
+    private fun isLinkPresent(linkState: String?): Boolean = linkState == VoiceBridgeService.LINK_CONNECTED ||
         linkState == VoiceBridgeService.LINK_ENCRYPTED ||
+        linkState == VoiceBridgeService.LINK_READY
+
+    /** 「已连接」的语义收紧:必须完成配对(加密)才算连上，没加密的只能叫未配对。 */
+    private fun isLinkUp(linkState: String?): Boolean = linkState == VoiceBridgeService.LINK_ENCRYPTED ||
         linkState == VoiceBridgeService.LINK_READY
 }
