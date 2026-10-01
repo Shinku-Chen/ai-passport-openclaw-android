@@ -48,4 +48,30 @@ class BridgeStatusTextTest {
         assertEquals("未配置", BridgeStatusText.gatewayName(null))
         assertEquals("未配置", BridgeStatusText.gatewayName("something-else"))
     }
+
+    @Test
+    fun summary_and_detail_stay_unchanged_without_warning() {
+        // 默认（前台服务正常）时不能多出任何东西：警告只在真的被系统拒绝时出现
+        assertEquals(
+            "设备：已就绪 ｜ 网关：就绪 ｜ 语音：已就绪",
+            BridgeStatusText.summary("已就绪", "就绪", "已就绪"),
+        )
+        assertEquals(
+            "设备：已就绪\n网关：就绪\n语音：已就绪",
+            BridgeStatusText.detail("已就绪", "就绪", "已就绪"),
+        )
+    }
+
+    @Test
+    fun warning_is_visible_in_both_collapsed_and_expanded_text() {
+        val warning = ServiceGuard.warningText(ServiceGuard.ForegroundState.DENIED)
+        val s = BridgeStatusText.summary("已就绪", "就绪", "已就绪", warning)
+        val d = BridgeStatusText.detail("已就绪", "就绪", "已就绪", warning)
+        // 折叠时也要能看见（否则三行全是“正常”，而实际上锁屏一分钟就会被系统停掉）
+        assertTrue("折叠摘要必须带警告标记", s.contains(ServiceGuard.WARNING_SUMMARY))
+        assertTrue("摘要仍不能换行", !s.contains("\n"))
+        assertTrue("展开正文要保留原来的三行", d.contains("设备：已就绪\n网关：就绪\n语音：已就绪"))
+        assertTrue("展开正文要带完整警告", d.contains(warning!!))
+        assertEquals("三行 + 一行警告", 4, d.split("\n").size)
+    }
 }

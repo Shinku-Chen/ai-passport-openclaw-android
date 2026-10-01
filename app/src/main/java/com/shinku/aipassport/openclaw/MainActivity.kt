@@ -304,6 +304,11 @@ class MainActivity : AppCompatActivity() {
             @Suppress("DEPRECATION")
             registerReceiver(statusReceiver, filter)
         }
+        // 回到前台时补一次前台服务。
+        // 系统会在后台启动路径上**静默拒绝** startForeground（App 收不到异常，只写一条系统日志），
+        // 服务于是降级成普通后台服务、App 闲置 60s 后被停掉；而"用户回到前台"这一刻是被允许的，
+        // 所以这是 App 唯一能自救的时机（见 ServiceGuard / VoiceBridgeService.startForegroundCompat）。
+        VoiceBridgeService.syncForeground(this)
     }
 
     override fun onPause() {

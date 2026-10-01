@@ -110,7 +110,29 @@ class VoiceBridgeService : Service() {
 
         /** 通知被用户划掉：只标记，不自动挂回（下次状态变化才会重新出现）。 */
         const val ACTION_NOTIFICATION_DISMISSED = "com.shinku.aipassport.openclaw.action.NOTIFICATION_DISMISSED"
-        const val EXTRA_STATUS = "status"
+
+        /**
+         * 回到前台时补一次前台服务（无其他副作用）。
+         *
+         * 修的是这个真机 bug：后台启动路径上 `startForeground()` 会被系统**静默拒绝**
+         * （只写一条 `not allowed due to bg restriction` 系统日志，App 收不到异常），
+         * 服务因此降级成普通后台服务、App 闲置 60s 后被停掉；而**用户回到前台**那一刻是被允许的，
+         * 所以用户在 App 里时补这一次就能自救（详见 [ServiceGuard]）。
+         */
+        const val ACTION_SYNC_FOREGROUND =
+            "com.shinku.aipassport.openclaw.action.SYNC_FOREGROUND"
+
+        /** 语音桥服务是否正在运行（进程内静态标记：进程被杀时自然为 false，看门狗据此判定）。 */
+        @Volatile
+        var isRunning = false
+            private set
+
+        /** 最近一次前台服务校验的结论（见 [verifyForegroundState]）；服务没跑过时是 UNKNOWN。 */
+        @Volatile
+        var lastForegroundState = ServiceGuard.ForegroundState.UNKNOWN
+            private set
+
+        val EXTRA_STATUS = "status"
 
         /** 当前(或最近一次)连接设备的名称(广播名,如 Passport-1234);断开后保留。 */
         const val EXTRA_DEVICE_NAME = "device_name"
@@ -131,11 +153,31 @@ class VoiceBridgeService : Service() {
         private const val GATEWAY_STATE_MIN_INTERVAL_MS = 3_000L
 
         fun start(context: Context) {
+            // 用户（或开机广播 / 看门狗）希望它运行：先记意愿，看门狗后续才有"该不该拉回来"的依据
+            KeepAliveState(context).bridgeWanted = true
             context.startForegroundService(Intent(context, VoiceBridgeService::class.java).setAction(ACTION_START))
         }
 
         fun stop(context: Context) {
+            // 用户显式停止：清掉意愿，否则看门狗下一轮巡检会把它拉回来
+            KeepAliveState(context).bridgeWanted = false
             context.stopService(Intent(context, VoiceBridgeService::class.java))
+        }
+
+        /**
+         * 服务在跑时补一次前台服务（回到前台时的自救通道）。
+         *
+         * 服务不在跑时不揽：那种情况应该走 [start]（前台服务启动），否则会被当成普通后台 start 而起不来。
+         */
+        fun syncForeground(context: Context) {
+            if (!isRunning) return
+            try {
+                context.startService(
+                    Intent(context, VoiceBridgeService::class.java).setAction(ACTION_SYNC_FOREGROUND),
+                )
+            } catch (e: Exception) {
+                Log.w(TAG, "补前台服务失败:${e.message}")
+            }
         }
 
         /**
@@ -197,14 +239,28 @@ class VoiceBridgeService : Service() {
 
     override fun onCreate() {
         super.onCreate()
+        isRunning = true
         createChannel()
         acquireKeepAliveLocks()
+        // 建好通知渠道后立即抢一次前台服务，并把"到底抢到没"查清楚（系统可能静默拒绝）
+        startForegroundCompat("onCreate")
+        // 看门狗是服务不在时的唯一自救路径：起步就排上；之后由看门狗自己续。
+        ServiceWatchdogReceiver.schedule(this)
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        // 每收到一次启动命令都重新确认前台服务。
+        // 系统可能在之前的后台启动路径上**静默拒绝**过 startForeground（不抛异常），
+        // 而"用户又打开了 App"（切到前台）正是唯一会被放行的时机 —— 这就是自救窗口。
+        // ACTION_STOP 除外：用户要停服务，不必再补前台状态。
+        if (intent?.action != ACTION_STOP) startForegroundCompat("onStartCommand")
         // 前台服务被系统杀死后 START_STICKY 重启(intent 为 null)也要拉起桥
         when (intent?.action) {
-            ACTION_STOP -> stopSelf()
+            ACTION_STOP -> {
+                // 用户显式停止：清掉"想运行"的意愿，否则看门狗会把服务拉回来
+                KeepAliveState(this).bridgeWanted = false
+                stopSelf()
+            }
             // 通知被用户划掉:什么都不做(不再自动挂回)。下次状态变化时 notify() 会重新出现。
             ACTION_NOTIFICATION_DISMISSED -> Log.i(TAG, "常驻通知被划掉(状态变化时才会重新出现)")
             ACTION_SCAN -> {
@@ -239,6 +295,8 @@ class VoiceBridgeService : Service() {
             // 设置页保存成功:重建适配器并重连(不重启服务、不断 BLE)。
             // 只改 host/端口/token 时原来不会重启服务,运行中的适配器仍在用旧配置。
             ACTION_RELOAD_SETTINGS -> if (!initialized) startBridge() else reloadGatewaySettings()
+            // 回到前台时的补前台请求:上面已经补过并校过(这里只记一行日志,不做其他副作用)
+            ACTION_SYNC_FOREGROUND -> Log.i(TAG, "回到前台:已重新确认前台服务")
             else -> startBridge()
         }
         return START_STICKY
@@ -255,6 +313,7 @@ class VoiceBridgeService : Service() {
         releaseKeepAliveLocks()
         releaseTtsEngine()
         initialized = false
+        isRunning = false
         OpenClawGatewayRegistry.removeListener(gatewayStatusListener)
         stopForegroundCompat()
         super.onDestroy()
@@ -265,7 +324,9 @@ class VoiceBridgeService : Service() {
     private fun startBridge() {
         if (initialized) return
         initialized = true
-        startForegroundCompat()
+        // 服务真的要把桥跑起来了 = 用户（或开机广播 / 看门狗）希望它运行：
+        // 看门狗与设置页都靠这个标记判断"该不该维持/拉回来"。
+        KeepAliveState(this).bridgeWanted = true
 
         // 共享对话历史:硬件语音也要写入同一列表,供对话 Tab 实时展示
         ConversationStore.init(this)
@@ -1240,12 +1301,18 @@ class VoiceBridgeService : Service() {
             linkReady = deviceLinkState == LINK_READY || deviceLinkState == LINK_ENCRYPTED,
             warmReady = if (::pipeline.isInitialized) pipeline.recognizerWarm() else false,
         )
+        // 前台服务被系统静默拒绝时，把警告直接放进常驻通知：
+        // 否则用户只会看到「设备/网关/语音」都很正常，而实际上锁屏 1 分钟后就会被系统停掉。
+        val warning = ServiceGuard.warningText(
+            if (foregroundDeniedNow) ServiceGuard.ForegroundState.DENIED
+            else ServiceGuard.ForegroundState.GRANTED,
+        )
         return NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle("AI Passport 语音桥")
-            .setContentText(BridgeStatusText.summary(device, gateway, voice))
+            .setContentText(BridgeStatusText.summary(device, gateway, voice, warning))
             .setStyle(
                 NotificationCompat.BigTextStyle()
-                    .bigText(BridgeStatusText.detail(device, gateway, voice))
+                    .bigText(BridgeStatusText.detail(device, gateway, voice, warning))
             )
             .setSmallIcon(R.drawable.ic_stat_voice)
             .setContentIntent(pi)
@@ -1271,7 +1338,7 @@ class VoiceBridgeService : Service() {
         else -> "未知"
     }
 
-    private fun startForegroundCompat() {
+    private fun startForegroundCompat(reason: String) {
         try {
             if (Build.VERSION.SDK_INT >= 29) {
                 ServiceCompat.startForeground(
@@ -1285,10 +1352,58 @@ class VoiceBridgeService : Service() {
             Log.e(TAG, "前台通知启动失败(不影响主流程)", e)
             try { startForeground(NOTIF_ID, notification("启动中…")) } catch (_: Exception) {}
         }
+        // 必须校验：系统（真机实测 MIUI/HyperOS）会在后台启动路径上**静默拒绝**这次请求，
+        // 连异常都不抛 —— 不查的话 App 会以为自己是前台服务（结果闲置 60s 被系统停掉）。
+        verifyForegroundState(reason)
+    }
+
+    /**
+     * 校验前台服务是否真的生效（系统可能在后台启动路径上静默拒绝：只写系统日志、不抛异常）。
+     *
+     * 判据：自己那条常驻通知有没有被系统打上前台服务标记（见 [ServiceGuard.classify]）。
+     * 结果同时落三处：日志、[KeepAliveState]（设置页要读）、常驻通知（多一行警告）。
+     */
+    private fun verifyForegroundState(reason: String) {
+        val state = try {
+            val active = getSystemService(NotificationManager::class.java)
+                ?.activeNotifications
+                ?.firstOrNull { it.id == NOTIF_ID }
+            ServiceGuard.classify(
+                notificationFound = active != null,
+                notificationFlags = active?.notification?.flags ?: 0,
+            )
+        } catch (e: Exception) {
+            Log.w(TAG, "前台服务状态校验失败:${e.message}")
+            ServiceGuard.ForegroundState.UNKNOWN
+        }
+        lastForegroundState = state
+        val denied = state == ServiceGuard.ForegroundState.DENIED
+        foregroundDeniedNow = denied
+        KeepAliveState(this).apply {
+            foregroundDenied = denied
+            foregroundCheckedAtMs = System.currentTimeMillis()
+        }
+        when (state) {
+            ServiceGuard.ForegroundState.GRANTED ->
+                Log.i(TAG, "前台服务已确认($reason)：isForeground=true")
+            ServiceGuard.ForegroundState.DENIED -> Log.e(
+                TAG,
+                "前台服务被系统静默拒绝($reason)：服务已降级为普通后台服务，" +
+                    "App 闲置满 60s 后会被系统停掉；请在系统设置里允许本应用 自启动 / 后台无限制",
+            )
+            ServiceGuard.ForegroundState.UNKNOWN ->
+                Log.i(TAG, "前台服务状态暂时无法判定($reason)：通知可能被划掉或尚未贴出")
+        }
+        // 通知文案里带不带警告会变 → 刷新一次（内容没变时 updateNotification 自己会跳过）
+        updateNotification(lastStatusText ?: "未连接")
     }
 
     /** 上一次挂出的通知正文：内容不变时不再 notify（不会把被划掉的通知重新唤醒）。 */
     private var lastNotificationText: String? = null
+
+    /** 前台服务当前是否被系统静默拒绝（[verifyForegroundState] 维护；只用于通知里加警告）。 */
+    @Volatile
+    private var foregroundDeniedNow = false
 
     /**
      * 更新常驻通知。

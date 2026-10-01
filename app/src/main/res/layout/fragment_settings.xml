@@ -522,6 +522,26 @@
             android:textColor="#9E9E9E"
             android:textSize="12sp" />
 
+        <!-- 后台运行许可：系统（尤其 MIUI/HyperOS）可能**静默拒绝** startForeground
+             （App 收不到异常，只写一条系统日志），服务降级成普通后台服务后闲置 60s 会被停掉。
+             这里把状态摆出来 + 一键去系统设置，免得用户以为"服务在跑"。 -->
+        <TextView
+            android:id="@+id/textForegroundWarning"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="10dp"
+            android:textColor="#FFB74D"
+            android:textSize="13sp"
+            android:visibility="gone" />
+
+        <Button
+            android:id="@+id/btnFixBackground"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="6dp"
+            android:text="打开系统应用设置（开自启动 / 后台无限制）"
+            android:visibility="gone" />
+
         <!-- 设备朗读(下行 TTS)的设置项当前【不提供】:项目暂不考虑文字转语音。
              代码与协议能力(0x06 下行帧 + 固件播放通路)保留为休眠能力,
              `tts_enabled` 默认 false,需要时可把开关加回来。 -->

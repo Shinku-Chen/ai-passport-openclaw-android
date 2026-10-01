@@ -15,15 +15,24 @@ object BridgeStatusText {
 
     /**
      * 折叠时的一行摘要（通知默认只显示一行，尽量短）。
+     *
+     * @param warning 非空时前缀一个警告（见 [ServiceGuard.warningText]），让「锁屏后会被系统停掉」这件事
+     *   在折叠状态也能被看见（否则用户只会看到「一切正常」的三行文案）
      */
-    fun summary(device: String, gateway: String, voice: String): String =
-        "设备：$device ｜ 网关：$gateway ｜ 语音：$voice"
+    fun summary(device: String, gateway: String, voice: String, warning: String? = null): String {
+        val body = "设备：$device ｜ 网关：$gateway ｜ 语音：$voice"
+        return if (warning.isNullOrBlank()) body else "${ServiceGuard.WARNING_SUMMARY} ｜ $body"
+    }
 
     /**
      * 展开时的三行正文（供 `BigTextStyle` 使用）。
+     *
+     * @param warning 非空时追加一行完整警告（见 [ServiceGuard.warningText]）
      */
-    fun detail(device: String, gateway: String, voice: String): String =
-        "设备：$device\n网关：$gateway\n语音：$voice"
+    fun detail(device: String, gateway: String, voice: String, warning: String? = null): String {
+        val body = "设备：$device\n网关：$gateway\n语音：$voice"
+        return if (warning.isNullOrBlank()) body else "$body\n⚠️ $warning"
+    }
 
     /**
      * 语音（识别通道）状态。

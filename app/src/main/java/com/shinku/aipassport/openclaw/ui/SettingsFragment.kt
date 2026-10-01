@@ -1,6 +1,9 @@
 package com.shinku.aipassport.openclaw.ui
 
+import android.content.Intent
+import android.net.Uri
 import android.os.Bundle
+import android.provider.Settings
 import android.view.LayoutInflater
 import android.view.View
 import android.view.ViewGroup
@@ -21,6 +24,7 @@ import com.shinku.aipassport.openclaw.gateway.GatewaySaveGuard
 import com.shinku.aipassport.openclaw.gateway.GatewaySaveGuard.SaveValidation
 import com.shinku.aipassport.openclaw.gateway.GatewaySettings
 import com.shinku.aipassport.openclaw.gateway.OpenClawConfig
+import com.shinku.aipassport.openclaw.service.KeepAliveState
 import com.shinku.aipassport.openclaw.service.VoiceBridgeService
 import com.shinku.aipassport.openclaw.stt.XiaozhiSettings
 import kotlinx.coroutines.CancellationException
@@ -259,6 +263,39 @@ class SettingsFragment : Fragment() {
 
         // 小智 URL/token 写死,不在 UI 展示;只显示当前识别引擎状态
         binding.xzStatus.text = "识别引擎:小智云端(已启用)"
+
+        refreshKeepAliveWarning()
+    }
+
+    /**
+     * 后台运行许可提示：前台服务被系统**静默拒绝**时把它摆到设置页上。
+     *
+     * 为什么要在设置页说：那种拒绝**不抛异常**（只写一条 `not allowed due to bg restriction` 系统日志），
+     * App 除了自查通知标记外没有任何感知，界面看上去一切正常 ✗ ——
+     * 而实际后果很重：服务降级成普通后台服务，App 闲置满 60s 被系统停掉，设备直接用不了
+     * （真机实测 60.379s 精确复现，见 ServiceGuard）。
+     */
+    private fun refreshKeepAliveWarning() {
+        val keepAlive = KeepAliveState(requireContext())
+        val denied = keepAlive.foregroundDenied
+        binding.textForegroundWarning.visibility = if (denied) View.VISIBLE else View.GONE
+        binding.btnFixBackground.visibility = if (denied) View.VISIBLE else View.GONE
+        if (!denied) return
+        binding.textForegroundWarning.text =
+            "⚠️ 系统拒绝了本应用的前台服务(App 收不到异常)：锁屏/息屏约 1 分钟后服务会被系统停掉。" +
+                "请把本应用设为「自启动」并允许「后台无限制 / 无限制省电」。"
+        binding.btnFixBackground.setOnClickListener {
+            try {
+                startActivity(
+                    Intent(
+                        Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                        Uri.parse("package:${requireContext().packageName}"),
+                    )
+                )
+            } catch (e: Exception) {
+                Toast.makeText(requireContext(), "打不开系统应用设置:${e.message}", Toast.LENGTH_LONG).show()
+            }
+        }
     }
 
     /**

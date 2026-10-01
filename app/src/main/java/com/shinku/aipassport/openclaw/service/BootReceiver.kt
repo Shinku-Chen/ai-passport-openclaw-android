@@ -16,6 +16,9 @@ import com.shinku.aipassport.openclaw.gateway.GatewaySettings
  *    那是 OEM 侧白名单，App 无法代替（设置页里已给出提示）。
  *
  * 另外兼容 `QUICKBOOT_POWERON`（部分机型/HTC 系的重启广播名）。
+ *
+ * 开机时也顺手把**看门狗**排上：重启会清掉所有闹钟，而开机后的服务启动同样可能被系统
+ * 静默拒绝前台服务（见 [ServiceGuard]）—— 没有看门狗就再也没人会来拉它了。
  */
 class BootReceiver : BroadcastReceiver() {
 
@@ -32,6 +35,12 @@ class BootReceiver : BroadcastReceiver() {
             VoiceBridgeService.start(context)
         } catch (e: Exception) {
             Log.w(TAG, "开机自启启动服务失败：${e.message}")
+        }
+        // 无论服务是否被系统放行，看门狗都要排上（开机清空了所有闹钟）
+        try {
+            ServiceWatchdogReceiver.schedule(context)
+        } catch (e: Exception) {
+            Log.w(TAG, "开机自启：看门狗排程失败：${e.message}")
         }
     }
 

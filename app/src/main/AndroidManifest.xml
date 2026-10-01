@@ -48,6 +48,13 @@
             android:exported="false"
             android:foregroundServiceType="connectedDevice" />
 
+        <!-- 看门狗：定时确认语音桥还在跑，被系统停掉后拉回来（见 ServiceGuard / ServiceWatchdogReceiver）。
+             只由 App 自己的闹钟 PendingIntent（显式 Intent）触发，因此 exported=false。 -->
+        <receiver
+            android:name=".service.ServiceWatchdogReceiver"
+            android:enabled="true"
+            android:exported="false" />
+
         <!-- 开机自启：收到开机广播后按用户设置拉起前台服务。
              exported 必须为 true 才能收到系统广播；小米/HyperOS 还需用户在系统里开本应用的「自启动」。 -->
         <receiver

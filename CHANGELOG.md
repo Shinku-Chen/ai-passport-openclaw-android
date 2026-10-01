@@ -2,6 +2,31 @@
 
 ## Unreleased
 
+- 新增：**前台服务防降级 + 看门狗**（真机实测：系统会**静默拒绝** `startForeground`）。
+  - 问题：从非用户主动路径启动（刚装完 APK / 被强停之后 / 开机广播）时，系统拒绝前台服务：
+    `Service.startForeground() not allowed due to bg restriction`（`allowStartForeground=DENIED`、
+    `isForeground=false`），而且**不抛异常**（App 完全不知情，`catch` 永远不触发）→ 服务实际只是普通
+    后台服务，App 闲置满 **60.379s** 被系统停掉（`Stopping service due to app idle`，两次精确复现）
+    → BLE / 网关 / 识别通道全断，设备用不了，直到用户再打开一次 App。
+    用户自己**点图标**启动时一切正常（`isForeground=true`、`types=00000010`（connectedDevice））。
+  - 判定：用 `NotificationManager.getActiveNotifications()` 反查自己那条常驻通知 —— 系统只在**前台服务真的
+    生效**时才给它补 `FLAG_FOREGROUND_SERVICE`（实测被拒 `flags=0x2`、正常 `flags=0x62`）。
+    三态：`GRANTED` / `DENIED` / `UNKNOWN`（通知被用户划掉算 `UNKNOWN`，**不**当被拒误报）。纯逻辑
+    `service/ServiceGuard.kt` + 单测 `ServiceGuardTest`（10 个用例）。
+  - 补救一（回到前台重试）：`startForegroundCompat(reason)` 现在在 `onCreate`、**每次 `onStartCommand`**
+    与 `MainActivity.onResume`（`ACTION_SYNC_FOREGROUND`）各执行一次并立即校验（`verifyForegroundState`）。
+    顺手修掉一个使自救失效的细节：原来它只在 `startBridge()` 里调一次，而 `startBridge()` 二次进入会
+    `if (initialized) return` → 服务已在跑（被降级）时，用户再打开 App 也不会重试。
+  - 补救二（看门狗）：新增 `ServiceWatchdogReceiver`，每 5 分钟（`ServiceGuard.WATCHDOG_INTERVAL_MS`）
+    用 `AlarmManager.setAndAllowWhileIdle` 巡检（**无需特殊权限**，Doze 下系统会顺延）：
+    服务不在了 → 拉起；服务在跑但被拒 → 原地重试（重启也会被再拒一次，没必要）；
+    用户显式停止过（`KeepAliveState.bridgeWanted=false`，落盘）→ 不动手。
+    一次性闹钟每次自己续排；`BootReceiver` 也排一次（重启会清空闹钟）。
+  - 让用户看得见（“静默”是这个 bug 最坏的地方）：常驻通知被拒时折叠行前缀 `⚠️ 后台受限`、
+    展开追加一行完整警告；设置页显示橙色警告 + 「打开系统应用设置（开自启动 / 后台无限制）」；
+    日志里明确写出“服务已降级为普通后台服务，闲置满 60s 会被停”。
+  - 新增文档 [docs/background-keepalive.md](docs/background-keepalive.md)（实测证据、判定表、验证步骤）。
+
 - 修 bug：**长时间锁屏后台运行后，设备语音转写失败（只能回「无语音」）**。
   - 根因：小智服务端在连接**闲置约 60s** 后**静默废弃**这条连接上的识别会话——WebSocket 传输层还活着
     （OkHttp 的 ping/pong 仍通、服务端不报 `error`、也不立刻断链），但 `listen.start` 与音频**没有响应**。
