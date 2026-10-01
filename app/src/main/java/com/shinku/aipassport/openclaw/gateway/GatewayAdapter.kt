@@ -87,6 +87,15 @@ interface GatewayAdapter {
     val lastError: String?
 
     /**
+     * 清掉上一次的错误(重载/重连**开始**时调用)。
+     *
+     * 目的:状态文案只允许拼接【本次尝试】的原因,绝不能把上一次的旧原因(例如概览页问了一个
+     * 这台网关不认识的方法)带进「网关配置已重载,正在重连… — …」里 —— 那看起来就是「网关不可达」。
+     * 默认空实现:把错误缓存在字段里的通道需重写(见各实现)。
+     */
+    fun clearLastError() {}
+
+    /**
      * 是否支持「用 `chat.history` 补正正文」(即 [chatMulti] 的 [onBodyCorrection] 会不会回调)。
      *
      * `VoicePipeline` 用它决定「命中状态话术的 body 要不要先缓发」:

@@ -185,9 +185,31 @@ class OpenClawGateway(
      *  用 agent:main:main —— 网关仅识别 main agent(health 显示 defaultAgentId=main,无 passport agent)。 */
     private val AgentSessionKey = "agent:main:main"
 
-    private val pendingReqs = ConcurrentHashMap<String, CompletableDeferred<JsonObject?>>()
+    /**
+     * 在途请求:除等待结果的 deferred 外,还记下这条请求是不是【关键操作】。
+     *
+     * 关键(`connect` 握手 / `chat.send` / 重连本身)失败才允许写 [lastRpcError] 并影响网关状态;
+     * 辅助查询(概览/用量/技能/会话列表/定时任务…)失败只经 [RpcResult] 返回给调用方。
+     * 不区分两者时的真机 bug:概览页问一个这台网关不认识的方法(如 `usage`),错误被写进
+     * `lastRpcError`,随后被「网关配置已重载,正在重连…」拼出来 —— 看起来就是「网关不可达」,
+     * 其实连接一直正常(而且 `onSocketDown` 只在 `lastRpcError == null` 时才写断开原因,
+     * 于是**真正的**断开原因反而被这条旧文案挡掉)。
+     */
+    private class PendingRequest(val critical: Boolean) {
+        val deferred = CompletableDeferred<JsonObject?>()
 
-    /** 最近一次 RPC 错误信息(供控制台分区显示"不可用/需权限"原因)。 */
+        /** 本次请求自己的错误文案(与 [lastRpcError] 解耦:辅助查询也能拿到原因)。 */
+        @Volatile
+        var error: String? = null
+    }
+
+    private val pendingReqs = ConcurrentHashMap<String, PendingRequest>()
+
+    /**
+     * 最近一次【关键操作】的错误信息(供状态卡/设置页/重连监控显示)。
+     *
+     * 辅助查询(概览/用量/技能/会话/定时任务…)永远不会写它:它们的失败只经 [RpcResult] 返回。
+     */
     @Volatile
     private var lastRpcError: String? = null
 
@@ -429,7 +451,8 @@ class OpenClawGateway(
         onRawUpdate: ((List<RawEntry>) -> Unit)?,
         onBodyCorrection: ((String) -> Unit)?,
     ) {
-        // rpcQuery 会把 lastRpcError 清空/写成历史查询的错误:补正是内部动作,必须恢复原值
+        // 补正是内部动作:即使将来把它标成关键查询,也**绝不允许**污染对外的 lastError
+        // (辅助查询本身已经不写 lastError 了,这里只是再加一道防线)
         val savedError = lastRpcError
         val result = try {
             // 与宽限窗共用时间:最多等这一窗,等不到就当没有历史(退回流式正文)
@@ -493,49 +516,81 @@ class OpenClawGateway(
     fun isPaired(): Boolean = identity.deviceToken.isNotBlank()
 
     // ---- 网关控制台 RPC 查询(实测可用/需权限的 method) ----
+    //
+    // 下面这一组全部是【辅助查询】([rpcQuery] 默认 critical = false):
+    // 失败只经 [RpcResult] 返回给调用方 —— **不写 [lastError]、不发状态文案、不影响网关状态**。
+    // 概览页据此把「该网关不支持<分区>查询」展示成友好文案并隐藏卡片(见 [queryUnavailable]/[QuerySupport]);
+    // 真正的关键操作只有 `connect` 握手与 `chat.send`(在 [sendConnect] / [sendChat] 里显式标 critical = true)。
 
     data class RpcResult(val ok: Boolean, val payload: String?, val error: String?)
 
     /**
-     * 通用 RPC 查询(connect 鉴权后调用):发 method,取 res.payload JSON 字符串。
-     * 失败(scope 不足/不支持/超时)返回 ok=false,error 带原因,不抛异常。
+     * 通用 RPC **辅助查询**(connect 鉴权后调用):发 method,取 res.payload JSON 字符串。
+     * 失败(scope 不足/网关不支持/超时)返回 ok=false,error 带原因,不抛异常。
+     *
+     * 关键性([critical],默认 false = 辅助):
+     *  - 辅助(默认):失败**只经 [RpcResult] 返回给调用方**，绝不写 [lastError]、绝不影响网关状态、
+     *    也不发状态文案。概览页的 agents/models/sessions/system.info/cron/channels/skills/usage、
+     *    以及正文补正用的 `chat.history` 全部走这条;
+     *  - 关键(true):清掉旧错误,失败时把本次原因写进 [lastError] 并影响状态。
+     *    `connect` 握手与 `chat.send` 不走这个方法(它们直用 [requestSync]),见 [shouldWriteGatewayError]。
      */
-    suspend fun rpcQuery(method: String, params: Map<String, Any?> = emptyMap()): RpcResult =
-        withContext(Dispatchers.IO) {
-            if (!ensureConnected()) {
-                return@withContext RpcResult(false, null, "网关未连接或鉴权失败")
-            }
-            val p = JsonObject()
-            params.forEach { (k, v) ->
-                when (v) {
-                    null -> p.add(k, com.google.gson.JsonNull.INSTANCE)
-                    is String -> p.addProperty(k, v)
-                    is Number -> p.addProperty(k, v)
-                    is Boolean -> p.addProperty(k, v)
-                    is List<*> -> p.add(k, gson.toJsonTree(v))
-                    else -> p.add(k, gson.toJsonTree(v))
-                }
-            }
-            lastRpcError = null
-            val reply = requestSync(method, p)
-            if (reply != null) {
-                RpcResult(true, reply.toString(), null)
-            } else {
-                RpcResult(false, null, lastRpcError ?: "网关未响应或超时")
+    suspend fun rpcQuery(
+        method: String,
+        params: Map<String, Any?> = emptyMap(),
+        critical: Boolean = false,
+    ): RpcResult = withContext(Dispatchers.IO) {
+        if (!ensureConnected()) {
+            return@withContext RpcResult(false, null, "网关未连接或鉴权失败")
+        }
+        val p = JsonObject()
+        params.forEach { (k, v) ->
+            when (v) {
+                null -> p.add(k, com.google.gson.JsonNull.INSTANCE)
+                is String -> p.addProperty(k, v)
+                is Number -> p.addProperty(k, v)
+                is Boolean -> p.addProperty(k, v)
+                is List<*> -> p.add(k, gson.toJsonTree(v))
+                else -> p.add(k, gson.toJsonTree(v))
             }
         }
+        // 关键查询失败才允许清/写 lastError(见 [shouldWriteGatewayError]);辅助查询不碰它。
+        if (critical) lastRpcError = null
+        val pending = request(method, p, critical)
+            ?: return@withContext RpcResult(false, null, "网关未响应或超时")
+        val payload = withTimeoutOrNull(GatewayConfig.TIMEOUT_SECONDS * 1000) {
+            pending.deferred.await()
+        }
+        if (payload != null) {
+            RpcResult(true, payload.toString(), null)
+        } else {
+            // 本次请求自己的原因(即使不写 lastError,调用方也拿得到)
+            val reason = pending.error ?: "网关未响应或超时"
+            if (critical && lastRpcError == null) lastRpcError = reason
+            RpcResult(false, null, reason)
+        }
+    }
+
+    /**
+     * 清掉上一次的关键错误(重载/重连**开始**时调用)。
+     *
+     * 目的:状态文案只允许拼接【本次尝试】的原因,绝不能把上一次的旧原因带进「正在重连…」里。
+     */
+    override fun clearLastError() {
+        lastRpcError = null
+    }
 
     /** Agent 列表(实测 agent.identity.get → payload.agents)。 */
-    suspend fun rpcAgents(): RpcResult = rpcQuery("agent.identity.get")
+    suspend fun rpcAgents(): RpcResult = rpcQuery(RPC_METHOD_AGENTS)
 
     /** 模型 + 命令(实测 health → payload.models / payload.commands)。 */
-    suspend fun rpcModels(): RpcResult = rpcQuery("health")
+    suspend fun rpcModels(): RpcResult = rpcQuery(RPC_METHOD_MODELS)
 
     /** 系统信息/概览(实测 system.info)。 */
-    suspend fun rpcOverview(): RpcResult = rpcQuery("system.info")
+    suspend fun rpcOverview(): RpcResult = rpcQuery(RPC_METHOD_OVERVIEW)
 
     /** 会话列表(实测 sessions.list)。 */
-    suspend fun rpcSessions(): RpcResult = rpcQuery("sessions.list")
+    suspend fun rpcSessions(): RpcResult = rpcQuery(RPC_METHOD_SESSIONS)
 
     /**
      * 本轮会话的历史(实测 `chat.history{sessionKey, limit}` → `{sessionKey, sessionId, messages:[…]}`)。
@@ -545,25 +600,25 @@ class OpenClawGateway(
         rpcQuery(RPC_CHAT_HISTORY, mapOf("sessionKey" to config.sessionKey, "limit" to limit))
 
     /** 定时任务(实测 cron.list → payload.worktrees;jobs 在 directory.list)。 */
-    suspend fun rpcCron(): RpcResult = rpcQuery("cron.list")
+    suspend fun rpcCron(): RpcResult = rpcQuery(RPC_METHOD_CRON)
 
     /** 目录/任务(实测 directory.list → payload.jobs)。 */
-    suspend fun rpcDirectory(): RpcResult = rpcQuery("directory.list")
+    suspend fun rpcDirectory(): RpcResult = rpcQuery(RPC_METHOD_DIRECTORY)
 
     /** 渠道列表(实测需 operator.admin,当前 token 可能无权限)。 */
-    suspend fun rpcChannels(): RpcResult = rpcQuery("channels.list")
+    suspend fun rpcChannels(): RpcResult = rpcQuery(RPC_METHOD_CHANNELS)
 
     /** 技能列表(实测需 operator.admin)。 */
-    suspend fun rpcSkills(): RpcResult = rpcQuery("skills")
+    suspend fun rpcSkills(): RpcResult = rpcQuery(RPC_METHOD_SKILLS)
 
     /** 用量(实测需 operator.admin)。 */
-    suspend fun rpcUsage(): RpcResult = rpcQuery("usage")
+    suspend fun rpcUsage(): RpcResult = rpcQuery(RPC_METHOD_USAGE)
 
     /** 节点列表(实测需 operator.admin)。 */
-    suspend fun rpcNodes(): RpcResult = rpcQuery("nodes.list")
+    suspend fun rpcNodes(): RpcResult = rpcQuery(RPC_METHOD_NODES)
 
     /** 设备列表(实测需 operator.admin)。 */
-    suspend fun rpcDevices(): RpcResult = rpcQuery("devices.list")
+    suspend fun rpcDevices(): RpcResult = rpcQuery(RPC_METHOD_DEVICES)
 
     /**
      * 释放一次引用。
@@ -590,7 +645,7 @@ class OpenClawGateway(
     private fun doClose() {
         scope.cancel()
         try { ws?.close(1000, "shutdown") } catch (_: Exception) {}
-        pendingReqs.values.forEach { it.complete(null) }
+        pendingReqs.values.forEach { it.deferred.complete(null) }
         pendingReqs.clear()
         // 服务/配置变更时真正断开:在途收集算被取消,不当作「空回复」
         activeCollector?.cancel()
@@ -708,7 +763,7 @@ class OpenClawGateway(
                 if (lastRpcError == null) lastRpcError = readable
             }
         }
-        pendingReqs.values.forEach { it.complete(null) }
+        pendingReqs.values.forEach { it.deferred.complete(null) }
         pendingReqs.clear()
         activeCollector?.takeIf { !it.isTerminal }?.let { collector ->
             collector.onConnectionInterrupted(reason ?: "连接已断开")
@@ -835,7 +890,7 @@ class OpenClawGateway(
                 }
                 "res" -> {
                     val id = obj.get("id")?.asString ?: return
-                    val deferred = pendingReqs.remove(id) ?: return
+                    val pending = pendingReqs.remove(id) ?: return
                     if (obj.get("ok")?.asBoolean == true) {
                         val payload = obj.getAsJsonObject("payload")
                         // connect 成功后持久化 deviceToken
@@ -844,24 +899,41 @@ class OpenClawGateway(
                                 ?.takeIf { it.isNotBlank() }
                                 ?.let { identity.deviceToken = it }
                         }
-                        deferred.complete(payload)
+                        pending.deferred.complete(payload)
                     } else {
                         val err = obj.getAsJsonObject("error")
                         val code = err?.get("code")?.asString
                         val message = err?.get("message")?.asString
-                        Log.e(tag, "RPC 错误 [$code]: $message")
-                        // 错误 → 状态是纯函数(见 OpenClawErrors.kt),这里只负责落地:
-                        // 等待授权的原文(detail)进 lastError 并播报,状态词仍是 connecting。
-                        val status = mapRpcError(code, message, shortDeviceId(identity.deviceId))
-                        if (status.awaitingPairing) {
-                            markAwaitingPairing(status.detail)
-                        } else {
-                            lastRpcError = message?.takeIf { it.isNotBlank() } ?: code
-                            if (isMissingScope(message)) {
-                                onStatus(status.detail)
+                        // 本次请求自己的原因:辅助查询也能拿到(即使不写 lastError)
+                        pending.error = message?.takeIf { it.isNotBlank() } ?: code
+                        when {
+                            // 辅助查询失败:只记日志。绝不写 lastError、绝不影响网关状态 ——
+                            // 概览页问「这台网关没有的方法」不该让 App 报「网关不可达」。
+                            // 日志里标出良性与否(能力/权限 vs 连接层),方便定位是不是真断线。
+                            !pending.critical -> {
+                                val kind = if (isBenignQueryError(code, message)) "能力/权限" else "连接层"
+                                Log.w(tag, "辅助查询失败($kind, 不影响网关状态) [$code]: $message")
+                            }
+                            // 关键操作命中良性错误(网关不认识这个方法):链路是好的,不写、不改状态
+                            !shouldWriteGatewayError(true, code, message) ->
+                                Log.w(tag, "关键操作命中良性错误,不改网关状态 [$code]: $message")
+
+                            else -> {
+                                Log.e(tag, "RPC 错误 [$code]: $message")
+                                // 错误 → 状态是纯函数(见 OpenClawErrors.kt),这里只负责落地:
+                                // 等待授权的原文(detail)进 lastError 并播报,状态词仍是 connecting。
+                                val status = mapRpcError(code, message, shortDeviceId(identity.deviceId))
+                                if (status.awaitingPairing) {
+                                    markAwaitingPairing(status.detail)
+                                } else {
+                                    lastRpcError = pending.error
+                                    if (isMissingScope(message)) {
+                                        onStatus(status.detail)
+                                    }
+                                }
                             }
                         }
-                        deferred.complete(null)
+                        pending.deferred.complete(null)
                     }
                 }
             }
@@ -911,9 +983,10 @@ class OpenClawGateway(
             addProperty("locale", "zh-CN")
             addProperty("userAgent", "passport-android/0.1.0")
         }
-        request("connect", params)?.let { deferred ->
+        // 关键操作:失败才允许写 lastError / 影响网关状态(见 [shouldWriteGatewayError])
+        request("connect", params, critical = true)?.let { pending ->
             scope.launch {
-                val ok = withTimeoutOrNull(10_000) { deferred.await() } != null
+                val ok = withTimeoutOrNull(10_000) { pending.deferred.await() } != null
                 connected = ok
                 if (ok) {
                     // 批准后第一次成功连接:清零等待授权并清掉授权文案 → 上层监控/探针播报「网关已恢复连接」
@@ -960,7 +1033,8 @@ class OpenClawGateway(
             addProperty("idempotencyKey", idempotencyKey)
             addProperty("agentId", "main")
         }
-        val reply = requestSync("chat.send", params)
+        // chat.send 是【关键操作】:失败必须写 lastError,不能与辅助查询混为一谈
+        val reply = requestSync("chat.send", params, critical = true)
         if (reply == null && lastRpcError == null) lastRpcError = "chat.send 无响应或超时"
         return reply?.get("runId")?.asString
     }
@@ -1158,11 +1232,15 @@ class OpenClawGateway(
 
     // ---- 底层请求 ----
 
-    private fun request(method: String, params: JsonObject): CompletableDeferred<JsonObject?>? {
+    /**
+     * 发一条请求。[critical] = 关键操作(失败才允许写 [lastRpcError]),默认 true:
+     * 直用本方法的调用方是 `connect` 握手与 `chat.send`(关键);辅助查询请走 [rpcQuery]。
+     */
+    private fun request(method: String, params: JsonObject, critical: Boolean = true): PendingRequest? {
         val socket = ws ?: return null
         val id = UUID.randomUUID().toString()
-        val deferred = CompletableDeferred<JsonObject?>()
-        pendingReqs[id] = deferred
+        val pending = PendingRequest(critical)
+        pendingReqs[id] = pending
         val frame = JsonObject().apply {
             addProperty("type", "req")
             addProperty("id", id)
@@ -1171,7 +1249,7 @@ class OpenClawGateway(
         }
         return try {
             socket.send(frame.toString())
-            deferred
+            pending
         } catch (e: Exception) {
             pendingReqs.remove(id)
             Log.e(tag, "发送 $method 失败", e)
@@ -1179,14 +1257,37 @@ class OpenClawGateway(
         }
     }
 
-    private suspend fun requestSync(method: String, params: JsonObject): JsonObject? {
-        val deferred = request(method, params) ?: return null
-        return withTimeoutOrNull(GatewayConfig.TIMEOUT_SECONDS * 1000) { deferred.await() }
+    private suspend fun requestSync(
+        method: String,
+        params: JsonObject,
+        critical: Boolean = true,
+    ): JsonObject? {
+        val pending = request(method, params, critical) ?: return null
+        return withTimeoutOrNull(GatewayConfig.TIMEOUT_SECONDS * 1000) { pending.deferred.await() }
     }
 
     companion object {
         /** 进度文案前缀:状态面板与设备屏据此识别「网关工作中」状态。 */
         const val PROGRESS_PREFIX = "网关工作中:"
+
+        /**
+         * 控制台**辅助查询**的 method 名。
+         *
+         * 放在这里的原因:概览页的「这台网关不支持这个方法」记忆按 method 索引,
+         * 与 [rpcAgents] / [rpcUsage] 这些包装函数必须用**同一份字面量** —— 否则两处一旦写不同,
+         * 就会出现「请求用新名字、记忆记旧名字」(或反之)这类难查的偏差。
+         */
+        const val RPC_METHOD_AGENTS = "agent.identity.get"
+        const val RPC_METHOD_MODELS = "health"
+        const val RPC_METHOD_OVERVIEW = "system.info"
+        const val RPC_METHOD_SESSIONS = "sessions.list"
+        const val RPC_METHOD_CRON = "cron.list"
+        const val RPC_METHOD_DIRECTORY = "directory.list"
+        const val RPC_METHOD_CHANNELS = "channels.list"
+        const val RPC_METHOD_SKILLS = "skills"
+        const val RPC_METHOD_USAGE = "usage"
+        const val RPC_METHOD_NODES = "nodes.list"
+        const val RPC_METHOD_DEVICES = "devices.list"
 
         /** 进度节流:两次上报至少间隔 2s(避免工具事件密集时刷屏)。 */
         private const val PROGRESS_MIN_INTERVAL_MS = 2_000L

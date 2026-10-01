@@ -68,6 +68,93 @@ fun isMissingScope(message: String?): Boolean =
     message?.contains("missing scope", ignoreCase = true) == true
 
 /**
+ * 网关回复是否是「这台网关不认识这个方法」(实测 `usage` / `usage.get` / `system.usage` / `stats*` /
+ * `metrics` / `cost` / `skills` 在部分 OpenClaw 上都是这个错误)。
+ *
+ * 语义:这是**能力缺失**,不是链路故障 —— 连接与鉴权都好好的,只是这个 RPC 不存在。
+ * 因此它绝不能把网关状态推到 `offline`,也绝不能写进 `lastError` 去污染「正在重连…」这类状态文案。
+ */
+fun isUnknownMethod(code: String?, message: String?): Boolean {
+    val c = code?.trim().orEmpty().lowercase()
+    val m = message?.trim().orEmpty().lowercase()
+    return m.contains("unknown method") ||
+        m.contains("method not found") ||
+        m.contains("no such method") ||
+        c == "method_not_found" ||
+        m.contains("未知方法") || m.contains("不支持的方法")
+}
+
+/**
+ * 辅助查询失败是否「良性」(不该被当成网关故障)。
+ *
+ * 良性 = 路径/查询本身的问题:① 网关不认识这个方法;② 当前 token 没这个 scope。
+ * 两者都说明**链路是通的**,只是这条查询拿不到数据。
+ *
+ * 关键错误(`NOT_PAIRED` 等待授权、`token mismatch`、传输层/超时/HTTP 错误)一律返回 false:
+ * 那些确实代表网关不可用,必须写进 `lastError` 并驱动重连。
+ *
+ * 注意:本函数回答的是「**辅助查询**的失败要不要当故障」(日志分类/展示决策用);
+ * **关键操作**的写入门槛看 [shouldWriteGatewayError] —— 权限不足虽然链路可用,
+ * 但它意味着这次关键操作真的做不成,仍要把原因写进 `lastError` 让用户看到。
+ */
+fun isBenignQueryError(code: String?, message: String?): Boolean =
+    isUnknownMethod(code, message) || isMissingScope(message)
+
+/**
+ * 一次 RPC 失败是否允许写 `lastError` / 影响网关状态。
+ *
+ * - 辅助查询(`critical = false`,概览/用量/技能/会话/定时任务等)一律**不写**:
+ *   失败只经 `RpcResult` 返回给调用方,网关状态与状态文案完全不受影响;
+ * - 关键操作(`critical = true`,`connect` 握手 / `chat.send` / 重连本身)**除「网关不认识这个方法」
+ *   外都写**:连接失败、等待授权、token 失效、权限不足都必须让用户看到。
+ *   `unknown method` 单列是因为它无论如何都不是链路故障(能力缺失),而其它原因都要能解释
+ *   「为什么这次操作没成」—— 一个关键的 `chat.send` / `connect` 失败却什么原因都不留,
+ *   `ensureConnected()` 只能报一个「连接超时」,反而把用户引向错误的方向。
+ *
+ * 真机 bug 的根因就在这里:概览页问了一个这台网关没有的方法(`usage`),错误被写进 `lastError`,
+ * 随后被「网关配置已重载,正在重连…」拼上去,看起来就成了**网关不可达**(其实连接一直正常)。
+ */
+fun shouldWriteGatewayError(critical: Boolean, code: String?, message: String?): Boolean =
+    critical && !isUnknownMethod(code, message)
+
+/**
+ * 辅助查询失败时的网关状态词:连接没坏,状态只由连接决定。
+ * 已连接 → `ready`;尚未连上 → `connecting`(由重连流程推进),**绝不**报 `offline`。
+ */
+fun benignQueryState(isConnected: Boolean): String =
+    if (isConnected) GatewayStatus.STATE_READY else GatewayStatus.STATE_CONNECTING
+
+/**
+ * 概览页一个分区的查询失败展示决策。
+ *
+ * @param text 展示文案:「该网关不支持用量查询」这类友好文案,或可读的失败原因
+ * @param hideCard 是否隐藏/禁用该分区卡片(网关不支持 / 无权限时为 true:反复显示一条报错没有意义)
+ */
+data class QueryUnavailable(val text: String, val hideCard: Boolean)
+
+/**
+ * 概览页分区查询失败 → 展示决策(纯函数,JVM 可测)。
+ *
+ * - 网关不认识该方法 → 「该网关不支持<分区>查询」+ **隐藏卡片**;
+ * - 无权限(missing scope) → 「当前 token 无权读取<分区>（需网关 admin 权限）」+ **隐藏卡片**;
+ * - 其余(连接断开/超时等)→ 保留卡片并显示可读原因:这是真的连不上,用户需要看到。
+ *
+ * @param section 分区名的中文短名(如「用量」「技能」),直接拼进文案
+ */
+fun queryUnavailable(section: String, code: String?, message: String?): QueryUnavailable = when {
+    isUnknownMethod(code, message) ->
+        QueryUnavailable("该网关不支持${section}查询", hideCard = true)
+
+    isMissingScope(message) ->
+        QueryUnavailable("当前 token 无权读取${section}（需网关 admin 权限）", hideCard = true)
+
+    else -> QueryUnavailable(
+        "不可用: ${message?.trim()?.takeIf { it.isNotBlank() } ?: "网关未响应"}",
+        hideCard = false,
+    )
+}
+
+/**
  * 构造「等待网关授权」状态。
  *
  * @param deviceIdShort deviceId 前 8 位(完整值写日志,不进设备屏文案)
@@ -136,6 +223,14 @@ fun mapRpcError(code: String?, message: String?, deviceIdShort: String): Gateway
         isMissingScope(msg) -> GatewayStatus(
             state = GatewayStatus.STATE_READY,
             detail = "该数据需网关 admin 权限,当前 token 无权读取",
+            recoverable = true,
+        )
+
+        // 3.1) 网关不认识这个方法:同样是「链路可用」,绝不能落到兜底的 offline
+        //      (真机 bug:概览页问 `usage` 得到 unknown method,状态卡就成了「网关不可达」)
+        isUnknownMethod(code, msg) -> GatewayStatus(
+            state = GatewayStatus.STATE_READY,
+            detail = "该网关不支持该方法:${msg.ifBlank { code?.trim().orEmpty() }}",
             recoverable = true,
         )
 

@@ -122,6 +122,11 @@ class OpenAiCompatibleGateway(
     override val lastError: String?
         get() = _lastError
 
+    /** 重载/重连开始时清掉旧错误:状态文案只允许拼【本次尝试】的原因(见接口 KDoc)。 */
+    override fun clearLastError() {
+        _lastError = null
+    }
+
     override fun isReady(): Boolean = ready
 
     /**

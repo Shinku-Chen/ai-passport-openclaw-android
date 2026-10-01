@@ -27,6 +27,7 @@ import com.shinku.aipassport.openclaw.gateway.GatewaySettings
 import com.shinku.aipassport.openclaw.gateway.OpenClawGateway
 import com.shinku.aipassport.openclaw.gateway.OpenClawGatewayRegistry
 import com.shinku.aipassport.openclaw.gateway.ReconnectBackoff
+import com.shinku.aipassport.openclaw.gateway.isUnknownMethod
 import com.shinku.aipassport.openclaw.gateway.needsGatewayReload
 import com.shinku.aipassport.openclaw.pipeline.VoicePipeline
 import com.shinku.aipassport.openclaw.ui.ConversationStore
@@ -366,9 +367,14 @@ class VoiceBridgeService : Service() {
         // 重建后立即重连一次;失败也不打紧,连接监控的退避循环会继续重试
         scope.launch {
             try {
+                // 重载/重连**开始**:先清掉上一次的错误,并把监控的「已播报原因」置空。
+                // 于是下面拼出的状态文案只可能是【本次尝试】的原因 —— 不会再把上一次的旧原因
+                // (真机案例:概览页问了一个本网关没有的方法 → `unknown method: usage`)
+                // 拼成「网关配置已重载,正在重连… — unknown method: usage」从而看着像「网关不可达」。
+                fresh.clearLastError()
+                reportedGatewayError = null
                 if (fresh.connect()) {
                     gatewayBackoff.reset()
-                    reportedGatewayError = null
                     publishGatewayStatus("网关配置已重载,连接就绪")
                 } else {
                     val reason = fresh.lastError?.takeIf { it.isNotBlank() }
@@ -395,6 +401,15 @@ class VoiceBridgeService : Service() {
     /** 已播报过的网关错误(只在原因变化时重新播报,避免每 6s 刷屏)。 */
     @Volatile
     private var reportedGatewayError: String? = null
+
+    /**
+     * 最近一次重连失败的原因。
+     *
+     * 重连**开始**时会清掉适配器的旧错误(保证状态文案只含本次尝试的原因);万一某个实现
+     * `connect()` 失败却什么都没写,就用它兜底 —— 重连循环绝不能因为「没有原因」而停掉。
+     */
+    @Volatile
+    private var lastReconnectReason: String? = null
 
     /** 网关重连是否在途(避免多个重连叠在一起)。 */
     @Volatile
@@ -477,6 +492,7 @@ class VoiceBridgeService : Service() {
         if (!::gateway.isInitialized) return
         if (gateway.isReady()) {
             gatewayBackoff.reset()
+            lastReconnectReason = null
             if (reportedGatewayError != null) {
                 reportedGatewayError = null
                 publishGatewayStatus("网关已恢复连接")
@@ -484,7 +500,10 @@ class VoiceBridgeService : Service() {
             return
         }
         // 还没有失败原因(如尚未首次对话)时不播报,避免误报「网关断开」
-        val reason = gateway.lastError ?: return
+        val reason = gateway.lastError ?: lastReconnectReason ?: return
+        // 双保险:「网关不认识这个方法」与连接无关(能力缺失),不播报、也不驱动重连。
+        // 只拦这一个原因 —— 权限不足之类的仍要重试/播报(重连循环绝不能停在那上面)。
+        if (isUnknownMethod(null, reason)) return
         if (reason != reportedGatewayError) {
             reportedGatewayError = reason
             publishGatewayStatus("$reason — 正在重连…")
@@ -496,11 +515,16 @@ class VoiceBridgeService : Service() {
         scope.launch {
             try {
                 kotlinx.coroutines.delay(delayMs)
+                // 本次尝试开始:清掉上一次的错误 → 之后读到的 lastError 一定是本次尝试的原因
+                gateway.clearLastError()
                 if (gateway.connect()) {
                     gatewayBackoff.reset()
+                    lastReconnectReason = null
                     Log.i(TAG, "网关重连成功")
                 } else {
-                    Log.w(TAG, "网关重连失败: ${gateway.lastError}")
+                    val fresh = gateway.lastError
+                    if (fresh == null) lastReconnectReason = reason
+                    Log.w(TAG, "网关重连失败: ${fresh ?: reason}")
                 }
             } catch (e: Exception) {
                 Log.w(TAG, "网关重连异常: ${e.message}")

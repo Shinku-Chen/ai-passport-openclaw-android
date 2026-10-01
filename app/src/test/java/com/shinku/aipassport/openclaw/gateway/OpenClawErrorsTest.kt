@@ -87,6 +87,23 @@ class OpenClawErrorsTest {
         assertTrue("不能骗用户说连不上", status.state != GatewayStatus.STATE_OFFLINE)
     }
 
+    /**
+     * 3.1) 网关不认识这个方法(实测 `usage` / `usage.get` / `stats*` 等):同样是「链路可用」,
+     * 绝不能落到兜底的 offline —— 否则辅助查询一失败,状态卡就成了「网关不可达」。
+     */
+    @Test
+    fun unknown_method_is_not_a_connection_failure() {
+        val status = mapRpcError("INVALID_REQUEST", "unknown method: usage", short)
+        assertEquals(GatewayStatus.STATE_READY, status.state)
+        assertFalse(status.awaitingPairing)
+        assertFalse("不能报成致命失败", status.fatal)
+        assertTrue("原因应可读: ${status.detail}", status.detail.contains("unknown method"))
+        assertTrue(
+            "method not found 同一处理",
+            mapRpcError(null, "method not found", short).state != GatewayStatus.STATE_OFFLINE,
+        )
+    }
+
     /** 4) 等待网关授权【不】是致命错误:仍可恢复,重连/重试循环必须继续跑。 */
     @Test
     fun awaiting_pairing_is_not_fatal() {

@@ -2,6 +2,36 @@
 
 ## Unreleased
 
+- 修 bug：**切换网关（Hermes → OpenClaw）后误报「网关不可达」，重启 App 才正常**。
+  - 真机现象（抓包原文）：`网关配置已重载: type=openclaw host=… port=18789`（重载成功、配置正确），紧接着
+    `网关配置已重载,正在重连… — unknown method: usage`，并把这条 detail 下发给设备；重启 App 后一切正常。
+  - 根因：概览页对每个分区都发辅助查询（`rpcUsage()` / `rpcSkills()` …），而该网关实测**不存在** `usage`，
+    回 `unknown method: usage` —— 关键操作与辅助查询**没有区分**，错误被写进网关的 `lastError`；
+    随后重载/重连的状态文案把这条**过期错误**拼了上去，链路一直正常的连接看起来就成了「网关不可达」。
+    更隐蔽的是 `onSocketDown` 只在 `lastRpcError == null` 时才写断开原因，于是**真正的**断开原因反而被这条旧文案挡掉；
+    App 重启后 `lastError` 为空，所以「重启后正常」。
+  - **关键 / 辅助错误隔离**：`OpenClawGateway.rpcQuery(method, params, critical: Boolean = false)` 新增 `critical`
+    （默认非关键）。**关键**= `connect` 握手 / `chat.send` / 重连本身：失败才允许写 `lastError`、影响网关状态；
+    **辅助**= 概览/用量/技能/渠道/会话列表/定时任务等查询，以及正文补正用的 `chat.history`：失败只经 `RpcResult`
+    返回给调用方，**绝不写 `lastError`、绝不影响网关状态、不发状态文案**。判定抽成纯函数
+    `shouldWriteGatewayError(critical, code, message) = critical && !isUnknownMethod(code, message)`：
+    辅助查询一律不写；关键操作除「网关不认识这个方法」外都写；每条请求自带 `error`，
+    因此辅助查询失败仍能拿到可读原因。
+  - **状态文案不再携带过期错误**：重载/重连**开始**前先清掉上一次的错误（新增 `GatewayAdapter.clearLastError()`，
+    OpenClaw / Hermes / 自定义 OpenAI 兼容重写；`VoiceBridgeService` 的 `reportedGatewayError` 同步置空，
+    重连路径用 `lastReconnectReason` 兜底保证重连循环不会因缺原因而停），状态 detail 只拼**本次尝试**的原因。
+  - **`unknown method` / `missing scope` 不再算网关故障**：`mapRpcError` 新增 `unknown method` 分支 → `state=ready`
+    （不再落到兜底的 `offline`）；辅助查询的失败日志按「能力/权限 vs 连接层」分类（纯函数
+    `isBenignQueryError`）；监控路径对 `isUnknownMethod` 的原因不播报、也不驱动重连（只拦这一个，
+    重连循环绝不会因权限类原因停下）。
+  - **概览页对「网关不支持」友好**：命中 `unknown method` / `missing scope` 时显示「该网关不支持用量查询」/
+    「当前 token 无权读取用量（需网关 admin 权限）」并**隐藏卡片**（标题+内容一起隐藏）；
+    同一会话内记住「不支持」（按配置指纹索引，换网关/地址/token 自动作废），不再每次进页都报一次错；
+    其它失败（断开/超时）仍保留卡片并显示可读原因。新增纯逻辑 `gateway/QuerySupport.kt`。
+  - 单测：新增 `QuerySupportTest`（11 例：错误→关键性/状态映射、辅助查询失败不得写 `lastError`、
+    概览页文案 + 隐藏、会话内记忆按指纹作废）、`OpenClawErrorsTest` 补 `unknown method` 不得报 `offline`；
+    单测总数 223 → 235，全绿。文档：`docs/gateway-adapters.md` 新增「2.6 关键 / 辅助 RPC 的错误隔离」。
+
 ## 0.1.1
 
 - 打包与签名改由 GitHub Actions 完成：keystore 与口令存放在仓库 Secrets，推送 `v*` 标签即产出并附上签名 APK。

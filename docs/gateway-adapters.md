@@ -29,6 +29,8 @@ interface GatewayAdapter {
     fun interrupt()
     /** 最近一次错误的可读描述，供设置页与状态面板显示。 */
     val lastError: String?
+    /** 清掉上一次的错误（重载/重连开始时用：状态文案只能含本次尝试的原因）。默认空实现。 */
+    fun clearLastError()
     /** 是否支持「用 chat.history 补正正文」（决定状态话术 body 要不要先缓发，见 2.5）。默认 false。 */
     val supportsBodyCorrection: Boolean
     fun close()
@@ -250,6 +252,68 @@ interface GatewayAdapter {
 | TTS | 行为不变（仍按 body 合并朗读，历史补正**不重新触发** TTS） |
 | 纯函数 | `pipeline/BodyDispatch.kt`：`bodyDispatch(streamedBody, correctedBody, correctedAvailable, historyCorrectionSupported)` → `BodyAction`（`SendNow` / `Hold` / `ReplaceWithCorrected` / `SendHeld`）；来源标记 `ui/ReplyDisplay.kt` 的 `BodySource` / `bodySourceOf` / `bodyFlag`；JVM 单测 `BodyDispatchTest` / `ReplyDisplayTest` |
 
+### 2.6 关键 / 辅助 RPC 的错误隔离（真机 bug：切换网关后「网关不可达」）
+
+**真机现象**（用户原话：「Hermes 切换为 openclaw，网关不可达，重启 app 后正常」）：
+
+```text
+01:35:43  网关配置已重载: type=openclaw host=192.168.31.5 port=18789   ← 重载成功，配置正确
+01:35:58  网关配置已重载,正在重连… — unknown method: usage
+          下发网关状态给设备: {"cmd":"gateway","state":"connecting","detail":"… — unknown method: usage"}
+01:38:59  重启 App 后: type=openclaw 一切正常
+```
+
+PC 探针实测该网关：**不存在**的方法 `usage` / `usage.get` / `system.usage` / `stats*` / `metrics` / `cost` / `skills`
+一律回 `unknown method: xxx`；**存在** `health` / `system.info` / `sessions.list` / `cron.list` / `chat.history` / `chat.send` / `connect`。
+
+根因链：概览页会对每个分区各发一次辅助查询（`rpcUsage()` / `rpcSkills()` …），失败后错误被写进网关的
+`lastError` —— 关键操作与辅助查询**没有区分**；随后重载/重连的状态文案把这条**过期错误**拼了上去
+（`网关配置已重载,正在重连… — unknown method: usage`），于是链路一直正常的连接看起来成了「网关不可达」。
+更隐蔽的是 `onSocketDown` 只在 `lastRpcError == null` 时才写断开原因，于是**真正的**断开原因反而被这条旧文案挡掉。
+重启 App 后 `lastError` 是空的，所以「重启后正常」。
+
+**规则：只有关键操作的失败才允许写 `lastError` / 影响网关状态**
+
+| 类别 | 成员 | 失败行为 |
+| --- | --- | --- |
+| **关键** | `connect` 握手、`chat.send`、重连本身 | 允许写 `lastError` 并影响网关状态：连接失败/等待授权/token 失效都必须让用户看到 |
+| **辅助** | 概览页的 `agent.identity.get` / `health` / `system.info` / `sessions.list` / `cron.list` / `channels.list` / `skills` / `usage`，以及正文补正用的 `chat.history` | **只经 `RpcResult` 返回给调用方**：不写 `lastError`、不发状态文案、不影响网关状态 |
+
+实现要点：
+
+| 项 | 语义 |
+| --- | --- |
+| 签名 | `OpenClawGateway.rpcQuery(method, params, critical: Boolean = false)`：默认**非关键**（辅助） |
+| 关键性在请求上 | `PendingRequest.critical`：`connect` / `chat.send` 显式 `critical = true`；其余走默认 |
+| 写入门槛 | `shouldWriteGatewayError(critical, code, message) = critical && !isUnknownMethod(code, message)`（纯函数）：辅助查询一律不写；关键操作除「网关不认识这个方法」外都写（含权限不足 —— 它虽链路可用，但这次操作真的做不成，必须留原因） |
+| 每条请求自带原因 | 请求对象记 `error`：即使不写 `lastError`，调用方也能从 `RpcResult.error` 拿到可读原因 |
+| 良性错误 | `isUnknownMethod`（`unknown method` / `method not found` / `METHOD_NOT_FOUND` / 「未知方法」）与 `isMissingScope` → `isBenignQueryError`：对**辅助查询**而言链路是通的，只是这条查询拿不到数据（日志里按「能力/权限」与「连接层」分类，便于定位是不是真断线） |
+| 状态词 | `mapRpcError` 新增 `unknown method` 分支 → `state=ready`（不再落到兜底的 `offline`）；`benignQueryState(isConnected)` 也保证辅助查询失败**永不**报 `offline` |
+| 纯函数 | `gateway/OpenClawErrors.kt` 的 `isUnknownMethod` / `isBenignQueryError` / `shouldWriteGatewayError` / `benignQueryState` / `queryUnavailable`；JVM 单测 `QuerySupportTest` + 扩充的 `OpenClawErrorsTest` |
+
+**规则：状态文案不得携带过期错误**
+
+| 位置 | 规则（逐字） |
+| --- | --- |
+| 重载（`VoiceBridgeService.reloadGatewaySettings`） | 连接尝试**开始**前先 `gateway.clearLastError()` 并把 `reportedGatewayError` 置空 → 详情只可能是本次尝试的原因：`网关配置已重载,连接就绪` / `网关配置已重载,正在重连… — <本次原因>` |
+| 重连（`VoiceBridgeService.monitorGateway`） | 重连**开始**前 `clearLastError()`；本次尝试没留下原因时用 `lastReconnectReason` 兜底（重连循环不能因「没有原因」而停掉）；播报仍是 `<本次原因> — 正在重连…` |
+| 辅助查询 | 永不进入状态文案；监控路径再加一道：原因是 `isUnknownMethod` 时不播报、也不驱动重连（只拦这一个 —— 权限不足之类的仍要重试/播报，重连循环绝不能停在那上面） |
+| 接口 | `GatewayAdapter.clearLastError()`（默认空实现）：OpenClaw / Hermes / 自定义 OpenAI 兼容各自重写 |
+
+**规则：概览页对「网关不支持」友好（不再每次进页都报错）**
+
+| 情况 | 文案 | 卡片 |
+| --- | --- | --- |
+| 网关不认识该方法 | `该网关不支持用量查询` | **隐藏**（标题 + 内容一起隐藏） |
+| 无权限（missing scope） | `当前 token 无权读取用量（需网关 admin 权限）` | **隐藏** |
+| 其它失败（断开/超时） | `不可用: <可读原因>` | **保留**（这是真的连不上，用户需要看到原因） |
+| 同一会话内已知「不支持」 | —（不再请求、不再报错） | 直接隐藏 |
+
+- 记忆放在纯逻辑 `gateway/QuerySupport.kt`（进程级 `QuerySupport.shared`），按**配置指纹**
+  （`OpenClawGatewayRegistry.keyOf`）索引：换网关/地址/token 时自动作废旧结论，App 重启即重新探测。
+- 分区的方法名取自 `OpenClawGateway.RPC_METHOD_*` 常量 —— 与 `rpcAgents()` / `rpcUsage()` 这些包装函数
+  共用同一份字面量，避免「请求用新名字、记忆记旧名字」这类偏差。
+
 ## 3. Hermes（新增）
 Hermes 的接入方式是 **OpenAI 兼容 HTTP API server**（由 `hermes gateway` 提供），比 OpenClaw 简单得多：无需设备签名，用 Bearer key 直接对话。
 
@@ -413,7 +477,8 @@ OpenClaw 对每台设备做 ed25519 设备配对认证：新设备首次连接�
 | 自定义 OpenAI 兼容 SSE 与未知事件 | 与 Hermes 共用解析器；未知事件不进入正文 |
 | 空 model / 401 / 404 / 超时 | 断言 `lastError` 可读、`chat()` 返回 null；空 model 不发请求 |
 | 校验 `/models` → 退化最小对话 / 失败不落盘 | `connect()` + `GatewaySaveGuard.validateAndPersist` 断言落盘回调未被调用 |
-| 错误映射：NOT_PAIRED / INVALID_REQUEST+device / missing scope / EHOSTUNREACH / SocketTimeout / HTTP 401·403·404 | `OpenClawErrorsTest` 断言状态词只在四态内、detail 可读、等待授权 `awaitingPairing=true` 且 `fatal=false` |
+| 错误映射：NOT_PAIRED / INVALID_REQUEST+device / missing scope / unknown method / EHOSTUNREACH / SocketTimeout / HTTP 401·403·404 | `OpenClawErrorsTest` 断言状态词只在四态内、detail 可读、等待授权 `awaitingPairing=true` 且 `fatal=false`、`unknown method` 不得报成 `offline` |
+| 关键 / 辅助 RPC 的错误隔离：`unknown method`·`missing scope` 属辅助（不致命、状态仍由连接决定）；`NOT_PAIRED`·`token mismatch`·传输层错误属关键；辅助查询失败**不得**写 `lastError`；概览页「不支持」→ 友好文案 + 隐藏卡片；同一次会话内记住、换网关（指纹变）重新探测 | `QuerySupportTest`（10 例，纯函数 `isUnknownMethod` / `isBenignQueryError` / `shouldWriteGatewayError` / `benignQueryState` / `queryUnavailable` / `QuerySupport`） |
 | 等待授权不被当成致命错误、且绝不落盘 | `GatewaySaveGuardTest` 用假适配器（`isAwaitingPairing=true`）断言 `SaveValidation.AwaitingPairing` 且 persist 回调未被调用 |
 | 语音附加提示：语音追加 / 文字不追加 / 空 suffix / trim / 空输入 | `VoicePromptTest` 断言 `VoicePrompt.compose` |
 | 仅 host/port/token 变化也必须重载 | `GatewayReloadTest` 比较前后 `GatewayConfigSnapshot`，断言 `needsGatewayReload == true` |
