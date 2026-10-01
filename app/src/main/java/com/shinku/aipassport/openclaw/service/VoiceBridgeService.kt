@@ -193,10 +193,14 @@ class VoiceBridgeService : Service() {
                     // 先把链路状态置为「正在扫描」:网关状态广播很多,不单独记链路状态的话
                     // 设备页会在一秒内被网关文案刷成「未连接」。
                     publishLinkStatus(LINK_SCANNING, "正在扫描设备…")
+                    userDisconnected = false   // 用户重新发起:恢复自动重连
                     ble.rescan()
                 }
             }
             ACTION_DISCONNECT -> {
+                // 用户主动断开:标记后连接监控不再自动重连,否则设备会被立刻接回来,
+                // 设备页列表里就一直显示"已连接"(真机反馈)。重新扫描/重连会清掉这个标记。
+                userDisconnected = true
                 if (::ble.isInitialized) ble.stop()
                 publishLinkStatus(LINK_DISCONNECTED, "已断开")
             }
@@ -431,6 +435,15 @@ class VoiceBridgeService : Service() {
     @Volatile
     private var lastGatewayStateAtMs: Long = 0L
 
+    /**
+     * 用户是否主动点过「断开设备」。
+     *
+     * 为 true 时连接监控不再自动重连(否则断开一秒后又连上,列表里一直显示已连接);
+     * 重新扫描(ACTION_SCAN)会置回 false。只在内存中,App 重启后恢复正常自动重连。
+     */
+    @Volatile
+    private var userDisconnected = false
+
     private fun startConnectionMonitor() {
         monitorJob?.cancel()
         monitorJob = scope.launch {
@@ -439,7 +452,8 @@ class VoiceBridgeService : Service() {
                     kotlinx.coroutines.delay(6_000)
                     try {
                         // 设备(BLE)连接检测:若断,触发重连(自动重连上次设备)。
-                        if (!ble.isConnected()) {
+                        // 用户刚点过「断开设备」时不在这里重连:那是有意断开,不该被监控接回来。
+                        if (!ble.isConnected() && !userDisconnected) {
                             Log.w(TAG, "连接监控: 设备 BLE 已断开,触发重连")
                             publishLinkStatus(LINK_DISCONNECTED, "设备断开,自动重连…")
                             ble.rescan()
