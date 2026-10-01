@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+- 修 bug：**配对输完 6 位密码后卡在「已连接,等待加密」，设备屏的配对码面板也不消失**。
+  - 真机现象：设备重启后重新配对，App 输入密码后一直停在「已连接,等待加密」；
+    设备侧的配对码对话框也不再自动消失（只能断开重来）。
+  - 根因：`BleCentral` 在 PIN / PASSKEY / DISPLAY_PASSKEY 这些**输入类**配对变体上提交密码时，
+    同时调了 `setPin()` 与 `setPairingConfirmation(true)`。`setPairingConfirmation()` 只属于
+    `PAIRING_VARIANT_PASSKEY_CONFIRMATION`（两侧显示同一数字需确认）；在输入类变体上附带确认
+    会打断协议栈的状态机，加密阶段就此停住——App 等不到 `BOND_BONDED` 广播，设备也等不到加密完成事件。
+  - 修复：输入类变体**只提交 `setPin()`**；确认逻辑仍留在 `PAIRING_VARIANT_PASSKEY_CONFIRMATION` 分支。
+  - 固件侧同步：把「配对已完成」的判定从“手机订阅完成”提前到“加密完成”，并给配对码面板加 90 秒
+    兜底超时（`main/oc_app.c` / `main/oc_ui.c`），对端中途放弃时不会一直挡着屏幕。
+- 修 bug：**设备关机重启后 App 重新连接特别慢**。
+  - 真机现象：设备重启后要等很久才连上，有时还得手动去设备页点「扫描并连接」。
+  - 根因：重连路径固定“退避 8 秒 + 重新扫描”（`scheduleReconnect(8_000L)`），而设备重启只需几秒；
+    启动时那次按地址直连失败后也没有重试或扫描兜底，双向都慢。
+  - 修复：新增纯逻辑策略 `LinkRetryPolicy`——前 3 次**直连上次记住的地址**（间隔 1.5 秒，
+    覆盖“设备刚重启完”这个主场景），连续失败后再改为 8 秒退避 + 扫描（覆盖设备换地址/绑定被清除）；
+    并给直连加上 10 秒**连接超时**（Android 的直连请求本身不超时，设备不在时会无限期挂着）。
+    新增 `LinkRetryPolicyTest`（4 个用例）。
+
 - 重构：把 BLE 设备接入参数收进「设备档案」，为以后接入别的品牌做准备（**行为不变**）。
   - 新增 `ble/DeviceProfile.kt`（档案数据类：服务/RX/TX/CCCD UUID、广播名前缀、请求 MTU、配对方式、
     帧格式、音频参数、设备能力）与 `ble/DeviceProfiles.kt`（档案目录：AI Passport 档案 + `byId`/`detect`）。

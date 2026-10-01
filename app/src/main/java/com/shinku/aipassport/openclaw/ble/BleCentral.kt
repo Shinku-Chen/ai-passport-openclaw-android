@@ -39,8 +39,12 @@ import androidx.core.content.ContextCompat
  *
  * 配对:固件为 LE SC + MITM + bonding,配对时生成随机 6 位密码并在小屏显示。中央端收到
  * PIN / PASSKEY / DISPLAY_PASSKEY 输入请求时弹出输入框,用户按固件屏幕显示的密码输入后
- * setPin + setPairingConfirmation 完成匹配;收到 PASSKEY_CONFIRMATION 时自动确认。
+ * **只调 setPin**(输入类变体不能再调 setPairingConfirmation,否则配对会卡在加密阶段);
+ * 只有 PASSKEY_CONFIRMATION(两侧显示同一数字需确认)才自动 setPairingConfirmation(true)。
  */
+// 重连/超时策略见 [LinkRetryPolicy](纯逻辑,已单测):前几次直连记住的地址(快路),
+// 连续失败后退避 + 扫描(慢路)。
+
 @SuppressLint("MissingPermission")
 class BleCentral(
     private val context: Context,
@@ -96,6 +100,15 @@ class BleCentral(
     private var gatt: BluetoothGatt? = null
     private var targetDevice: BluetoothDevice? = null
     private var running = false
+
+    /** 物理链路是否已连上(用于连接超时判定:`gatt != null` 只代表"发起过连接")。 */
+    private var linkUp = false
+
+    /** 连续"直连记住的地址"失败次数:少量快速重试后改为退避 + 扫描。 */
+    private var directRetryCount = 0
+
+    /** 连接超时任务(连上或掉线时取消)。 */
+    private var connectTimeout: Runnable? = null
 
     /** code=1(SCAN_FAILED_ALREADY_STARTED) 连续次数:扫到设备后重置,见 [ScanRetry]。 */
     private var alreadyStartedAttempts = 0
@@ -213,16 +226,16 @@ class BleCentral(
             when (newState) {
                 BluetoothProfile.STATE_CONNECTED -> {
                     Log.i(tag, "已连接 status=$status")
+                    linkUp = true
+                    cancelConnectTimeout()
+                    directRetryCount = 0
                     listener.onConnected()
                     ensureEncryption(g)
                 }
                 BluetoothProfile.STATE_DISCONNECTED -> {
                     Log.i(tag, "已断开 status=$status")
-                    gatt?.close()
-                    gatt = null
-                    listener.onDisconnected()
-                    // 断开后不立即高频重连,退避后再扫,避免 Android 扫描限流
-                    if (running) scheduleReconnect(backoffMs = 8_000L)
+                    // 断开(含设备重启、直连超时)统一走重连策略,不再固定退避 8 秒 + 重新扫描。
+                    onLinkDown()
                 }
             }
         }
@@ -536,7 +549,8 @@ class BleCentral(
 
     /**
      * 配对请求:弹输入框让用户输入固件小屏显示的 6 位密码。
-     * 广播在系统回调线程,必须 post 到主线程弹 UI;确认成功后 setPin + setPairingConfirmation。
+     * 广播在系统回调线程,必须 post 到主线程弹 UI;确认后**只提交 setPin**——
+     * 输入类变体不需要也不能附带确认,确认只属于 PASSKEY_CONFIRMATION 变体。
      */
     private fun requestPairingPin(device: BluetoothDevice, showHint: Boolean) {
         Log.i(tag, "配对请求:需用户输入 6 位密码(showHint=$showHint)")
@@ -580,10 +594,13 @@ class BleCentral(
                     dialog.dismiss()
                     bleHandler.post {
                         try {
+                            // 真机回归:这里同时调 setPairingConfirmation(true) 会让配对卡在加密阶段——
+                            // App 一直停在「已连接,等待加密」,设备屏上的配对码面板也不消失。
+                            // 输入类变体(PIN / PASSKEY / DISPLAY_PASSKEY)只提交 setPin 即可;
+                            // 需要确认的是 PASSKEY_CONFIRMATION,已在广播接收器里单独处理。
                             device.setPin(pin.toByteArray())
-                            device.setPairingConfirmation(true)
                         } catch (e: Exception) {
-                            Log.e(tag, "setPin/setPairingConfirmation 失败", e)
+                            Log.e(tag, "setPin 失败", e)
                             listener.onError("配对码提交失败:${e.message}")
                         }
                     }
@@ -617,6 +634,8 @@ class BleCentral(
         listener.onConnecting()
         bleHandler.post {
             Log.i(tag, "连接 ${device.address}")
+            linkUp = false
+            scheduleConnectTimeout(device.address)
             gatt = device.connectGatt(
                 context, false, gattCallback, BluetoothDevice.TRANSPORT_LE
             )
@@ -667,9 +686,76 @@ class BleCentral(
         g.writeDescriptor(cccd)
     }
 
-    private fun scheduleReconnect(backoffMs: Long = 2_000L) {
+    /**
+     * 重连调度。
+     *
+     * [direct] = true 时先直连上次记住的地址(1~2 秒级,设备刚重启完就能接上);
+     * 连续失败 [DIRECT_RETRY_LIMIT] 次后改为"退避 + 扫描",兜住设备地址变化或需重新配对的情况。
+     */
+    private fun scheduleReconnect(backoffMs: Long = 2_000L, direct: Boolean = false) {
         bleHandler.removeCallbacksAndMessages(null)
-        bleHandler.postDelayed({ if (running) startScan() }, backoffMs)
+        val addr = lastDeviceAddr
+        val tryDirect = direct && addr != null
+        bleHandler.postDelayed({
+            if (!running) return@postDelayed
+            val dev = if (tryDirect) {
+                try {
+                    adapter?.getRemoteDevice(addr!!)
+                } catch (e: Exception) {
+                    Log.w(tag, "直连地址无效(${e.message}),改为扫描")
+                    null
+                }
+            } else {
+                null
+            }
+            if (dev != null) {
+                Log.i(tag, "重连:直连上次设备 $addr(已用直连重试 $directRetryCount 次)")
+                connectTo(dev)
+            } else {
+                startScan()
+            }
+        }, backoffMs)
+    }
+
+    /**
+     * 连接超时兜底:到点仍未连上就当作掉线,交给 [onLinkDown] 重连。
+     *
+     * 没有它时,设备关机重启期间发起的那次直连会一直挂着(Android 不报错也不超时),
+     * 用户看上去就是"重新连接特别慢"。
+     */
+    private fun scheduleConnectTimeout(address: String) {
+        cancelConnectTimeout()
+        val r = Runnable {
+            if (running && !linkUp) {
+                Log.w(tag, "连接超时(${LinkRetryPolicy.CONNECT_TIMEOUT_MS}ms):$address")
+                onLinkDown()
+            }
+        }
+        connectTimeout = r
+        bleHandler.postDelayed(r, LinkRetryPolicy.CONNECT_TIMEOUT_MS)
+    }
+
+    private fun cancelConnectTimeout() {
+        connectTimeout?.let { bleHandler.removeCallbacks(it) }
+        connectTimeout = null
+    }
+
+    /**
+     * 链路掉线(或直连超时)的统一入口:清理 gatt、通知上层,然后按"快路→慢路"重连。
+     *
+     * 快路:1.5 秒后直连上次地址 —— 设备关机重启后只等它把广播/连接能力拉起来;
+     * 慢路:连续直连失败后 8 秒退避 + 扫描 —— 处理设备换了地址、或绑定被清除需重新配对的情况。
+     */
+    private fun onLinkDown() {
+        linkUp = false
+        cancelConnectTimeout()
+        gatt?.close()
+        gatt = null
+        listener.onDisconnected()
+        if (!running) return
+        val d = LinkRetryPolicy.decide(directRetryCount)
+        if (d.direct) directRetryCount++ else directRetryCount = 0
+        scheduleReconnect(backoffMs = d.delayMs, direct = d.direct)
     }
 
     private fun hasBlePermissions(): Boolean {
