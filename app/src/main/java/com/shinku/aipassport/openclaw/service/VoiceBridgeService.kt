@@ -1295,7 +1295,7 @@ class VoiceBridgeService : Service() {
             Intent(this, MainActivity::class.java),
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
         )
-        val device = lastStatusText ?: status
+        val device = deviceNotificationLine(status)
         val gateway = gatewayNotificationLine()
         val voice = BridgeStatusText.voiceLine(
             linkReady = deviceLinkState == LINK_READY || deviceLinkState == LINK_ENCRYPTED,
@@ -1328,6 +1328,17 @@ class VoiceBridgeService : Service() {
             )
             .build()
     }
+
+    /**
+     * 通知里的「设备」行。
+     *
+     * 必须用 BLE 链路状态 [deviceLinkState]，**不能**用 [lastStatusText] —— 后者是全局状态文案，
+     * 网关探活/工作中等事件每几秒就会把它覆盖成「OpenAI 兼容网关可用」这类句子，
+     * 于是「设备」那一行显示的是网关的话（真机实测的常驻通知就是这样）。
+     * 链路状态还是空的（服务刚起来、尚未扫描）时再退回全局文案，避免这一行空着。
+     */
+    private fun deviceNotificationLine(status: String): String =
+        deviceLinkState.ifBlank { lastStatusText ?: status }
 
     /** 通知里的网关状态行（四态词转中文；类型由状态卡与设备页展示，通知里不重复）。 */
     private fun gatewayNotificationLine(): String = when (lastGatewayState) {
