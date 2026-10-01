@@ -107,6 +107,9 @@ class VoiceBridgeService : Service() {
          * 所以用 setDeleteIntent 监听“被划掉”事件，服务还在跑就重新上报一次前台通知。
          */
         const val ACTION_REPOST_NOTIFICATION = "com.shinku.aipassport.openclaw.action.REPOST_NOTIFICATION"
+
+        /** 通知被用户划掉：只标记，不自动挂回（下次状态变化才会重新出现）。 */
+        const val ACTION_NOTIFICATION_DISMISSED = "com.shinku.aipassport.openclaw.action.NOTIFICATION_DISMISSED"
         const val EXTRA_STATUS = "status"
 
         /** 当前(或最近一次)连接设备的名称(广播名,如 Passport-1234);断开后保留。 */
@@ -202,8 +205,8 @@ class VoiceBridgeService : Service() {
         // 前台服务被系统杀死后 START_STICKY 重启(intent 为 null)也要拉起桥
         when (intent?.action) {
             ACTION_STOP -> stopSelf()
-            // 通知被划掉 → 重新挂上（服务还在跑才会收到这个 intent）
-            ACTION_REPOST_NOTIFICATION -> startForegroundCompat()
+            // 通知被用户划掉:什么都不做(不再自动挂回)。下次状态变化时 notify() 会重新出现。
+            ACTION_NOTIFICATION_DISMISSED -> Log.i(TAG, "常驻通知被划掉(状态变化时才会重新出现)")
             ACTION_SCAN -> {
                 startBridge()
                 if (::ble.isInitialized) {
@@ -1234,7 +1237,7 @@ class VoiceBridgeService : Service() {
                 PendingIntent.getService(
                     this, 1,
                     Intent(this, VoiceBridgeService::class.java)
-                        .setAction(ACTION_REPOST_NOTIFICATION),
+                        .setAction(ACTION_NOTIFICATION_DISMISSED),
                     PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
                 )
             )
@@ -1266,10 +1269,26 @@ class VoiceBridgeService : Service() {
         }
     }
 
+    /** 上一次挂出的通知正文：内容不变时不再 notify（不会把被划掉的通知重新唤醒）。 */
+    private var lastNotificationText: String? = null
+
+    /**
+     * 更新常驻通知。
+     *
+     * 语义（用户要求）：**被划掉后不再自动回来，只有状态真正变化时才重新出现**。
+     * 于是内容与上次一致时（例如每 6 秒一次的网关心跳）直接跳过 —— 不会把用户刚划掉的通知又唤醒；
+     * 内容变了（链路 / 网关 / 语音 任一变化）才 notify，此时之前被划掉的会重新出现。
+     */
     private fun updateNotification(status: String) {
         try {
+            val notif = notification(status)
+            val text = notif.extras?.getString("android.bigText")
+                ?: notif.extras?.getString("android.text")
+                ?: status
+            if (text == lastNotificationText) return
+            lastNotificationText = text
             val nm = getSystemService(NotificationManager::class.java)
-            nm.notify(NOTIF_ID, notification(status))
+            nm.notify(NOTIF_ID, notif)
         } catch (e: Exception) {
             Log.w(TAG, "更新通知失败", e)
         }
