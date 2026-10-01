@@ -77,7 +77,7 @@ class VoiceBridgeService : Service() {
 
     companion object {
         private const val TAG = "VoiceBridgeService"
-        private const val CHANNEL_ID = "voice_bridge"
+        private const val CHANNEL_ID = "voice_bridge_v2"
         private const val NOTIF_ID = 1
 
         const val ACTION_START = "com.shinku.aipassport.openclaw.action.START"
@@ -1194,14 +1194,32 @@ class VoiceBridgeService : Service() {
 
     // ---- 前台通知 ----
 
+    /**
+     * 创建通知渠道。
+     *
+     * 重要性用 **IMPORTANCE_DEFAULT** 而不是 LOW：LOW 会被 MIUI/HyperOS 当成"静默通知"，
+     * 既不显示系统侧的「常驻通知」开关，也更容易被系统收起；DEFAULT 才是普通通知，
+     * 用户能在系统里把它设为常驻。
+     *
+     * 注意：**渠道重要性创建后只能降不能升**，所以这里换成新的渠道 id
+     * ([CHANNEL_ID]，1.10 起为 `voice_bridge_v2`)，并删掉旧的 `voice_bridge` 渠道。
+     */
     private fun createChannel() {
         val nm = getSystemService(NotificationManager::class.java)
         val channel = NotificationChannel(
             CHANNEL_ID,
             "语音对讲桥",
-            NotificationManager.IMPORTANCE_LOW,
-        ).apply { description = "保持与 AI Passport 设备的 BLE 连接与语音流水线" }
+            NotificationManager.IMPORTANCE_DEFAULT,
+        ).apply {
+            description = "保持与 AI Passport 设备的 BLE 连接与语音流水线；可在系统里设为常驻"
+            setShowBadge(false)
+        }
         nm.createNotificationChannel(channel)
+        // 旧渠道（IMPORTANCE_LOW）删掉，避免设置页里出现两个同名渠道
+        try {
+            nm.deleteNotificationChannel("voice_bridge")
+        } catch (_: Exception) {
+        }
     }
 
     /**
