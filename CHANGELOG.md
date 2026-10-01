@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+- 修 bug：**点「断开设备」后，设备列表里仍然显示「已连接」**。
+  - 根因：`VoiceBridgeService` 的连接监控每 6 秒检查 `ble.isConnected()`，断开就无条件 `rescan()` 自动重连；
+    `ACTION_DISCONNECT` 只停了 BLE，没告诉监控“这是用户主动断开的”。
+  - 修复：新增 `userDisconnected` 标记（`ACTION_DISCONNECT` 置位、`ACTION_SCAN` 清除），
+    监控在标记为真时不再自动重连；标记只在内存，App 重启后恢复“自动重连上次设备”的既有行为。
+- 修 bug：**新加 OpenClaw 网关/设备时，等待授权的状态不明确，而是报了别的错误**。
+  - 根因：设备审批识别只覆盖 `NOT_PAIRED` / `PAIRING_REQUIRED` /「not approved」/「pairing required」；
+    网关换别种说法（如 `DEVICE_NOT_APPROVED`、「unrecognized device」、「device not registered」）就落到普通错误分支。
+  - 修复：`isPairingRequired()` 扩展覆盖上述错误码与文案（含「approve + device」兜底），
+    一律走可恢复的「等待网关授权：请在 OpenClaw 控制台批准本设备 (deviceId …)」；
+    新增单测覆盖 8 种新写法。
+- 变更：**版本号与固件/社区对齐到 `1.8.0`**。
+  - App `versionName` `0.1.2 → 1.8.0`（`versionCode 4`），对应固件 release tag `v1.8.0-intercom`；
+    约定写进 `AGENTS.md`：固件 `vX.Y.Z-intercom` ↔ App `X.Y.Z`，社区作品说明里注明同一版本号。
+
 - 修 bug：**配对输完 6 位密码后卡在「已连接,等待加密」，设备屏的配对码面板也不消失**。
   - 真机现象：设备重启后重新配对，App 输入密码后一直停在「已连接,等待加密」；
     设备侧的配对码对话框也不再自动消失（只能断开重来）。
