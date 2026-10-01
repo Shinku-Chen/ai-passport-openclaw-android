@@ -110,6 +110,15 @@ class BleCentral(
     /** 连接超时任务(连上或掉线时取消)。 */
     private var connectTimeout: Runnable? = null
 
+    /**
+     * 单飞保护:已有连接在进行(或已连上)时,忽略重复的连接请求。
+     *
+     * 真机回归:rescan() 与“启动后自动重连”会几乎同时发起连接,
+     * 同一个设备上出现两个 BluetoothGatt 客户端、两条 onConnectionStateChange 回调,
+     * 加密/配对状态机被搅乱 —— App 就一直停在「已连接,等待加密」。
+     */
+    private var connectInFlight = false
+
     /** code=1(SCAN_FAILED_ALREADY_STARTED) 连续次数:扫到设备后重置,见 [ScanRetry]。 */
     private var alreadyStartedAttempts = 0
 
@@ -179,8 +188,10 @@ class BleCentral(
             when (intent.action) {
                 BluetoothDevice.ACTION_BOND_STATE_CHANGED -> {
                     val device: BluetoothDevice? = intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE)
-                    val target = targetDevice ?: return
-                    if (device?.address != target.address) return
+                    val target = targetDevice
+                    Log.i(tag, "绑定状态变化 ${device?.address} state=${device?.bondState} target=${target?.address}")
+                    if (device == null || target == null) return
+                    if (device.address != target.address) return
                     when (device.bondState) {
                         BluetoothDevice.BOND_BONDED -> {
                             Log.i(tag, "配对完成")
@@ -197,12 +208,19 @@ class BleCentral(
                 }
                 BluetoothDevice.ACTION_PAIRING_REQUEST -> {
                     val device: BluetoothDevice? = intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE)
-                    val target = targetDevice ?: return
-                    if (device?.address != target.address) return
                     val variant = intent.getIntExtra(
                         BluetoothDevice.EXTRA_PAIRING_VARIANT,
                         BluetoothDevice.PAIRING_VARIANT_PIN
                     )
+                    // 先记日志再判断:这对“配对没弹框、一直等加密”是唯一的现场证据。
+                    Log.i(tag, "收到配对请求 ${device?.address} variant=$variant target=${targetDevice?.address}")
+                    if (device == null) return
+                    // 真机回归:以前是 `targetDevice ?: return`,一旦 target 暂时为空(例如刚 rescan 过)
+                    // 配对广播就被静默丢弃 —— 手机不会弹输入框,设备也等不到加密,两边一起卡住。
+                    // 配对请求是系统广播,这里只拦“别的设备”,target 为空时直接采纳该设备。
+                    val target = targetDevice
+                    if (target != null && device.address != target.address) return
+                    if (target == null) targetDevice = device
                     when (variant) {
                         // 固件无键盘,由中央端输入其小屏显示的 6 位随机密码
                         BluetoothDevice.PAIRING_VARIANT_PIN,
@@ -227,6 +245,7 @@ class BleCentral(
                 BluetoothProfile.STATE_CONNECTED -> {
                     Log.i(tag, "已连接 status=$status")
                     linkUp = true
+                    connectInFlight = false
                     cancelConnectTimeout()
                     directRetryCount = 0
                     listener.onConnected()
@@ -327,6 +346,7 @@ class BleCentral(
         try { gatt?.close() } catch (_: Exception) {}
         gatt = null
         targetDevice = null
+        connectInFlight = false   // 手动重扫:丢掉上一次的单飞状态,避免永久拦住新连接
         // 旧实现只有 `if (running) startScan()`:
         // 用户点过「断开设备」后 BleCentral.stop() 已把 running 置 false,
         // 于是「断开 → 再点扫描」是空操作,只能重启 App 才恢复(真机复现过)。
@@ -355,6 +375,7 @@ class BleCentral(
         try { gatt?.close() } catch (_: Exception) {}
         gatt = null
         targetDevice = null
+        connectInFlight = false
     }
 
     /** 单次 ATT 写安全片长(MTU256-3≈253,留余量用 240)。 */
@@ -629,12 +650,18 @@ class BleCentral(
     }
 
     private fun connectTo(device: BluetoothDevice) {
+        // 单飞:同一设备已在连接/已连上时不再发起第二次 GATT 连接(见 connectInFlight 注释)。
+        if (connectInFlight && targetDevice?.address == device.address) {
+            Log.i(tag, "忽略重复连接请求 ${device.address}(已有连接在进行)")
+            return
+        }
         targetDevice = device
         rememberDevice(device.address)   // 记住设备地址,App 重启后可自动重连
         listener.onConnecting()
         bleHandler.post {
             Log.i(tag, "连接 ${device.address}")
             linkUp = false
+            connectInFlight = true
             scheduleConnectTimeout(device.address)
             gatt = device.connectGatt(
                 context, false, gattCallback, BluetoothDevice.TRANSPORT_LE
@@ -748,6 +775,7 @@ class BleCentral(
      */
     private fun onLinkDown() {
         linkUp = false
+        connectInFlight = false
         cancelConnectTimeout()
         gatt?.close()
         gatt = null
