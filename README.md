@@ -7,8 +7,7 @@
 | 我要 | 去哪里 |
 | --- | --- |
 | **下载手机 App** | [Releases](https://github.com/Shinku-Chen/ai-passport-openclaw-android/releases/latest) → `app-release.apk`（已签名） |
-| **给设备刷固件** | 固件仓 [Shinku-Chen/ai-passport](https://github.com/Shinku-Chen/ai-passport) → [**Releases 列表**](https://github.com/Shinku-Chen/ai-passport/releases) → 找**名字里带 `intercom` 的最新一版**（发布命名形如 `v1.8.0-intercom`）→ 下载 `FoloToy-AI-Passport-full.bin`（可直接烧录的合并镜像） |
-| **看/改固件源码** | 同上仓库，**分支 [`feature/openclaw-intercom`](https://github.com/Shinku-Chen/ai-passport/tree/feature/openclaw-intercom)**（本应用的全部固件代码都在这个分支上，`main` 上还没有） |
+| **给设备刷固件** | [**Shinku-Chen/ai-passport（分支 feature/openclaw-intercom）**](https://github.com/Shinku-Chen/ai-passport/tree/feature/openclaw-intercom) → [Releases 列表](https://github.com/Shinku-Chen/ai-passport/releases) → 找**名字里带 `intercom` 的最新一版**（发布命名形如 `v1.8.0-intercom`）→ 下载 `FoloToy-AI-Passport-full.bin`（可直接烧录的合并镜像） |
 | **在线刷机**（不用装工具） | <https://ai-passport.folotoy.cn/tools/web-flasher/> |
 | **看别人做了什么** | [AI Passport 社区](https://ai-passport.folotoy.cn/plays/)（本项目已投稿，审核中） |
 
@@ -61,11 +60,10 @@
 
 | 项 | 值 |
 | --- | --- |
-| 仓库 | <https://github.com/Shinku-Chen/ai-passport>（上游为 `FoloToy/ai-passport` 的 fork） |
-| **分支** | **`feature/openclaw-intercom`** |
+| 仓库（已含分支） | <https://github.com/Shinku-Chen/ai-passport/tree/feature/openclaw-intercom> |
 | 对应的发布 | 在 [Releases](https://github.com/Shinku-Chen/ai-passport/releases) 里找名字带 `intercom` 的最新一版（形如 `v1.8.0-intercom`） |
-| 构建 | ESP-IDF **5.5.3**，`idf.py -B build build`（构建与烧录细节见固件仓 `docs/development/engineering/build-and-test.md`） |
-| 协议文档 | 固件仓 `docs/development/engineering/intercom-wire-protocol.md`（中英各一份） |
+| 构建 | ESP-IDF **5.5.3**，`idf.py -B build build`（构建与烧录细节见仓库内 `docs/development/engineering/build-and-test.md`） |
+| 协议文档 | 仓库内 `docs/development/engineering/intercom-wire-protocol.md`（中英各一份） |
 
 ```bash
 # 取固件源码(本应用对应的分支)
@@ -135,13 +133,13 @@ idf.py -B build build      # 需要已激活 ESP-IDF 5.5.3
 
 **AI Passport Pocket Intercom** — hold the OK button on the device, speak, and your phone hands the words to your own AI assistant; the answer comes back to the device screen and the phone app. The device itself needs no Wi-Fi: audio travels over Bluetooth only.
 
-- **Firmware**: open the firmware repo's [Releases page](https://github.com/Shinku-Chen/ai-passport/releases) and pick the **latest release whose name contains `intercom`** (releases look like `v1.8.0-intercom`; the repository also hosts other apps), then flash `FoloToy-AI-Passport-full.bin` (or use the [web flasher](https://ai-passport.folotoy.cn/tools/web-flasher/)). The firmware source lives in [Shinku-Chen/ai-passport](https://github.com/Shinku-Chen/ai-passport) on branch **`feature/openclaw-intercom`**, built with ESP-IDF 5.5.3.
+- **Firmware**: flash `FoloToy-AI-Passport-full.bin` from the firmware repository's [Releases page](https://github.com/Shinku-Chen/ai-passport/releases) — pick the **latest release whose name contains `intercom`** (releases look like `v1.8.0-intercom`; the repository also hosts other apps) — or use the [web flasher](https://ai-passport.folotoy.cn/tools/web-flasher/). The source is at [Shinku-Chen/ai-passport @ feature/openclaw-intercom](https://github.com/Shinku-Chen/ai-passport/tree/feature/openclaw-intercom), built with ESP-IDF 5.5.3.
 - **App**: install `app-release.apk` from [Releases](https://github.com/Shinku-Chen/ai-passport-openclaw-android/releases/latest) (Android 8+).
 - **Pair**: Device tab → Scan and connect → type the 6-digit code shown on the device.
 - **Gateway**: Settings → pick OpenClaw / Hermes / custom OpenAI-compatible / Echo, fill the fields and save (the app validates before saving).
 - **Talk**: press and hold OK (screen turns red, then green — you may speak), release to send.
 
-Screenshots are under `docs/images/`. The wire protocol and firmware live in [Shinku-Chen/ai-passport](https://github.com/Shinku-Chen/ai-passport) — branch `feature/openclaw-intercom`.
+Screenshots are under `docs/images/`. The wire protocol and firmware live in [Shinku-Chen/ai-passport @ feature/openclaw-intercom](https://github.com/Shinku-Chen/ai-passport/tree/feature/openclaw-intercom).
 
 ## 说明与许可
 
