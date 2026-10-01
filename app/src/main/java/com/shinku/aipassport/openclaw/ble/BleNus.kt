@@ -7,6 +7,10 @@ import java.util.UUID
  *
  * 固件以标准 NUS 128 位 UUID 广播并对外设特征做 READ/WRITE 加密校验,
  * 中央端必须先完成配对/加密,再写 RX、订阅 TX 通知。
+ *
+ * 这里保存的是 **AI Passport 对讲机这一台设备**的字面值（唯一来源，避免与固件头文件漂移）；
+ * 扫描/连接/订阅等流程不要直接回这些常量，而是读 [DeviceProfiles.PASSPORT] 这个
+ * [DeviceProfile]——以后接入其它品牌时，只需新增档案，流程代码不动。
  */
 object BleNus {
     /** 服务 UUID:6e400001-b5a3-f393-e0a9-e50e24dcca9e */

@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- 重构：把 BLE 设备接入参数收进「设备档案」，为以后接入别的品牌做准备（**行为不变**）。
+  - 新增 `ble/DeviceProfile.kt`（档案数据类：服务/RX/TX/CCCD UUID、广播名前缀、请求 MTU、配对方式、
+    帧格式、音频参数、设备能力）与 `ble/DeviceProfiles.kt`（档案目录：AI Passport 档案 + `byId`/`detect`）。
+  - `BleCentral` 不再直接读 `BleNus` 常量，而是读 `profile`（当前 = `DeviceProfiles.default` = AI Passport 档案）：
+    扫描过滤、名字二次过滤、服务/特征/CCCD 查找、请求 MTU 全部走档案字段。
+  - `BleNus` 保留为**字面值唯一来源**（仍与固件 `voice_bridge_ble.h` 逐字对齐），由档案引用它，
+    避免两处各写一份而漂移；档案文件顶部写明新增品牌的做法（加一个档案，必要时再补该品牌的帧编解码器，
+    扫描/连接/音频流程一行不改）。
+  - 新增 `DeviceProfileTest`（7 个用例）：断言档案与重构前字面值逐一相同（回归防线）、名字匹配仍是
+    大小写敏感前缀匹配、`detect`/`byId` 行为，以及档案自身字段自洽（MTU/采样率/帧长/文本上限为正、前缀非空）。
+
 ## 0.1.2
 
 - 新增应用图标：以 AI Passport 设备外观为主体、屏幕里是 OpenClaw 的红色吉祥物；自适应图标（前景按 72dp 安全区缩放，圆形/圆角遮罩下主体完整）、圆形图标与各密度 PNG 一应俱全，并接上 `AndroidManifest` 的 `icon`/`roundIcon`（此前用的是系统默认图标）。

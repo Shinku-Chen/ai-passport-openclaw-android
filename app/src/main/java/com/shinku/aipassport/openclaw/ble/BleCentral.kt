@@ -118,19 +118,27 @@ class BleCentral(
         prefs.edit().putString(KEY_LAST_DEVICE, addr).apply()
     }
 
+    /**
+     * 当前设备档案（UUID / 广播名前缀 / MTU / 配对方式 / 帧格式 / 音频参数）。
+     *
+     * 取 [DeviceProfiles.default]（目前等于唯一的 AI Passport 档案），行为与重构前一致；
+     * 以后支持多设备时改为“按扫描结果 / 用户选择”切换该属性即可，扫描与连接逻辑不用改。
+     */
+    private val profile: DeviceProfile = DeviceProfiles.default
+
     private val scanSettings = ScanSettings.Builder()
         .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
         .build()
     private val scanFilter = ScanFilter.Builder()
-        .setServiceUuid(ParcelUuid(BleNus.SERVICE_UUID))
+        .setServiceUuid(ParcelUuid(profile.serviceUuid))
         .build()
 
     private val scanCallback = object : ScanCallback() {
         override fun onScanResult(callbackType: Int, result: ScanResult) {
             val device = result.device ?: return
             val name = result.scanRecord?.deviceName ?: device.name
-            // 兜底:即便广播过滤失效,也按名字前缀再过滤一次
-            if (name?.startsWith(BleNus.DEVICE_NAME_PREFIX) != true) return
+            // 兜底:即便广播过滤失效,也按名字前缀再过滤一次(前缀与大小写敏感规则来自设备档案)
+            if (!profile.matchesName(name)) return
             Log.i(tag, "发现设备 ${device.address} $name")
             alreadyStartedAttempts = 0   // 扫到了:重置 code=1 计数
             stopScan()
@@ -245,7 +253,7 @@ class BleCentral(
             descriptor: BluetoothGattDescriptor,
             status: Int,
         ) {
-            if (descriptor.characteristic.uuid == BleNus.TX_UUID && status == BluetoothGatt.GATT_SUCCESS) {
+            if (descriptor.characteristic.uuid == profile.txUuid && status == BluetoothGatt.GATT_SUCCESS) {
                 Log.i(tag, "TX 已订阅")
                 listener.onReady()
             } else if (status != BluetoothGatt.GATT_SUCCESS) {
@@ -419,8 +427,8 @@ class BleCentral(
             callFailRetries = 0
         }
         val g = gatt ?: run { currentWrite = null; return }
-        val service = g.getService(BleNus.SERVICE_UUID) ?: run { currentWrite = null; return }
-        val rx = service.getCharacteristic(BleNus.RX_UUID) ?: run { currentWrite = null; return }
+        val service = g.getService(profile.serviceUuid) ?: run { currentWrite = null; return }
+        val rx = service.getCharacteristic(profile.rxUuid) ?: run { currentWrite = null; return }
         val frame = currentWrite ?: return
         if (currentOffset >= frame.size) {
             Log.i(tag, "writeBytes 逻辑帧完成 字节=${frame.size}")
@@ -509,7 +517,7 @@ class BleCentral(
         // 先停掉可能残留的扫描:否则 Android 会回 SCAN_FAILED_ALREADY_STARTED(code=1),
         // 旧实现就是在这里自锁的(rescan() 直接 startScan,上一次一直没被停)。
         stopScan()
-        Log.i(tag, "开始扫描 ${BleNus.DEVICE_NAME_PREFIX}*")
+        Log.i(tag, "开始扫描 ${profile.namePrefixes.joinToString("/")}*")
         try {
             s.startScan(listOf(scanFilter), scanSettings, scanCallback)
         } catch (e: Exception) {
@@ -635,9 +643,9 @@ class BleCentral(
     }
 
     private fun requestMtuAndSubscribe(g: BluetoothGatt) {
-        val service = g.getService(BleNus.SERVICE_UUID)
-        val tx = service?.getCharacteristic(BleNus.TX_UUID)
-        val rx = service?.getCharacteristic(BleNus.RX_UUID)
+        val service = g.getService(profile.serviceUuid)
+        val tx = service?.getCharacteristic(profile.txUuid)
+        val rx = service?.getCharacteristic(profile.rxUuid)
         if (service == null || tx == null || rx == null) {
             listener.onError("未找到 NUS 服务/特征")
             g.disconnect()
@@ -645,12 +653,12 @@ class BleCentral(
         }
         try {
             @Suppress("DEPRECATION")
-            g.requestMtu(BleNus.REQUEST_MTU)
+            g.requestMtu(profile.requestMtu)
         } catch (e: Exception) {
             Log.w(tag, "requestMtu 失败:${e.message}")
         }
         g.setCharacteristicNotification(tx, true)
-        val cccd = tx.getDescriptor(BleNus.CCCD_UUID)
+        val cccd = tx.getDescriptor(profile.cccdUuid)
         if (cccd == null) {
             listener.onError("未找到 CCCD")
             return
