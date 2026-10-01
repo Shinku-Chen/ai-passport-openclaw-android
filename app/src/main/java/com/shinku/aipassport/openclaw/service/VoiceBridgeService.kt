@@ -296,8 +296,17 @@ class VoiceBridgeService : Service() {
             pairingDialogContext = { AppActivity.current() },
             listener = object : BleCentral.Listener {
                 override fun onConnecting() = publishLinkStatus(LINK_CONNECTING, "正在连接设备…")
-                override fun onConnected() = publishLinkStatus(LINK_CONNECTED, "已连接,等待加密")
-                override fun onEncrypted() = publishLinkStatus(LINK_ENCRYPTED, "已加密")
+                override fun onConnected() {
+                    // 记录“已连接但尚未加密”的起点:手机刚解除配对、设备侧还留着旧绑定时，
+                    // 没有任何一方会再发起 createBond，靠这个时间戳让看门狗重建连接。
+                    waitingEncryptSinceMs = System.currentTimeMillis()
+                    publishLinkStatus(LINK_CONNECTED, "已连接,等待加密")
+                }
+                override fun onEncrypted() {
+                    waitingEncryptSinceMs = 0L
+                    encryptStuckCycles = 0
+                    publishLinkStatus(LINK_ENCRYPTED, "已加密")
+                }
                 override fun onReady() {
                     publishLinkStatus(LINK_READY, "已就绪,长按设备 OK 说话")
                     // 识别通道常驻预热:链路一就绪就先建一条小智热连接(后台静默、不影响 UI),
@@ -444,6 +453,17 @@ class VoiceBridgeService : Service() {
     @Volatile
     private var userDisconnected = false
 
+    /** 「已连接但尚未加密」的起点时刻(0 = 不处于该状态):配对卡住时靠它识别并重建连接。 */
+    @Volatile
+    private var waitingEncryptSinceMs = 0L
+
+    /** 加密看门狗阀值:超过它仍未加密就重建连接(真机：解除配对后用旧连接重配会永远停在「等待加密」)。 */
+    private val encryptTimeoutMs = 12_000L
+
+    /** 连续多少次看门狗重建后仍未加密:达到上限就改成给用户可操作的提示。 */
+    @Volatile
+    private var encryptStuckCycles = 0
+
     private fun startConnectionMonitor() {
         monitorJob?.cancel()
         monitorJob = scope.launch {
@@ -460,6 +480,36 @@ class VoiceBridgeService : Service() {
                         }
                     } catch (e: Exception) {
                         Log.e(TAG, "连接监控异常", e)
+                    }
+                    try {
+                        // 加密看门狗:连上了却一直不加密。
+                        // 典型场景:手机侧解除了配对，但连接还在(设备侧还留着旧绑定) ——
+                        // 两边都不会再发起 createBond，界面就永远停在「等待加密」。
+                        // 处理:重建一次连接，让 ensureEncryption() 重新走一遍(该弹配对码时就弹)。
+                        val stuckMs = if (waitingEncryptSinceMs > 0L) {
+                            System.currentTimeMillis() - waitingEncryptSinceMs
+                        } else {
+                            0L
+                        }
+                        if (!userDisconnected && ble.isConnected() && stuckMs > encryptTimeoutMs) {
+                            encryptStuckCycles++
+                            if (encryptStuckCycles >= 3) {
+                                // 重建两次仍未加密:多半是手机侧与设备侧的配对状态对不上(典型：手机刚从
+                                // 系统蓝牙里取消了配对),重建连接解决不了 —— 把该做的事直接告诉用户。
+                                Log.w(TAG, "连接监控: 连续 ${encryptStuckCycles} 次重建仍未加密,提示用户处理配对")
+                                publishLinkStatus(
+                                    LINK_DISCONNECTED,
+                                    "配对卡住了：请到系统蓝牙里取消配对本设备，再回设备页点「扫描并连接」",
+                                )
+                            } else {
+                                Log.w(TAG, "连接监控: 已连接 ${stuckMs}ms 仍未加密,重建连接以重新配对")
+                                publishLinkStatus(LINK_CONNECTED, "等待加密超时,重新建立连接…")
+                            }
+                            waitingEncryptSinceMs = System.currentTimeMillis()   // 下一轮再检查
+                            ble.rescan()
+                        }
+                    } catch (e: Exception) {
+                        Log.e(TAG, "加密看门狗异常", e)
                     }
                     try {
                         // 识别通道保活:热连接会被服务端/中间设备静默回收(真机实测 `小智 WS 失败 code=null`,
