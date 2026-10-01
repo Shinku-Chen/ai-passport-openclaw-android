@@ -561,6 +561,10 @@ class VoiceBridgeService : Service() {
                 reportedGatewayError = null
                 publishGatewayStatus("网关已恢复连接")
             }
+            // 真机反馈「网关就绪状态刷新不及时」：上面只在“曾经报过错”时才播报，
+            // 首次由 connecting → ready 时什么都不发，设备屏就停在「网关 连接中」。
+            // 这里每轮（6 秒）同步一次，重复内容由 publishGatewayState 的 3 秒去抖拦掉。
+            syncGatewayStateToDevice(force = false)
             return
         }
         // 还没有失败原因(如尚未首次对话)时不播报,避免误报「网关断开」
@@ -710,14 +714,16 @@ class VoiceBridgeService : Service() {
 
     /**
      * 首次同步用:不带状态文案,直接按适配器当前情况推导 —— 否则设备会一直显示「未知」。
+     *
+     * @param force true = 忽略去抖立即下发;监控循环里用 false,靠 3 秒去抖变成“最多每轮一次”的心跳式同步。
      */
-    private fun syncGatewayStateToDevice() {
+    private fun syncGatewayStateToDevice(force: Boolean = true) {
         val (state, detail) = if (::gateway.isInitialized && gateway.isReady()) {
             "ready" to ""
         } else {
             "connecting" to (if (::gateway.isInitialized) gateway.lastError ?: "正在连接网关…" else "正在连接网关…")
         }
-        publishGatewayState(state, detail, force = true)
+        publishGatewayState(state, detail, force = force)
     }
 
     private fun publishGatewayState(state: String, detail: String, force: Boolean) {
