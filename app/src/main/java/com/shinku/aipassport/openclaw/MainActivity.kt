@@ -29,7 +29,6 @@ import com.shinku.aipassport.openclaw.gateway.GatewayFactory
 import com.shinku.aipassport.openclaw.gateway.GatewaySettings
 import com.shinku.aipassport.openclaw.service.VoiceBridgeService
 import com.shinku.aipassport.openclaw.ui.ChatFragment
-import com.shinku.aipassport.openclaw.ui.DevicesFragment
 import com.shinku.aipassport.openclaw.ui.OverviewFragment
 import com.shinku.aipassport.openclaw.ui.SettingsFragment
 import kotlinx.coroutines.CoroutineScope
@@ -39,7 +38,7 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
 
 /**
- * 主界面:顶部网关连接状态卡片 + 4 个 Tab(对话/概览/设备/设置)。
+ * 主界面:顶部网关连接状态卡片 + 3 个 Tab(对话/概览/设置;设备管理已并入设置页)。
  *
  * 本地 OpenClaw 网关控制台 + 设备管理 + 通知同步 —— 对标原型 App 的本地子集,
  * 不包含登录/账号/订阅/订单/云智能灯效(那是云套餐业务,本端不依赖)。
@@ -212,7 +211,6 @@ class MainActivity : AppCompatActivity() {
     private fun createFragment(position: Int): Fragment = when (position) {
         0 -> ChatFragment()
         1 -> OverviewFragment()
-        2 -> DevicesFragment()
         else -> SettingsFragment()
     }
 

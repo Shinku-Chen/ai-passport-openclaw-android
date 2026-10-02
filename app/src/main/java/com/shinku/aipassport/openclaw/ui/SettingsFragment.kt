@@ -123,7 +123,7 @@ class SettingsFragment : Fragment() {
     // ---- 二级菜单(网关 / 对话 / 应用 / 高级)----
 
     /** 当前展开的 section。 */
-    private enum class Section { GATEWAY, CHAT, APP, ADVANCED }
+    private enum class Section { GATEWAY, DEVICE, CHAT, APP, ADVANCED }
 
     /** 默认展开的 section(null = 一级菜单)。 */
     private var currentSection: Section? = null
@@ -137,6 +137,7 @@ class SettingsFragment : Fragment() {
      */
     private fun setupSections() {
         binding.btnMenuGateway.setOnClickListener { showSection(Section.GATEWAY, "网关设置") }
+        binding.btnMenuDevice.setOnClickListener { showSection(Section.DEVICE, "设备管理") }
         binding.btnMenuChat.setOnClickListener { showSection(Section.CHAT, "对话设置") }
         binding.btnMenuApp.setOnClickListener { showSection(Section.APP, "应用设置") }
         binding.btnMenuAdvanced.setOnClickListener { showSection(Section.ADVANCED, "高级") }
@@ -169,9 +170,11 @@ class SettingsFragment : Fragment() {
         }
         val sections = mapOf(
             Section.GATEWAY to listOf(
-                binding.titleGateway, binding.spinnerType, binding.textCleartextHint,
+                binding.titleGateway, binding.labelGatewayType, binding.spinnerType,
+                binding.textCleartextHint,
                 binding.groupOpenclaw, binding.groupHermes, binding.groupOpenai, binding.btnSave,
             ),
+            Section.DEVICE to listOf(binding.groupDevice),
             Section.CHAT to listOf(
                 binding.titleVoicePrompt, binding.inputVoicePromptSuffix,
                 binding.checkShowRawStream, binding.checkTtsEnabled, binding.ttsHint,

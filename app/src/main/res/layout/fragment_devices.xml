@@ -1,43 +1,51 @@
 <?xml version="1.0" encoding="utf-8"?>
 <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
-    android:orientation="vertical"
-    android:background="#0F1220">
-
-    <TextView
-        android:id="@+id/devicesTitle"
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:text="设备管理"
-        android:textSize="18sp"
-        android:textStyle="bold"
-        android:textColor="#FFFFFF"
-        android:padding="16dp" />
+    android:orientation="vertical">
 
     <Button
         android:id="@+id/btnScan"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
         android:text="扫描并连接设备"
-        android:layout_marginHorizontal="12dp"
-        android:layout_marginBottom="4dp" />
+        android:layout_marginHorizontal="0dp"
+        android:layout_marginBottom="4dp" 
+        app:cornerRadius="12dp"
+        android:textColor="@color/ink"
+        android:textStyle="bold"
+        android:paddingTop="12dp"
+        android:paddingBottom="12dp"
+    />
 
     <Button
         android:id="@+id/btnDisconnect"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
         android:text="断开设备"
-        android:layout_marginHorizontal="12dp"
-        android:layout_marginBottom="8dp" />
+        android:layout_marginHorizontal="0dp"
+        android:layout_marginBottom="8dp" 
+        app:backgroundTint="@android:color/transparent"
+        app:cornerRadius="12dp"
+        app:strokeColor="@color/card_stroke"
+        app:strokeWidth="1dp"
+        android:textColor="@color/accent"
+    />
 
     <Button
         android:id="@+id/btnForget"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
         android:text="忘记设备 / 重新配对"
-        android:layout_marginHorizontal="12dp"
-        android:layout_marginBottom="8dp" />
+        android:layout_marginHorizontal="0dp"
+        android:layout_marginBottom="8dp" 
+        app:backgroundTint="@android:color/transparent"
+        app:cornerRadius="12dp"
+        app:strokeColor="@color/warn_stroke"
+        app:strokeWidth="1dp"
+        android:textColor="@color/warn"
+    />
 
     <TextView
         android:id="@+id/deviceStatusText"

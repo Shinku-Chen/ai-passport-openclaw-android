@@ -1,0 +1,18 @@
+<resources>
+    <!--
+        设置页调色板。数值与页面里既有的硬编码保持一致(#0F1220 底 / #2A2A3E 输入框 / #9E9E9E 次文字),
+        新改动统一走这里的引用,避免再散落新的十六进制。
+    -->
+    <color name="page_bg">#0F1220</color>
+    <color name="card_bg">#171B2E</color>
+    <color name="card_stroke">#2A2A3E</color>
+    <color name="row_bg">#1B2035</color>
+    <color name="row_ripple">#33FFFFFF</color>
+    <color name="ink">#FFFFFF</color>
+    <color name="ink_body">#DDDDDD</color>
+    <color name="ink_dim">#9E9E9E</color>
+    <color name="accent">#4FC3F7</color>
+    <color name="primary">#1E88E5</color>
+    <color name="warn">#FFB74D</color>
+    <color name="warn_stroke">#66FFB74D</color>
+</resources>

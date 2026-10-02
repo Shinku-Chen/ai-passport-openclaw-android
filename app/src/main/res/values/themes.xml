@@ -1,3 +1,32 @@
 <resources>
-    <style name="Theme.VoiceBridge" parent="Theme.Material3.DayNight.NoActionBar" />
+    <!--
+        统一主题:M3 默认主色是紫色,和这个 App 的深蓝调完全不搭(真机截图里按钮/刷新/开关全是紫的)。
+        这里把主色系改成蓝(#1E88E5 / #4FC3F7),底色改成页面那套深蓝,其余沿用 M3 默认。
+        只改颜色,不动组件形状与字号。
+    -->
+    <style name="Theme.VoiceBridge" parent="Theme.Material3.DayNight.NoActionBar">
+        <item name="colorPrimary">@color/primary</item>
+        <item name="colorOnPrimary">@color/ink</item>
+        <item name="colorPrimaryContainer">@color/card_bg</item>
+        <item name="colorOnPrimaryContainer">@color/accent</item>
+
+        <item name="colorSecondary">@color/accent</item>
+        <item name="colorOnSecondary">@color/page_bg</item>
+        <item name="colorSecondaryContainer">@color/card_bg</item>
+        <item name="colorOnSecondaryContainer">@color/accent</item>
+
+        <item name="colorTertiary">@color/accent</item>
+        <item name="colorOnTertiary">@color/page_bg</item>
+
+        <item name="android:colorBackground">@color/page_bg</item>
+        <item name="colorOnBackground">@color/ink</item>
+        <item name="colorSurface">@color/card_bg</item>
+        <item name="colorOnSurface">@color/ink</item>
+        <item name="colorSurfaceVariant">@color/row_bg</item>
+        <item name="colorOnSurfaceVariant">@color/ink_dim</item>
+        <item name="colorOutline">@color/card_stroke</item>
+        <item name="colorOutlineVariant">@color/card_stroke</item>
+        <item name="colorError">#EF5350</item>
+        <item name="colorOnError">@color/ink</item>
+    </style>
 </resources>
