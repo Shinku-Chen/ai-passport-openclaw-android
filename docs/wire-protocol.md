@@ -93,6 +93,18 @@ App：上屏之后再走 TTS 下行（0x06，见第 6 节）：{"ev":"tts_start"
 - 长文本按 2048B/帧分片，**绝不切在多字节 UTF-8 序列中间**（回退到字符边界）。
 - 使用 `WRITE_TYPE_DEFAULT`（with-response）发送；写失败 → 短延时重试一次 → 仍失败则在对话列表标注"未送达"。
 
+### 5.1 设备屏字库限制（写文案必须遵守）
+
+设备屏用**整张编进镜像的位图字库**画字，没有字体回退：字库里没有的字符会画成方块（LVGL 的 missing-glyph 占位框）。
+
+- 字库 = 固件 `assets/fonts/intercom_cjk_16.c`（`lv_font_intercom_cjk_16`，`tools/intercom_font.py` 生成）
+  = **GB2312 全量（6763 汉字 + 682 符号）+ ASCII**，共 **7540 个码位**；
+- 所以 `TEXT` 气泡与 `gateway.detail`（设备屏底部提示行）里的文字都受此限制；
+- 常见踩坑：`↔`(U+2194)、`—`(U+2014)、`·`(U+00B7)、`✓`、emoji **都不在 GB2312**；可用替代见 `protocol/DeviceFont` 的表；
+- App 侧判定用 `protocol/DeviceFont.canRender()`（JDK/Android 的 `GB2312` 字符集与固件字库的码位清单**逐位一致**），
+  `DeviceFontTest` / `VersionCompatTest` / `GatewayStatusTextTest` 已把 App 自己的设备文案锁住；
+- 网关/模型给出的**自由文本**（STT 原文、AI 回复）不在此列，仍可能带方块 —— 要不要在边界做降级（丢字或替换）是待定项。
+
 ## 6. TTS 下行（手机合成 → 设备播放）
 
 网关回复由**手机侧合成**成音频、经 `TTS_OPUS`(0x06) 推给设备播放；设备自己**不**调语音服务

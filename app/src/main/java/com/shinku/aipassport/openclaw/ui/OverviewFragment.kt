@@ -33,7 +33,7 @@ import kotlinx.coroutines.launch
  * **错误隔离**(修 bug「Hermes 切换为 openclaw,网关不可达,重启 app 后正常」):
  * 本页八个分区全是**辅助查询**(`rpcQuery` 默认 `critical = false`)—— 失败只改本分区的文案,
  * **绝不写网关的 `lastError`、绝不影响网关状态**(否则一次「这台网关没有 usage 方法」会被
- * 「网关配置已重载,正在重连… — unknown method: usage」拼出来,看着就像网关不可达)。
+ * 「网关配置已重载,正在重连… ｜ unknown method: usage」拼出来,看着就像网关不可达)。
  * 网关不支持 / 无权限时显示友好文案并**隐藏卡片**,且在本次会话内记住(见 [QuerySupport])。
  */
 class OverviewFragment : Fragment() {

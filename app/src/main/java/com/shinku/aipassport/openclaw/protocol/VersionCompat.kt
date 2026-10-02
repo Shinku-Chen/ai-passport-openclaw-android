@@ -12,6 +12,11 @@ package com.shinku.aipassport.openclaw.protocol
  * 配对握手时双方互报版本（设备 `hello` 带 `fw` / `proto`，App 的 `hello` 带 `app`），
  * 只有大版本不同才在**两边**提示 —— 且**只提示、不阻断**：旧版本仍能对话。
  *
+ * ⚠ 提示文案会被 [com.shinku.aipassport.openclaw.pipeline.VoicePipeline] **原样下发到设备屏**
+ * （`sendText` 的 TEXT 气泡），所以只能用设备字库有的字符（GB2312 + ASCII，见 [DeviceFont]）。
+ * 历史坑：原本文案写成 `（1.12 ↔ 1.11）`，`↔`(U+2194) 不在 GB2312 里 —— 设备屏上就是
+ * `1.12 ▯ 1.11` 两个方块（真机反馈「版本号之间是方块乱码」），现在改用 `≠`(U+2260，GB2312 里有)。
+ *
  * 历史坑：这里原来是**整串相等**比较，于是 App 一发小版本（1.11.1）就会被判成不匹配，
  * 设备屏还会弹一条假告警 —— 所以比较必须走 [major]。
  */
@@ -69,7 +74,8 @@ object VersionCompat {
         if (fw.isEmpty()) return null
         val app = appVersion.trim()
         if (major(fw) == major(app)) return null
-        return "固件 $fw 与 App $app 大版本不一致（${major(fw)} ↔ ${major(app)}），" +
+        // 提示会原样上设备屏：只能用设备字库有的字符，改动前先过 DeviceFont.canRender 的单测。
+        return "固件 $fw 与 App $app 大版本不一致（${major(fw)} ≠ ${major(app)}），" +
             "请把固件与 App 更新到同一大版本"
     }
 

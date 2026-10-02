@@ -10,7 +10,7 @@ import org.junit.Test
  *
  * 真机 bug(用户原话:「Hermes 切换为 openclaw,网关不可达,重启 app 后正常」)的根因:
  * 概览页对一台**不认识 `usage`** 的网关发了一次辅助查询 → 错误被写进网关的 `lastError`
- * → 随后被「网关配置已重载,正在重连… — unknown method: usage」拼出来,看起来就是网关不可达
+ * → 随后被「网关配置已重载,正在重连… ｜ unknown method: usage」拼出来,看起来就是网关不可达
  * (连接其实一直正常,重启 App 后那条旧文案没了,所以「重启后正常」)。
  *
  * 覆盖:

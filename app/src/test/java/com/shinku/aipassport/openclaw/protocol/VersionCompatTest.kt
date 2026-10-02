@@ -30,6 +30,28 @@ class VersionCompatTest {
         assertTrue("要告诉用户怎么做", notice.contains("更新"))
     }
 
+    /**
+     * 提示会【原样下发到设备屏】（VoicePipeline 的 TEXT 气泡），只能用设备字库有的字符。
+     *
+     * 真机 bug：「版本号之间是方块乱码」—— 原文案写 `（1.12 ↔ 1.11）`，`↔`(U+2194)
+     * 不在设备字库（GB2312 + ASCII）里，设备屏上就是 `1.12 ▯ 1.11`。
+     */
+    @Test
+    fun notices_are_renderable_on_the_device_screen() {
+        val mismatch = VersionCompat.check("1.12", "1.11", VersionCompat.MIN_PROTO_VERSION)!!
+        assertNull(
+            "设备屏显示不了的字符: ${DeviceFont.firstUnrenderable(mismatch)}",
+            DeviceFont.firstUnrenderable(mismatch),
+        )
+        assertTrue("大版本对比要留着: $mismatch", mismatch.contains("1.11 ≠ 1.12"))
+
+        val oldProto = VersionCompat.check("1.12", "1.12", 0)!!
+        assertNull(
+            "设备屏显示不了的字符: ${DeviceFont.firstUnrenderable(oldProto)}",
+            DeviceFont.firstUnrenderable(oldProto),
+        )
+    }
+
     @Test
     fun missing_firmware_version_stays_quiet() {
         assertNull("老固件不上报 fw 时不该猜", VersionCompat.check("1.9.0", null, null))

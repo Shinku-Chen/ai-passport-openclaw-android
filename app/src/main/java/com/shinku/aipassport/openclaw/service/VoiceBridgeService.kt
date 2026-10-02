@@ -596,7 +596,7 @@ class VoiceBridgeService : Service() {
                 // 重载/重连**开始**:先清掉上一次的错误,并把监控的「已播报原因」置空。
                 // 于是下面拼出的状态文案只可能是【本次尝试】的原因 —— 不会再把上一次的旧原因
                 // (真机案例:概览页问了一个本网关没有的方法 → `unknown method: usage`)
-                // 拼成「网关配置已重载,正在重连… — unknown method: usage」从而看着像「网关不可达」。
+                // 拼成「网关配置已重载,正在重连… ｜ unknown method: usage」从而看着像「网关不可达」。
                 fresh.clearLastError()
                 reportedGatewayError = null
                 if (fresh.connect()) {
@@ -604,7 +604,9 @@ class VoiceBridgeService : Service() {
                     publishGatewayStatus("网关配置已重载,连接就绪")
                 } else {
                     val reason = fresh.lastError?.takeIf { it.isNotBlank() }
-                    publishGatewayStatus("网关配置已重载,正在重连…" + (reason?.let { " — $it" } ?: ""))
+                    // 分隔符/文案见 GatewayStatusText：这条会随网关状态下发到设备屏底部提示行，
+                    // 只能用设备字库有的字符（GB2312 + ASCII，长破折号 — 在设备上是个方块）。
+                    publishGatewayStatus(GatewayStatusText.reloadedReconnecting(reason))
                 }
             } catch (e: Exception) {
                 Log.w(TAG, "重载后连接网关失败: ${e.message}")
@@ -822,7 +824,7 @@ class VoiceBridgeService : Service() {
         if (isUnknownMethod(null, reason)) return
         if (reason != reportedGatewayError) {
             reportedGatewayError = reason
-            publishGatewayStatus("$reason — 正在重连…")
+            publishGatewayStatus(GatewayStatusText.reconnecting(reason))
         }
         // 未就绪时也保持同步:重连原因/详情会变，设备屏不能停在旧文案上（同一内容由 3 秒去抖拦掉）。
         syncGatewayStateToDevice(force = false)
