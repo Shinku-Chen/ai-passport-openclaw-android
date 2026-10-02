@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- 重构（无行为变化）：小智 WS 会话层从 `stt/XiaozhiStt.kt` 抽为 `stt/XiaozhiSession.kt`（771 行 → 适配器 73 行 + 会话 828 行），并把 `stt`/`llm`/`tts` 三类消息分流为回调 —— 为「小智 AI 网关」（`docs/design/xiaozhi-ai-gateway.md`）打地基；STT 路径、日志文案与超时数值逐条核对未变，329 项单测全绿。
+
 - 文档：新设计文档 `docs/design/xiaozhi-ai-gateway.md`（小智 AI 网关：把现有小智会话从「只做 STT」延长为 STT+LLM+TTS，TTS 音频原样转发给设备播放；纯 App 改动，固件不动）。
 
 ## 1.13

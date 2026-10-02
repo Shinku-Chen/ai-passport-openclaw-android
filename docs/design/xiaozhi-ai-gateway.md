@@ -21,7 +21,7 @@
 
 | 位置 | 现有职责 | 与本设计的关系 |
 | --- | --- | --- |
-| `stt/XiaozhiStt.kt`（771 行） | **自己维护小智 WS 会话**：hello 握手、上行 opus（16 kHz/60 ms 单声道）、`{"type":"stt"}` 只取 `text` 交网关、预热（`WarmLink`）、断线重连重放（`TurnRecovery`） | 会话要实现 LLM/TTS 部分 → **抽出去共用** |
+| `stt/XiaozhiStt.kt`（73 行，薄适配器）+ `stt/XiaozhiSession.kt`（828 行，**已抽出的 WS 会话层**） | 会话层负责 hello 握手、上行 opus（16 kHz/60 ms 单声道）、预热（`WarmLink`）、断线重连重放（`TurnRecovery`），并把 `stt`/`llm`/`tts` 三类消息分流；适配器只保留「`{"type":"stt"}` → 文本」 | ✅ 已抽离（2026-10-03）；下一步在会话层之上实现 LLM/TTS |
 | `stt/XiaozhiActivator.kt`（208 行） | 官方 OTA → 手持绑定码 → `activate` 轮询 → 授权（`lancelot` + HMAC） | 直接复用，激活状态是「小智 AI」能否可用的前提 |
 | `stt/XiaozhiSettings.kt` | 小智开关（当前恒为 true） | 扩展为「小智 AI」的配置入口 |
 | `pipeline/VoicePipeline.kt` | 一轮的编排：`turn_start` → 音频喂 STT → `endTurn()` 出文本 → 网关 `chatMulti` → 上屏（`sendText`）→ 设备朗读（`DeviceTtsSession`） | 新增「小智直连」模式的分支 |
@@ -69,7 +69,7 @@
 
 ### 4.1 会话抽离
 
-把 WS 连接、hello、opus 编码、预热、重连重放从 `XiaozhiStt` 抽到 `stt/XiaozhiSession.kt`，
+（✅ 已完成）WS 连接、hello、opus 编码、预热、重连重放已从 `XiaozhiStt` 抽到 `stt/XiaozhiSession.kt`，
 `XiaozhiStt` 退化为「只负责 `stt` 事件 → 文本」的适配器（现有行为与日志保持不变）。
 `XiaozhiSession` 暴露三组回调：`onStt(text)` / `onLlm(text)` / `onTtsState(state, text)` / `onTtsAudio(opus, rateKhz, frameMs)`。
 
