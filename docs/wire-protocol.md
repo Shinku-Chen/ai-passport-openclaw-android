@@ -103,7 +103,7 @@ App：上屏之后再走 TTS 下行（0x06，见第 6 节）：{"ev":"tts_start"
 - 常见踩坑：`↔`(U+2194)、`—`(U+2014)、`·`(U+00B7)、`✓`、emoji **都不在 GB2312**；可用替代见 `protocol/DeviceFont` 的表；
 - App 侧判定用 `protocol/DeviceFont.canRender()`（JDK/Android 的 `GB2312` 字符集与固件字库的码位清单**逐位一致**），
   `DeviceFontTest` / `VersionCompatTest` / `GatewayStatusTextTest` 已把 App 自己的设备文案锁住；
-- 网关/模型给出的**自由文本**（STT 原文、AI 回复）不在此列，仍可能带方块 —— 要不要在边界做降级（丢字或替换）是待定项。
+- 网关/模型给出的**自由文本**（STT 原文、AI 回复）不在此列，缺字就显示方块。**已定（2026-10-02）：不做边界降级** —— 不丢字、不替换成 `?`，保留原文：宁可看到占位框，也不要静默改内容。
 
 ## 6. TTS 下行（手机合成 → 设备播放）
 
