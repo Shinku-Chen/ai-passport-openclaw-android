@@ -35,9 +35,12 @@ android {
         applicationId = "com.shinku.aipassport.openclaw"
         minSdk = 26          // BLE 前台 Service + 后台扫描需要
         targetSdk = 35
-        versionCode = 8
+        versionCode = 9
         // 版本号与固件/社区保持一致(硬约定,两段式):固件 tag vX.Y-intercom ↔ App versionName X.Y。
-        // 1.10 = 对应固件 v1.10-intercom(固件/App 互报版本 + 不一致双向提示)。
+        // 1.12 = 对应固件 v1.12-intercom(固件/App 互报版本 + 不一致双向提示)。
+        // versionCode 8 → 9:重发 1.12(App 侧修 bug:设备屏方块提示)。
+        // ⚠ 只提 versionCode 不提 versionName,所以已装 1.12 的设备【不会】收到「有新版本」提醒
+        // (更新提醒按 versionName 比对),需要在 Release 页手动下载重装。
         versionName = "1.12"
     }
 
