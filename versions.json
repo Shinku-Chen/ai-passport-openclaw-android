@@ -4,7 +4,7 @@
   "app": {
     "version": "1.12",
     "url": "https://github.com/Shinku-Chen/ai-passport-openclaw-android/releases/latest",
-    "notes": "版本更新提醒；设备卡显示固件版本；应用设置常显当前版本"
+    "notes": "版本更新提醒；设备卡显示固件版本；应用设置常显当前版本；修设备屏方块提示（版本不匹配文案、重连提示分隔符）"
   },
   "firmware": {
     "version": "1.12",
