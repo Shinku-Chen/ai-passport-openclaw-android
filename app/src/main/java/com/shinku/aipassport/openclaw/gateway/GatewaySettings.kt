@@ -137,11 +137,12 @@ class GatewaySettings(context: Context) {
     /**
      * 是否把网关回复合成成音频并**下发设备播放**(设备朗读回复)。
      *
-     * 默认 **false(关)**:M1 先把通路与设置项做齐,等真机验收(固件 TTS 播放通路就绪)后再考虑默认开。
+     * 默认 **true(开)**:固件 TTS 播放通路已在真机验收(播放栈/LVGL 池两个崩溃点已修),
+     * 因此新装即开;设备若不支持(`hello.caps` 无 `tts_opus`)由 App 回退手机朗读。
      * 与网关连接无关,因此设置页**切换即落盘**(不走「保存网关设置」的校验-落盘闸门,也不参与网关探活)。
      */
     var ttsEnabled: Boolean
-        get() = prefs.getBoolean(KEY_TTS_ENABLED, false)
+        get() = prefs.getBoolean(KEY_TTS_ENABLED, true)
         set(value) = prefs.edit().putBoolean(KEY_TTS_ENABLED, value).apply()
 
     /**

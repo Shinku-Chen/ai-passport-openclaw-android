@@ -101,6 +101,13 @@ class AndroidTtsEngine(private val context: Context) : DeviceTtsEngine {
     }
 
     /**
+     * 某个语言在本机引擎上的可用性(透传 [TextToSpeech.isLanguageAvailable])。
+     * 供「本机到底支不支持设备朗读」的探测使用(见 [TtsSupport]);引擎没起来时返回 null。
+     */
+    fun languageAvailability(locale: Locale): Int? =
+        tts?.let { engine -> runCatching { engine.isLanguageAvailable(locale) }.getOrNull() }
+
+    /**
      * 从引擎枚举出的音色里挑一个用于**设备朗读**:优先中文 + **离线** + 语音包已下载 + 质量高、延迟低
      * (策略见 [TtsVoiceChoice])。挑不到就保持 `setLanguage(zh)` 的结果(引擎默认),绝不硬塞英文音色。
      *

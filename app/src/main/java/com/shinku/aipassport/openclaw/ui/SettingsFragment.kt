@@ -28,6 +28,7 @@ import com.shinku.aipassport.openclaw.gateway.OpenClawConfig
 import com.shinku.aipassport.openclaw.service.KeepAliveState
 import com.shinku.aipassport.openclaw.service.VoiceBridgeService
 import com.shinku.aipassport.openclaw.stt.XiaozhiSettings
+import com.shinku.aipassport.openclaw.tts.TtsSupport
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -56,8 +57,8 @@ import kotlinx.coroutines.launch
  * 三个「与网关无关」的开关/下拉走**切换即落盘**(不参与网关校验):
  * 「App 显示完整回传流（调试）」。
  *
- * 设备朗读(下行 TTS)的设置项已移除(项目暂不考虑文字转语音);
- * `tts_enabled`/`tts_engine` 仍保留在 prefs(默认 false / android),代码作为休眠能力保留。
+ * 设备朗读(下行 TTS)默认开(`tts_enabled` 默认 true,固件播放通路已真机验收);
+ * `tts_engine` 保留在 prefs(默认 android),当前只有系统 TTS 一种实现。
  */
 class SettingsFragment : Fragment() {
 
@@ -323,10 +324,10 @@ class SettingsFragment : Fragment() {
             // 不用等第一条回复(也方便在没有网关时先确认 TTS 是否可用)。
             if (checked) context?.let { VoiceBridgeService.prewarmTts(it) }
         }
-
-        // 设备朗读(下行 TTS)的设置项已移除(项目暂不考虑文字转语音):
-        // prefs 里的 tts_enabled 保持默认 false,代码作为休眠能力保留。
-        // 注意:不要因为删掉开关就把 tts_enabled 改写成 true。
+        // 设备朗读默认开(GatewaySettings.ttsEnabled 默认 true):这里只回填一次,
+        // 用户手动关掉后 prefs 里就是 false,不会再被改写回 true。
+        // 手机自己都合不成语音时,这个开关没有任何意义:关掉并置灰(见 applyTtsAvailability)。
+        applyTtsAvailability()
 
         // Hermes
         binding.inputHermesHost.setText(settings.hermesHost)
@@ -373,6 +374,33 @@ class SettingsFragment : Fragment() {
      * 而实际后果很重：服务降级成普通后台服务，App 闲置满 60s 被系统停掉，设备直接用不了
      * （真机实测 60.379s 精确复现，见 ServiceGuard）。
      */
+    /**
+     * 「设备朗读(TTS)」开关的可用性门控。
+     *
+     * 用户要求:先检测手机是否支持语音合成,不支持就把开关关闭且不允许打开。
+     * 探测要构造一次系统 TTS 引擎(异步回调),因此先禁用开关避免这期间被点开;
+     * 结果只在页面还活着时回写(_binding 判空),不支持时同时把 tts_enabled 落盘成 false。
+     */
+    private fun applyTtsAvailability() {
+        val appContext = context?.applicationContext ?: return
+        val normalHint = binding.ttsHint.text
+        binding.checkTtsEnabled.isEnabled = false
+        scope.launch {
+            val reason = TtsSupport.unsupportedReason(appContext)
+            val b = _binding ?: return@launch
+            if (reason == null) {
+                b.checkTtsEnabled.isEnabled = true
+                b.ttsHint.text = normalHint
+                return@launch
+            }
+            if (settings.ttsEnabled) settings.ttsEnabled = false
+            b.checkTtsEnabled.isChecked = false
+            b.checkTtsEnabled.isEnabled = false
+            b.ttsHint.text = "\u26a0\ufe0f 本机不支持设备朗读：$reason。开关已关闭且不可打开。"
+            log("设备朗读不可用：$reason")
+        }
+    }
+
     private fun refreshKeepAliveWarning() {
         val keepAlive = KeepAliveState(requireContext())
         val denied = keepAlive.foregroundDenied
