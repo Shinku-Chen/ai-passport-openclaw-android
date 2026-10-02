@@ -20,6 +20,41 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
+ * [XiaozhiSession] 对「小智 AI 网关」暴露的**最小能力面**(见 `docs/design/xiaozhi-ai-gateway.md` §4.2)。
+ *
+ * 为什么单独抽接口:网关只用到会话的三件事 —— 挂一个 `llm` 正文观察者、确认会话可用、复用同一条热连接;
+ * 而 [XiaozhiSession] 是构造即持 OkHttp 客户端的 WS 会话层(连不了假服务器)。有了这个面,
+ * [com.shinku.aipassport.openclaw.gateway.XiaozhiGateway] 的 JVM 单测可以注入假会话,
+ * 覆盖「拿到 llm 正文 / 超时 / barge 打断」三条路径,不依赖网络与 Android。
+ */
+interface XiaozhiLlmSource {
+
+    /** 会话是否可用(有服务端地址);false 时网关立刻给可读原因,不空等一个超时。 */
+    val isAvailable: Boolean
+
+    /** 建立/维持常驻热连接([XiaozhiSession.prewarm]):与识别通道共用同一条 socket,幂等。 */
+    fun prewarm()
+
+    /** 热连接是否已握手可收发([XiaozhiSession.isWarmReady])。 */
+    fun isWarmReady(): Boolean
+
+    /**
+     * 挂上/替换 `llm` 正文观察者(会话层唯一的一条下行正文出口)。
+     *
+     * 与会话构造参数里的 `onLlm` 各自独立、互不覆盖:那一条留给直接构造会话的调用方。
+     */
+    fun setLlmObserver(observer: ((String) -> Unit)?)
+
+    /**
+     * 仅当当前观察者**仍是** [observer] 时摘掉它。
+     *
+     * 为什么不能盲摘:网关实例会被设置页保存后的重建替换,而旧实例的 `close()` 可能晚于
+     * 新实例挂观察者 —— 盲摘会把新实例的观察者一起摘掉,下一轮就永远等不到 `llm`。
+     */
+    fun clearLlmObserver(observer: (String) -> Unit)
+}
+
+/**
  * 小智(xiaozhi.me)云端的 **WebSocket 会话层** —— 连接/握手/上行音频/预热/重连重放,
  * 并把服务器消息按类型分流给回调。
  *
@@ -32,6 +67,7 @@ import java.util.concurrent.atomic.AtomicBoolean
  *
  * 后三组回调只是**接入面**:本阶段(纯重构)只把消息分流出来并 `Log.d` 记录,
  * **不实现任何 LLM/TTS 逻辑**,STT 路径的行为、日志文案与级别、超时数值、线程语义都与抽离前逐字一致。
+ * 「小智 AI 网关」(增量 2)通过 [setLlmObserver] 取 `llm.text` 作为本轮回复;TTS 音频直通是增量 3。
  *
  * 链路(manual 模式,对应设备 PTT 的 turn_start/turn_end):
  *  设备麦克风 → [固件 Opus 编码] → BLE → App feedOpus(已剥掉 SEQ) → 原样转发小智
@@ -71,6 +107,7 @@ import java.util.concurrent.atomic.AtomicBoolean
  *
  * @param onStt 识别文本分流(每条 `stt` 回调一次;小智边识边发,可能是部分结果)。
  * @param onLlm 回复正文分流(`{"type":"llm"}`);当前只有 `Log.d`,留给「小智 AI 网关」。
+ *   共用本会话的网关不靠它,而是用 [setLlmObserver] 挂观察者(两条出口互不覆盖)。
  * @param onTtsState TTS 状态分流(`state`, `text`);当前只有 `Log.d`,留给「小智 AI 网关」。
  * @param onTtsAudio 下行 TTS 音频分流(`opus`, `rateKhz`, `frameMs`);当前只有 `Log.d`。
  *   `rateKhz`/`frameMs` 取自服务器 hello 的 `audio_params`(小智为 24 kHz/60 ms),**0 = 尚未上报**。
@@ -85,10 +122,17 @@ class XiaozhiSession(
     private val onLlm: ((String) -> Unit)? = null,
     private val onTtsState: ((String, String) -> Unit)? = null,
     private val onTtsAudio: ((ByteArray, Int, Int) -> Unit)? = null,
-) {
+) : XiaozhiLlmSource {
 
     private val tag = "XiaozhiStt"
     private val gson = Gson()
+
+    /** `llm` 正文观察者(构造参数之外的第二条接入口,供「小智 AI 网关」挂载;见 [setLlmObserver])。 */
+    @Volatile
+    private var llmObserver: ((String) -> Unit)? = null
+
+    /** [setLlmObserver]/[clearLlmObserver] 的锁:保证「挂」与「按身份摘」不交叉。 */
+    private val llmObserverLock = Any()
 
     /** 小智 Client-Id:每次 App 启动随机生成(同一进程内稳定,重启换新),避免旧会话占位被拒。 */
     private val clientId: String = UUID.randomUUID().toString()
@@ -117,7 +161,16 @@ class XiaozhiSession(
     private var warmReady = false
 
     /** 对外暴露热连接状态(通知栏「语音」行用)。 */
-    fun isWarmReady(): Boolean = warmReady
+    override fun isWarmReady(): Boolean = warmReady
+
+    override fun setLlmObserver(observer: ((String) -> Unit)?) {
+        synchronized(llmObserverLock) { llmObserver = observer }
+    }
+
+    override fun clearLlmObserver(observer: (String) -> Unit) {
+        // 身份比较:旧网关实例的 close() 不能摘掉新实例刚挂上的观察者(见 [XiaozhiLlmSource])。
+        synchronized(llmObserverLock) { if (llmObserver === observer) llmObserver = null }
+    }
 
     /** 热连接最近一次活动(建立/复用/一轮结束)的时刻,用于闲置超时判定。 */
     @Volatile
@@ -200,7 +253,7 @@ class XiaozhiSession(
     @Volatile
     private var onHelloCallback: ((Boolean) -> Unit)? = null
 
-    val isAvailable: Boolean
+    override val isAvailable: Boolean
         get() = serverUrl.isNotBlank()
 
     /** 小智 websocket 是否当前活跃连接(供连接监控器定时检测)。 */
@@ -214,7 +267,7 @@ class XiaozhiSession(
      * 不影响 UI;失败只记日志(下一轮按下仍会走「按下才连」,行为与未预热时一致)。
      * 已有可用热连接时直接返回;闲置超时的旧连接先关再建(不泄漏 socket)。
      */
-    fun prewarm() {
+    override fun prewarm() {
         if (!isAvailable) return
         when (WarmLink.decide(warmState(), System.currentTimeMillis())) {
             WarmLink.WarmDecision.REUSE -> return   // 已有热连接,不重复建
@@ -769,11 +822,13 @@ class XiaozhiSession(
                         onStt?.invoke(textVal)
                     }
                 }
-                // 小智的回复/TTS:本阶段只分流 + 记录,留给「小智 AI 网关」(不做 LLM/TTS 逻辑)。
+                // 小智的回复/TTS:分流给两条出口 —— 构造参数的 onLlm/onTtsState(直连会话的调用方),
+                // 以及观察者([llmObserver],共用本会话的「小智 AI 网关」)。TTS 音频转发仍是下一增量。
                 "llm" -> {
                     val reply = obj.stringOrNull("text").orEmpty()
-                    Log.d(tag, "收到小智 llm(仅记录): ${reply.take(200)}")
+                    Log.d(tag, "收到小智 llm: ${reply.take(200)}")
                     onLlm?.invoke(reply)
+                    llmObserver?.invoke(reply)
                 }
                 "tts" -> {
                     val state = obj.stringOrNull("state").orEmpty()

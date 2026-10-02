@@ -16,6 +16,10 @@ package com.shinku.aipassport.openclaw.gateway
  * 纯数据类,无 Android 依赖,JVM 单测可直接构造前后快照验证判定逻辑(见 `GatewayReloadTest`)。
  *
  * 注意:不含 `voicePromptSuffix` —— 它只影响发给网关的文本,由流水线单独更新,不需要重建连接。
+ *
+ * 小智 AI 没有可配置的连接字段(会话由识别通道提供,见
+ * [com.shinku.aipassport.openclaw.gateway.XiaozhiGateway]),因此它的快照是常量 ——
+ * 仅凭「类型不同」就判定为需要重建适配器。
  */
 sealed interface GatewayConfigSnapshot {
     /** OpenClaw(WebSocket + 设备鉴权)。 */
@@ -29,6 +33,9 @@ sealed interface GatewayConfigSnapshot {
 
     /** 本地回显(无可配置字段)。 */
     data object Echo : GatewayConfigSnapshot
+
+    /** 小智 AI(无可配置字段:会话由识别通道提供)。 */
+    data object Xiaozhi : GatewayConfigSnapshot
 }
 
 /**

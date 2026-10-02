@@ -32,13 +32,20 @@ class XiaozhiStt(
     /** 流式中间结果回调(构造参数原样保留):会话层的 `onStt` 与对外 [onPartial] 共用同一个实例。 */
     private val partialCallback: ((String) -> Unit)? = onPartial
 
-    /** 会话层:连接/握手/上行/预热/重连重放都在这里;本类只接 `stt` 一条分流。 */
-    private val session = XiaozhiSession(
+    /**
+     * 会话层实例:本适配器的所有调用都委托给它。
+     *
+     * 对外**只读**暴露,**唯一**用途是把它交给「小智 AI 网关」共用
+     * (见 `docs/design/xiaozhi-ai-gateway.md` §4.2):语音上行与 `llm` 回复必须在**同一条** WS 会话里,
+     * 所以网关绝不能另建一条会话(那会既收不到音频、也收不到正文)。
+     */
+    val session = XiaozhiSession(
         serverUrl = serverUrl,
         token = token,
         deviceId = deviceId,
         recovery = recovery,
-        // 唯一保留的一条路:stt → 文本(其余 llm/tts/音频分流本阶段不接,会话层只记日志)。
+        // 唯一保留的一条路:stt → 文本(其余 llm/tts/音频分流本适配器不接;
+        // llm 正文由共用本会话的「小智 AI 网关」用观察者取走,见 XiaozhiGateway)。
         onStt = { text -> partialCallback?.invoke(text) },
     )
 

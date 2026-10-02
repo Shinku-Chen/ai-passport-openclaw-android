@@ -7,11 +7,13 @@ import com.shinku.aipassport.openclaw.tts.TtsEngines
 /**
  * 网关设置在 App 内配置(SharedPreferences),不写死。
  *
- * 支持四类网关(见 docs/gateway-adapters.md):
+ * 支持五类网关(见 docs/gateway-adapters.md):
  *  - `openclaw`:自建 OpenClaw 网关(WebSocket + Ed25519 设备鉴权)
  *  - `hermes`:Hermes 的 OpenAI 兼容 HTTP API server(Bearer key)
  *  - `openai`:自定义 OpenAI 兼容 HTTP 服务(`POST {请求路径}`,每次带历史)
  *  - `echo`:本地回显(无网关联调用)
+ *  - `xiaozhi`:小智 AI(官方小智云;与识别通道**共用同一条会话**,回复来自该会话的 `llm` 事件;
+ *    代码层已可用,设置页入口与设备朗读直通是后续增量,见 `docs/design/xiaozhi-ai-gateway.md`)
  *
  * 各套配置用不同 key 前缀分别持久化(OpenClaw 沿用历史 `gateway_*` 键,Hermes 用 `hermes_*`,
  * 自定义 OpenAI 兼容用 `openai_*`),因此切换类型不会丢配置。token/API key 是运行时 secret,
@@ -24,7 +26,7 @@ class GatewaySettings(context: Context) {
 
     // ---- 网关类型 ----
 
-    /** 当前生效的网关类型:openclaw | hermes | openai | echo。非法值退回 openclaw。 */
+    /** 当前生效的网关类型:openclaw | hermes | openai | echo | xiaozhi。非法值退回 openclaw。 */
     var type: String
         get() = prefs.getString(KEY_TYPE, TYPE_OPENCLAW)?.takeIf { it in ALL_TYPES } ?: TYPE_OPENCLAW
         set(value) = prefs.edit().putString(KEY_TYPE, value.lowercase().takeIf { it in ALL_TYPES } ?: TYPE_OPENCLAW).apply()
@@ -456,7 +458,16 @@ class GatewaySettings(context: Context) {
         const val TYPE_OPENAI = "openai"
         const val TYPE_ECHO = "echo"
 
-        val ALL_TYPES = listOf(TYPE_OPENCLAW, TYPE_HERMES, TYPE_OPENAI, TYPE_ECHO)
+        /**
+         * 小智 AI(显示名「小智 AI」):官方小智云作为完整 AI 后端。
+         *
+         * 与其余类型不同,它没有自己的 host/port/token —— 上行与回复都跑在识别通道那条
+         * 小智会话上(见 [com.shinku.aipassport.openclaw.gateway.XiaozhiGateway]),
+         * 所以没有配套的 `xiaozhi_*` 配置键。
+         */
+        const val TYPE_XIAOZHI = "xiaozhi"
+
+        val ALL_TYPES = listOf(TYPE_OPENCLAW, TYPE_HERMES, TYPE_OPENAI, TYPE_ECHO, TYPE_XIAOZHI)
 
         const val DEFAULT_OPENCLAW_PORT = "8035"
         const val DEFAULT_HERMES_PORT = "8642"

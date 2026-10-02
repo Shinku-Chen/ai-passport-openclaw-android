@@ -1,0 +1,208 @@
+package com.shinku.aipassport.openclaw.gateway
+
+import com.shinku.aipassport.openclaw.stt.XiaozhiLlmSource
+import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.test.advanceTimeBy
+import kotlinx.coroutines.test.advanceUntilIdle
+import kotlinx.coroutines.test.runCurrent
+import kotlinx.coroutines.test.runTest
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
+import org.junit.Test
+
+/**
+ * 小智 AI 网关「文本这条路」的单测:无网络、无 Android 依赖。
+ *
+ * 用假会话 [FakeSession] 直接触发会话层的 `llm` 回调(与真
+ * [com.shinku.aipassport.openclaw.stt.XiaozhiSession] 的分流同形),断言的都是**用户可见的结果**:
+ *  1. 正常拿到 `llm.text` → 作为**单条**回复返回(流水线据此一次整段上屏);
+ *  2. 一直等不到 → 超时 + 可读原因(不是无限挂着);
+ *  3. barge/打断后旧轮不再产出结果:在途等待立刻以「本轮已打断」收尾(不悬挂)、
+ *     旧轮暂存的正文也不交给下一轮,且**不误报网关故障**(lastError 保持空,
+ *     否则状态卡/连接监控会把一次正常打断当成网关故障并触发重连)。
+ * 另覆盖两处真机容易踩到的边界:`llm` 比 `chatMulti` 早到(暂存窗口)、`close()` 不关闭共用会话。
+ */
+@OptIn(ExperimentalCoroutinesApi::class)
+class XiaozhiGatewayTest {
+
+    /**
+     * 假的小智会话:只保留网关真正用到的那一面 —— 挂观察者 / 可用 / 预热。
+     * [pushLlm] 等价于真会话在 WS 回调线程里分流出一条 `{"type":"llm","text":…}`。
+     */
+    private class FakeSession(var available: Boolean = true) : XiaozhiLlmSource {
+
+        /** 当前观察者;null = 没人接(llm 无处可去,与真会话里没有网关挂载时一致)。 */
+        var observer: ((String) -> Unit)? = null
+
+        var prewarmCount = 0
+        var warm = true
+
+        override val isAvailable: Boolean get() = available
+
+        override fun prewarm() {
+            prewarmCount++
+        }
+
+        override fun isWarmReady(): Boolean = warm
+
+        override fun setLlmObserver(observer: ((String) -> Unit)?) {
+            this.observer = observer
+        }
+
+        override fun clearLlmObserver(observer: (String) -> Unit) {
+            if (this.observer === observer) this.observer = null
+        }
+
+        fun pushLlm(text: String) {
+            observer?.invoke(text)
+        }
+    }
+
+    /** 正常路径:`llm.text` 作为单条回复返回;[chat] 取同一条回复。 */
+    @Test
+    fun llm_text_becomes_single_reply() = runTest {
+        val session = FakeSession()
+        val gw = XiaozhiGateway(session)
+
+        var reply: ChatReply? = null
+        // 入参只是本地识别原文;本通道不发任何请求,回复来自会话层的 llm 事件。
+        val job = launch { reply = gw.chatMulti("今天天气怎么样") }
+        runCurrent()                       // 让 chatMulti 挂上等待
+        session.pushLlm("今天晴,20 度。")   // 会话层推正文
+        advanceUntilIdle()
+        job.join()
+
+        assertEquals(listOf("今天晴,20 度。"), reply!!.messages)
+        assertNull(reply!!.error)
+        assertNull("成功一轮不留错误", gw.lastError)
+
+        var one: String? = null
+        val job2 = launch { one = gw.chat("再说一句") }
+        runCurrent()
+        session.pushLlm("  好的  ")         // 首尾空白应裁掉
+        advanceUntilIdle()
+        job2.join()
+        assertEquals("好的", one)
+    }
+
+    /** 超时路径:等不到 `llm` 时给出可读原因,并写进 lastError(与其它网关的失败语义一致)。 */
+    @Test
+    fun timeout_returns_readable_error() = runTest {
+        val gw = XiaozhiGateway(FakeSession(), replyTimeoutMs = 5_000)
+        var reply: ChatReply? = null
+        val job = launch { reply = gw.chatMulti("在吗") }
+        runCurrent()
+        advanceTimeBy(5_000)     // 虚拟时间:不真的等 5 秒
+        advanceUntilIdle()
+        job.join()
+
+        assertTrue("超时不应产出气泡", reply!!.messages.isEmpty())
+        assertTrue("原因必须可读", reply!!.error!!.contains("小智没有返回回复"))
+        assertEquals("超时原因要能被状态卡读到", reply!!.error, gw.lastError)
+    }
+
+    /** 打断在途等待(barge):新一轮 `turn_start` 先调 interrupt,旧轮立刻收尾、不悬挂。 */
+    @Test
+    fun barge_aborts_inflight_wait_without_result() = runTest {
+        val session = FakeSession()
+        val gw = XiaozhiGateway(session, replyTimeoutMs = 60_000)
+        var reply: ChatReply? = null
+        val job = launch { reply = gw.chatMulti("第一轮的问题") }
+        runCurrent()
+        gw.interrupt()                       // = 新一轮 turn_start(流水线固定会调)
+        advanceUntilIdle()                   // 若 interrupt 没作废等待,这里会一直等到 60s 超时
+        job.join()
+
+        assertTrue("打断的旧轮不能产出气泡", reply!!.messages.isEmpty())
+        assertEquals(XiaozhiGateway.ABORTED, reply!!.error)
+        assertNull("打断不是网关故障,不能写 lastError", gw.lastError)
+    }
+
+    /** 打断把旧轮暂存的正文一并作废:下一轮绝不能吃到上一轮的回复。 */
+    @Test
+    fun barge_discards_previous_turn_buffered_reply() = runTest {
+        val session = FakeSession()
+        val gw = XiaozhiGateway(session, replyTimeoutMs = 60_000)
+        // 旧轮的正文已经到、还没人来取(暂存),此时用户打断。
+        session.pushLlm("第一轮的正文")
+        gw.interrupt()
+
+        var next: ChatReply? = null
+        val job = launch { next = gw.chatMulti("第二轮的问题") }
+        runCurrent()
+        assertNull("打断后不能把旧轮的正文当成新一轮的回复", next)
+        session.pushLlm("第二轮的正文")
+        advanceUntilIdle()
+        job.join()
+        assertEquals(listOf("第二轮的正文"), next!!.messages)
+    }
+
+    /** `llm` 比 chatMulti 早到几百毫秒(真机常见:llm 紧跟在最终 stt 之后):不白等一个超时。 */
+    @Test
+    fun llm_before_chatMulti_is_reused() = runTest {
+        val session = FakeSession()
+        val gw = XiaozhiGateway(session, replyTimeoutMs = 5_000)
+        session.pushLlm("提前到达的正文")
+        var reply: ChatReply? = null
+        val job = launch { reply = gw.chatMulti("问题") }
+        advanceUntilIdle()
+        job.join()
+        assertEquals(listOf("提前到达的正文"), reply!!.messages)
+        assertNull(reply!!.error)
+    }
+
+    /** 没接线(App 内文本输入页没有语音会话)时立刻给可读原因,不空等。 */
+    @Test
+    fun missing_session_fails_fast_with_readable_reason() = runTest {
+        val gw = XiaozhiGateway(source = null)
+        val reply = gw.chatMulti("打字输入")
+        assertTrue(reply.messages.isEmpty())
+        assertTrue(reply.error!!.contains("只在设备语音链路里工作"))
+        assertNull(gw.chat("打字输入"))
+        assertFalse("connect 也要给出原因而不是假装就绪", gw.connect())
+        assertTrue(gw.lastError!!.contains("只在设备语音链路里工作"))
+    }
+
+    /** `connect()` 只确认会话可用并复用同一条热连接(不另建 socket);就绪看共用会话的握手状态。 */
+    @Test
+    fun connect_reuses_shared_session_and_readiness_follows_it() = runTest {
+        val session = FakeSession()
+        val gw = XiaozhiGateway(session)
+        assertTrue(gw.connect())
+        assertEquals(1, session.prewarmCount)
+        assertTrue("会话已握手 = 网关可收发", gw.isReady())
+
+        session.warm = false              // 热连接掉了(会话层自己会重连)
+        assertFalse("会话还在,只是没握手:不能假装可收发", gw.isReady())
+        assertTrue(gw.connect())
+        assertEquals("预热幂等:只是催一次会话层", 2, session.prewarmCount)
+
+        session.available = false
+        assertFalse(gw.connect())
+        assertFalse(gw.isReady())
+    }
+
+    /** `close()` 只摘观察者、作废等待:**绝不能关掉共用的会话**(那是识别通道的)。 */
+    @Test
+    fun close_detaches_observer_without_touching_shared_session() = runTest {
+        val session = FakeSession()
+        val gw = XiaozhiGateway(session, replyTimeoutMs = 60_000)
+        var reply: ChatReply? = null
+        val job = launch { reply = gw.chatMulti("问题") }
+        runCurrent()
+        gw.close()
+        advanceUntilIdle()
+        job.join()
+
+        assertNull("关掉网关应摘掉观察者(不留回调给旧实例)", session.observer)
+        assertEquals(XiaozhiGateway.ABORTED, reply!!.error)
+        // 旧实例不再使用:再来一条 llm 不产出结果,且快速给出可读原因(不白等一个超时)。
+        session.pushLlm("关闭后的正文")
+        val after = gw.chatMulti("问题")
+        assertTrue(after.messages.isEmpty())
+        assertTrue(after.error!!.contains("已关闭"))
+    }
+}

@@ -2,6 +2,7 @@ package com.shinku.aipassport.openclaw.gateway
 
 import android.content.Context
 import android.os.Build
+import com.shinku.aipassport.openclaw.stt.XiaozhiLlmSource
 import com.shinku.aipassport.openclaw.ui.ConversationStore
 
 /**
@@ -167,11 +168,15 @@ object GatewayFactory {
      * @param context 用于构造 OpenClaw 的设备身份与读取设置
      * @param settings 用户在设置页保存的网关配置
      * @param onStatus 状态文案回调(仅 OpenClaw 鉴权/配对过程会用到)
+     * @param xiaozhiSession 小智 AI 网关要**共用**的会话(即识别通道那个 [XiaozhiLlmSource] 实例)。
+     *   只有语音桥服务持有它;其余调用方(App 内探活 / 文本对话页)不传,
+     *   此时小智网关会给出「只在设备语音链路里工作」的可读原因,而不是空等一个超时。
      */
     fun create(
         context: Context,
         settings: GatewaySettings,
         onStatus: (String) -> Unit = {},
+        xiaozhiSession: XiaozhiLlmSource? = null,
     ): GatewayAdapter = when (settings.type) {
         GatewaySettings.TYPE_HERMES -> HermesGateway(
             config = settings.hermesConfig(defaultConversation(context)),
@@ -181,6 +186,9 @@ object GatewayFactory {
         )
 
         GatewaySettings.TYPE_ECHO -> EchoGateway()
+
+        // 小智 AI:不另建连接,复用识别通道那条会话去等 `llm` 正文(见 XiaozhiGateway)。
+        GatewaySettings.TYPE_XIAOZHI -> XiaozhiGateway(source = xiaozhiSession)
 
         GatewaySettings.TYPE_OPENAI -> OpenAiCompatibleGateway(
             config = settings.openAiConfig(),
@@ -206,6 +214,8 @@ object GatewayFactory {
                 )
 
             GatewaySettings.TYPE_ECHO -> GatewayConfigSnapshot.Echo
+
+            GatewaySettings.TYPE_XIAOZHI -> GatewayConfigSnapshot.Xiaozhi
 
             GatewaySettings.TYPE_OPENAI ->
                 GatewayConfigSnapshot.OpenAi(settings.openAiConfig())

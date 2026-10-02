@@ -39,6 +39,7 @@ import com.shinku.aipassport.openclaw.protocol.VbFrameReassembler
 import com.shinku.aipassport.openclaw.protocol.splitTextPayload
 import com.shinku.aipassport.openclaw.protocol.vbEncodeFrame
 import com.shinku.aipassport.openclaw.stt.SttFactory
+import com.shinku.aipassport.openclaw.stt.XiaozhiStt
 import com.shinku.aipassport.openclaw.tts.AndroidTtsEngine
 import com.shinku.aipassport.openclaw.tts.DeviceTtsDownlink
 import com.shinku.aipassport.openclaw.tts.DeviceTtsEngine
@@ -291,6 +292,13 @@ class VoiceBridgeService : Service() {
     private lateinit var pipeline: VoicePipeline
 
     /**
+     * 小智识别适配器(STT)。服务特意保留它的引用:里面的 [XiaozhiStt.session] 要与「小智 AI 网关」
+     * **共用**—— 语音上行与 `llm` 回复必须在同一条 WS 会话里,网关另建一条就永远等不到正文
+     * (见 `docs/design/xiaozhi-ai-gateway.md` §4.2)。
+     */
+    private lateinit var stt: XiaozhiStt
+
+    /**
      * 网关设置(服务生命周期内共用一份):网关重建与**设备朗读开关/引擎**都从这里实时读,
      * 因此设置页改完即时生效(无需重启服务)。
      */
@@ -439,12 +447,21 @@ class VoiceBridgeService : Service() {
         // 共享对话历史:硬件语音也要写入同一列表,供对话 Tab 实时展示
         ConversationStore.init(this)
 
-        // 网关适配器由设置里的类型决定(openclaw / hermes / echo),流水线只依赖 GatewayAdapter 接口。
+        // 先建识别适配器(小智云端流式识别),再建网关:小智网关要**共用**这条会话
+        // (同一个 XiaozhiSession 既上送音频/做识别,又接收本轮 `llm` 回复正文)。
+        stt = SttFactory.create(this) { partial ->
+            // 流式识别中间结果:不实时回传设备屏。小智识别会把多条 partial 连续回调,
+            // 若每条都 sendTextFrame('U') 上屏,设备会被海量 partial 淹没、状态卡在"接收中",
+            // 且覆盖最终的完整回复。识别文本最终由 onTurnEnd 的 sendText('U', text) 一次回传。
+            Log.d(TAG, "识别中间结果(不上屏): $partial")
+        }
+
+        // 网关适配器由设置里的类型决定(openclaw / hermes / openai / echo / xiaozhi),流水线只依赖 GatewayAdapter 接口。
         // OpenClaw 走 [OpenClawGatewayRegistry]:与顶部探针/概览页/对话页复用同一条 WS,
         // 不再各自 new 一个实例把对方连接顶掉。
         val settings = GatewaySettings(this)
         this.settings = settings
-        gateway = GatewayFactory.create(this, settings, gatewayStatusListener)
+        gateway = GatewayFactory.create(this, settings, gatewayStatusListener, stt.session)
         appliedGatewaySnapshot = GatewayFactory.configSnapshot(this, settings)
         // 把生效的关键参数打出来(排查「为什么等了这么久/怎么这么快就失败」时一眼能看到)。
         Log.i(TAG, "网关配置: type=${settings.type} 回复等待上限=${settings.openclawReplyTimeoutSeconds}s")
@@ -465,12 +482,7 @@ class VoiceBridgeService : Service() {
 
         pipeline = VoicePipeline(
             scope = scope,
-            stt = SttFactory.create(this) { partial ->
-                // 流式识别中间结果:不实时回传设备屏。小智识别会把多条 partial 连续回调,
-                // 若每条都 sendTextFrame('U') 上屏,设备会被海量 partial 淹没、状态卡在"接收中",
-                // 且覆盖最终的完整回复。识别文本最终由 onTurnEnd 的 sendText('U', text) 一次回传。
-                Log.d(TAG, "识别中间结果(不上屏): $partial")
-            },
+            stt = stt,
             gateway = gateway,
             tts = tts,
             deviceTts = deviceTts,
@@ -581,7 +593,7 @@ class VoiceBridgeService : Service() {
             return
         }
         val old = gateway
-        val fresh = GatewayFactory.create(this, settings, gatewayStatusListener)
+        val fresh = GatewayFactory.create(this, settings, gatewayStatusListener, stt.session)
         gateway = fresh
         appliedGatewaySnapshot = next
         if (::pipeline.isInitialized) pipeline.updateGateway(fresh)

@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- 新增：「小智 AI」作为一种**网关类型**接通**文本这条路**（`GatewaySettings.TYPE_XIAOZHI`，显示名「小智 AI」）。
+  实现方式是新增 `gateway/XiaozhiGateway` 实现现有 `GatewayAdapter`，**不新增管线模式**：它复用识别通道
+  那条 `XiaozhiSession`（`XiaozhiStt.session`，由语音桥服务同时交给 STT 与网关），`chatMulti` 不发任何
+  HTTP/WS 请求，只等会话层推来的 `llm.text` 作为**单条**回复（整段一次上屏，见设计文档 §6 方案 A），
+  于是「上屏 / 对话历史 / TTS」全部复用流水线原有流程；等不到正文时按现有失败语义返回可读原因并带超时，
+  每轮 `turn_start` 的 `interrupt()` 会作废旧轮等待（不留悬挂的 deferred）。**不改**其它四种网关的行为。
+  本次不含设置页入口、激活界面与 TTS 音频直通（增量 3/4）；新增 8 项 JVM 单测覆盖正常 / 超时 / 打断三条路径。
+
 - 重构（无行为变化）：小智 WS 会话层从 `stt/XiaozhiStt.kt` 抽为 `stt/XiaozhiSession.kt`（771 行 → 适配器 73 行 + 会话 828 行），并把 `stt`/`llm`/`tts` 三类消息分流为回调 —— 为「小智 AI 网关」（`docs/design/xiaozhi-ai-gateway.md`）打地基；STT 路径、日志文案与超时数值逐条核对未变，329 项单测全绿。
 
 - 文档：新设计文档 `docs/design/xiaozhi-ai-gateway.md`（小智 AI 网关：把现有小智会话从「只做 STT」延长为 STT+LLM+TTS，TTS 音频原样转发给设备播放；纯 App 改动，固件不动）。

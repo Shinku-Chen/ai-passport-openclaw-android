@@ -13,8 +13,13 @@ object SttFactory {
 
     private const val TAG = "SttFactory"
 
-    /** 创建引擎:固定返回小智云端识别(不再用 Vosk/模型识别)。 */
-    fun create(context: Context, onPartial: ((String) -> Unit)? = null): SttEngine {
+    /**
+     * 创建引擎:固定返回小智云端识别(不再用 Vosk/模型识别)。
+     *
+     * 返回具体类型 [XiaozhiStt] 而不是 [SttEngine]:语音桥服务要把它的 [XiaozhiStt.session]
+     * 交给「小智 AI 网关」共用(见 `docs/design/xiaozhi-ai-gateway.md` §4.2)。
+     */
+    fun create(context: Context, onPartial: ((String) -> Unit)? = null): XiaozhiStt {
         // 小智云端识别为唯一路径(固件编码 Opus 原样转发,识别率高、中文流式)。
         val xz = XiaozhiSettings()
         val serverUrl = xz.serverUrl
