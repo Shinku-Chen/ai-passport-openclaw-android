@@ -1186,11 +1186,17 @@ class VoiceBridgeService : Service() {
             }
             // 先声明一段开始,再推音频:设备据此进入播放态(停采集、保持背光)
             if (!sendControlJson(TtsControl.START_JSON)) return
+            // 下行朗读切到批量写(WRITE_NO_RESPONSE):带响应写串行执行只有 11 帧/秒,
+            // 低于实时所需的 16.7 帧/秒 → 设备会饿死、听感一卡一卡。结束/中断时在 finally 里恢复。
+            ble.setBulkWrite(true)
             // 【诊断】推送节奏覆盖(一次性):>0 = 固定每帧间隔(慢于实时),0 = 生产节奏。
             val gapMs = ttsPacingOverrideMs.also { ttsPacingOverrideMs = 0 }
             val startedAtMs = System.currentTimeMillis()
+            // 以 GATT 写回调为准的“已送达”基线:在途帧数 = 已交队列 − 已送达。
+            val deliveredBase = ble.deliveredFrameCount()
             var sent = 0
             var seq = 0
+            try {
             for (packet in plan.packets) {
                 if (id != pushId) {
                     Log.i(TAG, "设备朗读被打断: 已发 $sent/${plan.packets.size} 帧")
@@ -1205,6 +1211,18 @@ class VoiceBridgeService : Service() {
                     TtsFlowControl.waitMs(sent, System.currentTimeMillis() - startedAtMs)
                 }
                 if (wait > 0) delay(wait)
+                // 在途积压上限:入队快、送达慢时手机会凭空“领先”,设备侧却是空的 → 播放一卡一卡。
+                // 这里等到达送追上(每 5ms 查一次,总上限 1s;期间被打断/掉链立即退出)。
+                var backlogGuard = 0
+                while (TtsFlowControl.inFlightExceeds(
+                        sent,
+                        (ble.deliveredFrameCount() - deliveredBase).toInt().coerceAtLeast(0),
+                    ) && backlogGuard < 200
+                ) {
+                    if (id != pushId || !ble.isConnected()) break
+                    delay(5)
+                    backlogGuard++
+                }
                 if (id != pushId) {
                     Log.i(TAG, "设备朗读被打断: 已发 $sent/${plan.packets.size} 帧")
                     return
@@ -1229,6 +1247,9 @@ class VoiceBridgeService : Service() {
                     "rate=${plan.rateKhz}kHz 耗时 ${System.currentTimeMillis() - startedAtMs}ms" +
                     if (gapMs > 0) " (诊断节奏 ${gapMs}ms/帧)" else "",
             )
+            } finally {
+                ble.setBulkWrite(false)   // 无论正常结束还是被打断/掉链,都恢复带响应写
+            }
         }
     }
 

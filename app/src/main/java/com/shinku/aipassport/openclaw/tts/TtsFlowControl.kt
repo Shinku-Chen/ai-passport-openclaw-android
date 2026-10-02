@@ -35,8 +35,35 @@ object TtsFlowControl {
     /** 领先上限折合帧数:2000 / 60 = 33(33 × 60ms = 1980ms ≤ 2000ms)。 */
     const val MAX_LEAD_FRAMES = MAX_LEAD_MS / FRAME_MS
 
-    /** 目标领先量:800ms(见类注释;低于设备 24 包 ≈1.44s 的解码队列深度)。 */
-    const val TARGET_LEAD_MS = 800
+    /**
+     * 目标领先量:1200ms。
+     *
+     * 真机调过一轮:800ms 时听感“一卡一卡”(设备统计 `欠载=57/83`) —— 因为“领先量”是按
+     * **已交给 BLE 队列的帧数**算的,而 BLE 写队列当时积了 20+ 帧,实际送到设备的音频远不到
+     * 800ms,设备解码队列经常见底。现配合 [MAX_INFLIGHT_FRAMES] 把“在途”卡死,
+     * 于是设备侧真实缓冲 ≈ 1200ms − 8×60ms ≈ 720ms,再往上就会碰设备 24 包 ≈1.44s 的解码队列上限。
+     */
+    const val TARGET_LEAD_MS = 1_200
+
+    /**
+     * 允许同时“在途”(已交给 BLE、但还没拿到 GATT 写回调)的帧数上限。
+     *
+     * 超过它就先等 —— 否则所谓领先量只存在于**手机**队列里,设备那边是空的,
+     * 播放只能靠补静音维持,听感就是一卡一卡。8 帧 ≈ 480ms,足够吸收 BLE 写入的抖动。
+     */
+    const val MAX_INFLIGHT_FRAMES = 8
+
+    /**
+     * 在途帧是否已经超过上限。
+     *
+     * @param sentFrames 已交给 BLE 队列的帧数(本轮累计)
+     * @param deliveredFrames 已拿到 GATT 写回调的帧数(本轮累计)
+     */
+    fun inFlightExceeds(
+        sentFrames: Int,
+        deliveredFrames: Int,
+        maxInFlight: Int = MAX_INFLIGHT_FRAMES,
+    ): Boolean = sentFrames - deliveredFrames > maxInFlight
 
     /** 领先量(ms):已推帧的音频时长减去自 `tts_start` 起的实时时长;可为负(还没追平播放)。 */
     fun leadMs(sentFrames: Int, elapsedMs: Long, frameMs: Int = FRAME_MS): Long =

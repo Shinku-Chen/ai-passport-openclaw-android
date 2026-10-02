@@ -437,6 +437,34 @@ class BleCentral(
 
     /** 所有 App→设备逻辑帧共用串行队列,避免长回复分片交错。 */
     private val writeQueue = ArrayDeque<ByteArray>()
+
+    /**
+     * 已**送达**设备的下行逻辑帧数(以 GATT 写回调为准,不是“已入队”)。
+     *
+     * 下行 TTS 的流控靠它算“在途帧数”:入队快、送达慢时手机队列会积压,
+     * 只看入队数会把领先量算高,设备侧其实早已空库→播放一卡一卡(真机实测)。
+     */
+    @Volatile
+    private var deliveredFrames: Long = 0
+
+    /** 已送达设备的逻辑帧数快照(TTS 流控用)。 */
+    fun deliveredFrameCount(): Long = deliveredFrames
+
+    /**
+     * 批量写模式(下行朗读用):打开后用 `WRITE_NO_RESPONSE`,关闭时恢复带响应写。
+     *
+     * 真机实测:带响应写是串行的,一次连接事件只能推一个包 → 仅 11 帧/秒,
+     * 低于 16kHz/60ms 实时所需的 16.7 帧/秒 → 设备解码队列见底、声音一卡一卡。
+     */
+    @Volatile
+    private var bulkWrite: Boolean = false
+
+    /** 开启/关闭批量写模式(下行朗读开始/结束时调,幂等)。 */
+    fun setBulkWrite(enabled: Boolean) {
+        if (bulkWrite == enabled) return
+        bulkWrite = enabled
+        Log.i(tag, "批量写模式: $enabled")
+    }
     private var currentWrite: ByteArray? = null
     private var currentOffset = 0
     private var writeInProgress = false
@@ -496,6 +524,7 @@ class BleCentral(
         val frame = currentWrite ?: return
         if (currentOffset >= frame.size) {
             Log.i(tag, "writeBytes 逻辑帧完成 字节=${frame.size}")
+            deliveredFrames++   // 以 GATT 写回调为准的“已送达”计数(TTS 流控用它算在途量)
             currentWrite = null
             pumpWriteQueue()
             return
@@ -560,11 +589,20 @@ class BleCentral(
 
     private fun writeOne(rx: BluetoothGattCharacteristic, data: ByteArray): Boolean {
         return try {
+            // 下行朗读是批量实时流:用 WRITE_NO_RESPONSE(固件特征已声明支持)才够快;
+            // 控制/文本帧仍用带响应写(要确认到位)。
+            val type = if (bulkWrite) {
+                BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
+            } else {
+                BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
+            }
             if (Build.VERSION.SDK_INT >= 33) {
-                gatt?.writeCharacteristic(rx, data, BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT) == BluetoothStatusCodes.SUCCESS
+                gatt?.writeCharacteristic(rx, data, type) == BluetoothStatusCodes.SUCCESS
             } else {
                 @Suppress("DEPRECATION")
                 rx.value = data
+                @Suppress("DEPRECATION")
+                rx.writeType = type
                 @Suppress("DEPRECATION")
                 gatt?.writeCharacteristic(rx) == true
             }
@@ -726,6 +764,15 @@ class BleCentral(
             listener.onError("未找到 NUS 服务/特征")
             g.disconnect()
             return
+        }
+        // 请求高优先级连接间隔(默认间隔下每次写都要等一个连接事件:真机实测下行朗读
+        // 只能跑 11 帧/秒,而 16kHz/60ms 的实时播放需要 16.7 帧/秒 → 设备解码队列见底、
+        // 声音一卡一卡)。CONNECTION_PRIORITY_HIGH 会把间隔压到 ~11–15ms,下行/上行都受益。
+        try {
+            val ok = g.requestConnectionPriority(BluetoothGatt.CONNECTION_PRIORITY_HIGH)
+            Log.i(tag, "请求高优先级连接间隔: $ok")
+        } catch (e: Exception) {
+            Log.w(tag, "请求连接优先级失败:${e.message}")
         }
         try {
             @Suppress("DEPRECATION")

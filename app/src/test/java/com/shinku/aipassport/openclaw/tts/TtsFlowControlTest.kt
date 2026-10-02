@@ -10,7 +10,8 @@ import org.junit.Test
  *
  * 约束(固件 `intercom-wire-protocol.md`:Phone must not run more than about 2 s of audio ahead):
  * App 领先设备的音频量 ≤ 2s,即最多 [TtsFlowControl.MAX_LEAD_FRAMES] = 33 帧未播完就得等;
- * 实际按 [TtsFlowControl.TARGET_LEAD_MS] = 800ms 目标节流(设备解码队列只有 24 包 ≈1.44s)。
+ * 实际按 [TtsFlowControl.TARGET_LEAD_MS] = 1200ms 目标节流(设备解码队列只有 24 包 ≈1.44s)；
+ * 同时用 [TtsFlowControl.MAX_INFLIGHT_FRAMES] 限制“在途未送达”的帧数。
  */
 class TtsFlowControlTest {
 
@@ -38,11 +39,12 @@ class TtsFlowControlTest {
     fun wait_time_is_zero_until_target_lead_is_reached() {
         // 开局立刻可推:TTS 需要尽快在设备上出声
         assertEquals(0L, TtsFlowControl.waitMs(0, 0))
-        // 800ms 目标内不等待
-        assertEquals(0L, TtsFlowControl.waitMs(13, 0))
-        // 领先超过 800ms 后按差额等:14 帧(840ms) - 800ms = 40ms
-        assertEquals(40L, TtsFlowControl.waitMs(14, 0))
-        assertEquals(1_180L, TtsFlowControl.waitMs(33, 0))
+        // 目标领先量之内不等待(20 帧 = 1200ms 正好到点)
+        assertEquals(0L, TtsFlowControl.waitMs(19, 0))
+        assertEquals(0L, TtsFlowControl.waitMs(20, 0))
+        // 超过目标后按差额等:21 帧(1260ms) - 1200ms = 60ms
+        assertEquals(60L, TtsFlowControl.waitMs(21, 0))
+        assertEquals(780L, TtsFlowControl.waitMs(33, 0))
         // 设备已经播到后面了(实时追平):不等
         assertEquals(0L, TtsFlowControl.waitMs(100, 6_000))
     }
@@ -89,5 +91,25 @@ class TtsFlowControlTest {
             "目标领先 ${TtsFlowControl.TARGET_LEAD_MS}ms 应小于设备 24 包 ≈1440ms 的解码队列",
             TtsFlowControl.TARGET_LEAD_MS < 24 * TtsFlowControl.FRAME_MS,
         )
+    }
+
+    @Test
+    fun in_flight_backlog_is_capped() {
+        // 已交队列 20 帧、只送达 5 帧 → 在途 15 帧 > 8 → 必须等(否则领先量只存在于手机队列里)
+        assertTrue(TtsFlowControl.inFlightExceeds(sentFrames = 20, deliveredFrames = 5))
+        assertTrue(TtsFlowControl.inFlightExceeds(sentFrames = 9, deliveredFrames = 0))
+        // 刚好 8 帧在途不算超;送达追上后立即放行
+        assertFalse(TtsFlowControl.inFlightExceeds(sentFrames = 8, deliveredFrames = 0))
+        assertFalse(TtsFlowControl.inFlightExceeds(sentFrames = 20, deliveredFrames = 15))
+    }
+
+    @Test
+    fun target_lead_stays_below_the_device_decode_queue() {
+        // 设备解码队列 24 包 ≈1.44s:目标领先量必须小于它,又不能小到让设备饿着
+        assertTrue(TtsFlowControl.TARGET_LEAD_MS < 24 * TtsFlowControl.FRAME_MS)
+        assertTrue(TtsFlowControl.TARGET_LEAD_MS >= 1_000)
+        // 在途上限必须远小于目标领先量,否则真正到设备的缓冲会被挤没
+        assertTrue(TtsFlowControl.MAX_INFLIGHT_FRAMES * TtsFlowControl.FRAME_MS <=
+            TtsFlowControl.TARGET_LEAD_MS / 2)
     }
 }
