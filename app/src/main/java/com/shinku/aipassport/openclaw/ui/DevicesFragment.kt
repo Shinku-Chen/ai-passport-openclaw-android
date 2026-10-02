@@ -164,10 +164,12 @@ class DevicesFragment : Fragment() {
         return listOf(
             DeviceAdapter.DeviceItem(
                 name = deviceName?.takeIf { it.isNotBlank() } ?: "AI Passport 设备",
-                // 地址行顺带把固件版本带上:设备 hello 报过才有(老固件不上报就不显示)
-                address = deviceAddr + deviceFirmware
+                address = deviceAddr,
+                // 固件版本单独一行显示(比接在 MAC 后面醒目):设备 hello 报过才有,
+                // 老固件不上报就整行隐藏(不猜)。
+                firmware = deviceFirmware
                     ?.takeIf { it.isNotBlank() }
-                    ?.let { "  ·  固件 $it" }.orEmpty(),
+                    ?.let { "固件 $it" }.orEmpty(),
                 // 必须用映射后的中文状态:真机反馈过「没配对却在列表里显示已连接」——
                 // 这里以前直接用了原始 linkState(值为「已连接」)，把"连上但未加密"写成了已连接。
                 state = when (linkState) {

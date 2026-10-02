@@ -24,6 +24,16 @@
         android:textSize="12sp"
         android:textColor="#9E9E9E" />
 
+    <!-- 设备固件版本:设备 hello 报上来才有(老固件不上报就整行隐藏)。 -->
+    <TextView
+        android:id="@+id/deviceFirmware"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="2dp"
+        android:textSize="12sp"
+        android:textColor="#DDDDDD"
+        android:visibility="gone" />
+
     <TextView
         android:id="@+id/deviceState"
         android:layout_width="wrap_content"

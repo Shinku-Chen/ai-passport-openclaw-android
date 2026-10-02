@@ -12,7 +12,13 @@ import com.shinku.aipassport.openclaw.R
  */
 class DeviceAdapter : RecyclerView.Adapter<DeviceAdapter.VH>() {
 
-    data class DeviceItem(val name: String, val address: String, val state: String)
+    data class DeviceItem(
+        val name: String,
+        val address: String,
+        val state: String,
+        /** 设备固件版本(如 "固件 1.11");设备没上报时为空串,整行隐藏。 */
+        val firmware: String = "",
+    )
 
     private val items = mutableListOf<DeviceItem>()
 
@@ -40,11 +46,14 @@ class DeviceAdapter : RecyclerView.Adapter<DeviceAdapter.VH>() {
         holder.name.text = d.name
         holder.address.text = d.address
         holder.state.text = d.state
+        holder.firmware.text = d.firmware
+        holder.firmware.visibility = if (d.firmware.isBlank()) View.GONE else View.VISIBLE
     }
 
     class VH(view: View) : RecyclerView.ViewHolder(view) {
         val name: TextView = view.findViewById(R.id.deviceName)
         val address: TextView = view.findViewById(R.id.deviceAddress)
         val state: TextView = view.findViewById(R.id.deviceState)
+        val firmware: TextView = view.findViewById(R.id.deviceFirmware)
     }
 }
