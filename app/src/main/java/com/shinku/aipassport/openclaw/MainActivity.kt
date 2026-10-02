@@ -87,11 +87,42 @@ class MainActivity : AppCompatActivity() {
         setupTabs()
         applyWindowInsets(binding.root)
         askBatteryExemptionIfNeeded()
+        handleDiagnosticIntent(intent)
         binding.btnRefreshStatus.setOnClickListener {
             // 等待网关授权时这个按钮的含义变成“怎么做才能授权”,把步骤直接摆给用户看
             if (awaitingApproval) showApprovalDialog(binding.statusText.text.toString()) else refreshStatus()
         }
         refreshStatus()
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        handleDiagnosticIntent(intent)
+    }
+
+    /**
+     * 【诊断用】直接试推一段设备朗读，真机定位固件在**下行朗读时崩溃**用。
+     *
+     * 触发方式（仅 adb/调试）：
+     * ```
+     * adb shell am start -n com.shinku.aipassport.openclaw/.MainActivity --es tts_test "测试"
+     * ```
+     * 它**不看设置开关、不经网关与识别**，因此可以用不同长度的文本做定量扫描
+     * （推 8 帧就下 vs 推满 234 帧），把“内存不够”与“格式不匹配”两种原因分开 ——
+     * 真机实测开了开关后设备在推出约 90 帧时重启，就是靠它定位的。
+     * 正常使用不会触发；以后可以把它升级成设置页的「试听」按钮。
+     */
+    private fun handleDiagnosticIntent(intent: Intent?) {
+        val text = intent?.getStringExtra(VoiceBridgeService.EXTRA_TTS_TEST_TEXT)
+            ?.takeIf { it.isNotBlank() } ?: return
+        val gapMs = intent.getIntExtra(VoiceBridgeService.EXTRA_TTS_TEST_GAP_MS, 0)
+        Toast.makeText(
+            this,
+            "诊断：试推设备朗读（${text.length} 字，间隔=${if (gapMs > 0) "${gapMs}ms" else "生产"}）",
+            Toast.LENGTH_SHORT,
+        ).show()
+        VoiceBridgeService.ttsTest(this, text, gapMs)
     }
 
     /**

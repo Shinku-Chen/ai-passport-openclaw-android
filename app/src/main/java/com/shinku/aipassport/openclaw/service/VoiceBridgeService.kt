@@ -199,6 +199,36 @@ class VoiceBridgeService : Service() {
         }
 
         /**
+         * 【诊断用】直接推一段指定文本给设备朗读：**不看设置开关、不经网关与识别**。
+         *
+         * 用途：真机定位“设备在下行朗读时崩溃”。用不同长度做扫描就能分开两种原因：
+         *  - 推到一定帧数才崩 → 解码队列/内存（设备无 PSRAM，RAM 只有几百 KB）；
+         *  - 第一帧就崩 → 格式不匹配（采样率/帧长/x 帧头）。
+         * 触发方式见 [MainActivity.handleDiagnosticIntent]。
+         */
+        const val ACTION_TTS_TEST = "com.shinku.aipassport.openclaw.action.TTS_TEST"
+
+        /** 诊断试推的文本（同时是 `am start` 的 `--es` 名字）。 */
+        const val EXTRA_TTS_TEST_TEXT = "tts_test"
+
+        /** 诊断试推的推送间隔（ms/帧，`--ei`）：0/缺省 = 生产节奏；>0 时按固定间隔慢推。 */
+        const val EXTRA_TTS_TEST_GAP_MS = "tts_gap_ms"
+
+        fun ttsTest(context: Context, text: String, gapMs: Int = 0) {
+            if (!isRunning) return
+            try {
+                context.startService(
+                    Intent(context, VoiceBridgeService::class.java)
+                        .setAction(ACTION_TTS_TEST)
+                        .putExtra(EXTRA_TTS_TEST_TEXT, text)
+                        .putExtra(EXTRA_TTS_TEST_GAP_MS, gapMs),
+                )
+            } catch (e: Exception) {
+                Log.w(TAG, "诊断朗读请求失败:${e.message}")
+            }
+        }
+
+        /**
          * 设置页保存成功后调用:让运行中的服务按新设置重建网关适配器并重连。
          *
          * 修的是这个 bug:服务只在 [startBridge] 时读一次设置,原来只有网关类型变化才重启服务,
@@ -318,6 +348,20 @@ class VoiceBridgeService : Service() {
             // 设置页刚打开「设备朗读」开关:预热合成引擎(顺带把可用音色写进日志)
             ACTION_TTS_PREWARM -> {
                 if (::deviceTtsPush.isInitialized) scope.launch { deviceTtsPush.prewarm() }
+            }
+            // 【诊断】直接试推一段朗读(不看开关/网关):定位固件在下行朗读时崩溃的原因
+            ACTION_TTS_TEST -> {
+                val text = intent.getStringExtra(EXTRA_TTS_TEST_TEXT).orEmpty()
+                val gapMs = intent.getIntExtra(EXTRA_TTS_TEST_GAP_MS, 0)
+                if (text.isNotBlank() && ::deviceTtsPush.isInitialized) {
+                    ttsPacingOverrideMs = gapMs
+                    Log.i(
+                        TAG,
+                        "【诊断】设备朗读试推: ${text.length} 字,间隔=" +
+                            (if (gapMs > 0) "${gapMs}ms/帧" else "生产节奏"),
+                    )
+                    deviceTtsPush.speak(text)
+                }
             }
             else -> startBridge()
         }
@@ -1003,6 +1047,10 @@ class VoiceBridgeService : Service() {
      *  3. **复用现有 TX 队列**:帧只走 [BleCentral.writeBytes](同一个串行写队列 + ATT 确认),
      *     不另开线程猛灌;节奏由 [TtsFlowControl] 算(领先设备 ≤2s,目标 800ms)。
      */
+    /** 【诊断】下行推送节奏覆盖(ms/帧):0 = 用生产参数([TtsFlowControl]);仅对**下一次**试推生效(一次性)。 */
+    @Volatile
+    private var ttsPacingOverrideMs: Int = 0
+
     private inner class DeviceTtsPush : DeviceTtsDownlink {
 
         /**
@@ -1074,10 +1122,9 @@ class VoiceBridgeService : Service() {
         /**
          * 设备在**朗读推送途中**掉线 → 判定这台设备扛不住这段下行音频,自我保护。
          *
-         * 真机实测(HyperOS / Android 16 + AI Passport 固件 v1.10-intercom):开始推 TTS 后
-         * 约 5–6 秒设备断开重启(`设备未连接,丢弃控制帧: {"ev":"tts_abort"}` → `已加密` 重连),
-         * 重连后再推又崩,两次完全一致。原因在**固件侧**(解码队列/内存或采样率不匹配),
-         * App 能做的只有:停手、关掉开关、把原因明确告知用户(否则用户每说一句设备重启一次)。
+         * 真机实测(Android 16 + 固件 v1.10-intercom):开始推 TTS 后约 **5.2–5.4s** BLE 掉链
+         * (`已断开 status=8` = GATT_CONN_TIMEOUT,三次一致);设备串口**无 panic、无复位、堆稳定** ——
+         * 即设备没崩,是 BLE 被拖垮;而且掉一次后设备 BLE 会持续降级(重连也超时),要复位才恢复。
          *
          * 代价不对称:误判(其实是环境掉线)只是让用户重新打开开关;不判则设备反复重启。
          */
@@ -1139,6 +1186,8 @@ class VoiceBridgeService : Service() {
             }
             // 先声明一段开始,再推音频:设备据此进入播放态(停采集、保持背光)
             if (!sendControlJson(TtsControl.START_JSON)) return
+            // 【诊断】推送节奏覆盖(一次性):>0 = 固定每帧间隔(慢于实时),0 = 生产节奏。
+            val gapMs = ttsPacingOverrideMs.also { ttsPacingOverrideMs = 0 }
             val startedAtMs = System.currentTimeMillis()
             var sent = 0
             var seq = 0
@@ -1147,15 +1196,22 @@ class VoiceBridgeService : Service() {
                     Log.i(TAG, "设备朗读被打断: 已发 $sent/${plan.packets.size} 帧")
                     return
                 }
-                val wait = TtsFlowControl.waitMs(sent, System.currentTimeMillis() - startedAtMs)
+                // 节奏:生产参数下 TtsFlowControl 把领先量压在 800ms(基本按实时推);
+                // 【诊断】可用 tts_gap_ms 覆盖成固定间隔(慢于实时),用来验证“推太快拖垮 BLE”。
+                val wait = if (gapMs > 0) {
+                    (sent.toLong() * gapMs - (System.currentTimeMillis() - startedAtMs))
+                        .coerceAtLeast(0L)
+                } else {
+                    TtsFlowControl.waitMs(sent, System.currentTimeMillis() - startedAtMs)
+                }
                 if (wait > 0) delay(wait)
                 if (id != pushId) {
                     Log.i(TAG, "设备朗读被打断: 已发 $sent/${plan.packets.size} 帧")
                     return
                 }
-                // 设备在**推送途中**掉线:极可能是它被这段音频搞崩了(真机实测:推出约 90 帧
-                // ≈5.5s 后设备重启,重连后再次崩,两次一致)。继续推只会让“连上→崩→重连”反复发生,
-                // 所以立刻停手、关掉开关并把原因播出来 —— 既不再折磨设备,也让用户看得见。
+                // 设备在**推送途中**掉线:真机实测这是 TTS 推送带来的 BLE 副作用的典型表现——
+                // 开始推后约 5.2s 监督超时(status=8),之后设备 BLE 半死(重连也超时),要复位才恢复。
+                // 所以立刻停手、关掉开关并把原因播出来。
                 if (!ble.isConnected()) {
                     onDeviceTtsLookedTooHeavy(sent, plan.packets.size)
                     return
@@ -1170,7 +1226,8 @@ class VoiceBridgeService : Service() {
             Log.i(
                 TAG,
                 "设备朗读下发完成: frames=$sent dropped=${plan.dropped} " +
-                    "rate=${plan.rateKhz}kHz 耗时 ${System.currentTimeMillis() - startedAtMs}ms",
+                    "rate=${plan.rateKhz}kHz 耗时 ${System.currentTimeMillis() - startedAtMs}ms" +
+                    if (gapMs > 0) " (诊断节奏 ${gapMs}ms/帧)" else "",
             )
         }
     }
