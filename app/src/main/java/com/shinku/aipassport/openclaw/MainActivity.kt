@@ -341,8 +341,18 @@ class MainActivity : AppCompatActivity() {
 
     /** 用上次落盘的结论先渲染一次（不联网，打开就有东西看）。 */
     private fun renderUpdateFromCache() {
-        val n = UpdateChecker.cachedNotices(this)
+        // ⚠ 落盘的是【当时的】提示文案（里面写着当时的 App 版本）：装上新版后它就成了
+        // 「App 有新版本 1.12（当前 1.11）」（真机反馈）。传当前版本进去，版本对不上就不展示 App 那条，
+        // 等服务重查（dueForCheck 在版本变化时立刻算该查）几秒后广播回新结论。
+        val n = UpdateChecker.cachedNotices(this, currentVersionName())
         renderUpdateLine(n.appNotice, n.firmwareNotice, n.url)
+    }
+
+    /** 本 App 的 `versionName`（运行时读，不依赖 BuildConfig —— AGP 8 默认不生成它）。 */
+    private fun currentVersionName(): String = try {
+        packageManager.getPackageInfo(packageName, 0).versionName ?: "?"
+    } catch (e: Exception) {
+        "?"
     }
 
     private fun updateStatusDot(status: String) {

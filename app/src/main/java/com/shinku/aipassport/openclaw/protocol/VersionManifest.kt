@@ -94,4 +94,28 @@ object UpdateCheck {
 
     private fun notesSuffix(notes: String): String =
         if (notes.isBlank()) "" else "：${notes.trim().take(120)}"
+
+    /**
+     * 落盘的 App 提示还能不能直接用：只有「检查时的 App 版本」与当前版本一致才能展示。
+     *
+     * 为什么：提示文案里已经写死了当时的版本号（`App 有新版本 1.12（当前 1.11）`），
+     * App 装上 1.12 后这句话就变成错的（真机反馈：装好新版，顶部还挂着「当前 1.11」）。
+     * 版本一变就不用旧结论，等重查（[dueForCheck] 会因此立刻拉一次）。
+     */
+    fun usableAppNotice(notice: String, checkedAppVersion: String, appVersion: String): String? =
+        notice.takeIf { it.isNotBlank() && checkedAppVersion.trim() == appVersion.trim() }
+
+    /**
+     * 现在该重新检查版本吗：距上次超过 [intervalMs]，或者 App 换了版本。
+     *
+     * `checkedAt == 0`（从没查过）算「该查」；没记过版本（老缓存）时按新版本处理，
+     * 让它重建一次结论，避免一直挂着旧文案。
+     */
+    fun dueForCheck(
+        checkedAt: Long,
+        checkedAppVersion: String,
+        appVersion: String,
+        now: Long,
+        intervalMs: Long,
+    ): Boolean = now - checkedAt >= intervalMs || checkedAppVersion.trim() != appVersion.trim()
 }

@@ -23,6 +23,11 @@ import java.util.concurrent.TimeUnit
  *
  * 缓存策略：一天自动查一次；用户手点「检查更新」时给 URL 加时间戳绕过 CDN 缓存，
  * 保证立刻能看到刚发布的版本。
+ *
+ * ⚠ 结论里带着**当时的 App 版本号**（`App 有新版本 1.12（当前 1.11）`），所以：
+ *  - 渲染时用 [cachedNotices] 传入当前版本，版本对不上就丢掉 App 那条（见 `UpdateCheck.usableAppNotice`）；
+ *  - 一旦 App 换了版本（装了新版），[dueForCheck] 直接算「该查」，几秒内就用新结论刷新 UI ——
+ *    否则 24h 内都不会重查，横幅会一直挂着旧版本号（真机反馈）。
  */
 object UpdateChecker {
 
@@ -31,6 +36,7 @@ object UpdateChecker {
     private const val KEY_JSON = "manifest_json"
     private const val KEY_AT = "checked_at"
     private const val KEY_SOURCE = "source"
+    private const val KEY_CHECKED_APP = "checked_app_version"
     private const val KEY_NOTICE_APP = "notice_app"
     private const val KEY_NOTICE_FW = "notice_fw"
     private const val KEY_NOTICE_URL = "notice_url"
@@ -66,22 +72,39 @@ object UpdateChecker {
             .apply()
     }
 
-    /** 读上次落盘的结论（不动网）。 */
-    fun cachedNotices(context: Context): Notices {
+    /** 读上次落盘的结论（不动网）。
+     *
+     * @param appVersion 当前 `versionName`：与检查时不同的一律不展示 App 那条提示
+     *   （文案里写着当时的版本号，升级后就是错的；接下来 [dueForCheck] 会立刻重查）
+     */
+    fun cachedNotices(context: Context, appVersion: String): Notices {
         val p = prefs(context)
         return Notices(
-            appNotice = p.getString(KEY_NOTICE_APP, "").orEmpty(),
+            appNotice = UpdateCheck.usableAppNotice(
+                notice = p.getString(KEY_NOTICE_APP, "").orEmpty(),
+                checkedAppVersion = checkedAppVersion(context),
+                appVersion = appVersion,
+            ).orEmpty(),
             firmwareNotice = p.getString(KEY_NOTICE_FW, "").orEmpty(),
             url = p.getString(KEY_NOTICE_URL, "").orEmpty(),
             checkedAt = p.getLong(KEY_AT, 0L),
         )
     }
 
+    /** 上次检查时用的 App 版本（空 = 老缓存，没记过）。 */
+    fun checkedAppVersion(context: Context): String =
+        prefs(context).getString(KEY_CHECKED_APP, "").orEmpty()
+
     fun checkedAt(context: Context): Long = prefs(context).getLong(KEY_AT, 0L)
 
-    /** 距上次检查是否已过 24h。 */
-    fun dueForCheck(context: Context): Boolean =
-        System.currentTimeMillis() - checkedAt(context) >= INTERVAL_MS
+    /** 距上次检查是否已过 24h；App 换了版本也算「该查」（见类注释）。 */
+    fun dueForCheck(context: Context, appVersion: String): Boolean = UpdateCheck.dueForCheck(
+        checkedAt = checkedAt(context),
+        checkedAppVersion = checkedAppVersion(context),
+        appVersion = appVersion,
+        now = System.currentTimeMillis(),
+        intervalMs = INTERVAL_MS,
+    )
 
     /** 读缓存（不动网）：设置页/状态卡打开时立刻能显示上次结论。 */
     fun cached(context: Context, appVersion: String, deviceFirmware: String?): State? {
@@ -109,6 +132,7 @@ object UpdateChecker {
             .putString(KEY_JSON, fetched.first)
             .putLong(KEY_AT, now)
             .putString(KEY_SOURCE, fetched.second)
+            .putString(KEY_CHECKED_APP, appVersion.trim())
             .apply()
         Log.i(
             TAG,

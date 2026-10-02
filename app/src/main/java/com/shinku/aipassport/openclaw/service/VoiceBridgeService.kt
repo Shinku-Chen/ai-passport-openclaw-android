@@ -1414,7 +1414,7 @@ class VoiceBridgeService : Service() {
      * 判定规则（只比大版本、只报更新、信息不足就静默）见 [UpdateCheck]；这里只管触发与广播。
      */
     private fun runUpdateCheck(manual: Boolean) {
-        if (!manual && !UpdateChecker.dueForCheck(this)) return
+        if (!manual && !UpdateChecker.dueForCheck(this, appVersionName())) return
         val app = appVersionName()
         val fw = if (::pipeline.isInitialized) pipeline.deviceFirmwareVersion else null
         scope.launch {

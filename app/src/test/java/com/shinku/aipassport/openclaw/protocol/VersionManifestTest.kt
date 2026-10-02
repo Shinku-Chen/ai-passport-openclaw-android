@@ -122,4 +122,44 @@ class VersionManifestTest {
         val n = UpdateCheck.notices("1.11", null, long)
         assertTrue(n.appUpdate!!.length < 300)
     }
+
+    // ---- 落盘结论的「版本变了就作废」（真机 bug：装上 1.12 后横幅还写「当前 1.11」） ----
+
+    @Test
+    fun stale_app_notice_is_dropped_after_the_app_version_changes() {
+        val notice = "App 有新版本 1.12（当前 1.11）：修了点东西"
+        assertNull(
+            "提示里写着检查时的版本号，换版本后不能再展示",
+            UpdateCheck.usableAppNotice(notice, checkedAppVersion = "1.11", appVersion = "1.12"),
+        )
+        assertEquals(
+            notice,
+            UpdateCheck.usableAppNotice(notice, checkedAppVersion = "1.11", appVersion = "1.11"),
+        )
+        assertNull("空提示本来就不展示", UpdateCheck.usableAppNotice("", "1.11", "1.11"))
+        assertNull(
+            "老缓存没记过版本 → 不展示（但不崩）",
+            UpdateCheck.usableAppNotice(notice, checkedAppVersion = "", appVersion = "1.11"),
+        )
+    }
+
+    @Test
+    fun app_version_change_forces_an_immediate_recheck() {
+        val day = 24L * 60L * 60L * 1000L
+        val now = 1_000_000_000_000L
+        assertFalse(
+            "同版本、没到 24h → 不重查（别天天扰动）",
+            UpdateCheck.dueForCheck(now - 1000L, "1.12", "1.12", now, day),
+        )
+        assertTrue(
+            "App 换了版本 → 立刻重查（否则横幅会一直挂着旧版本号）",
+            UpdateCheck.dueForCheck(now - 1000L, "1.11", "1.12", now, day),
+        )
+        assertTrue("从没查过 → 该查", UpdateCheck.dueForCheck(0L, "", "1.12", now, day))
+        assertTrue("过了 24h → 该查", UpdateCheck.dueForCheck(now - day, "1.12", "1.12", now, day))
+        assertTrue(
+            "老缓存没记版本 → 也算该查，重查一次建立新结论",
+            UpdateCheck.dueForCheck(now - 1000L, "", "1.12", now, day),
+        )
+    }
 }

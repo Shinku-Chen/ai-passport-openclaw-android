@@ -780,7 +780,8 @@ class SettingsFragment : Fragment() {
     /** 渲染更新结论：有新版就列出来，没有就说「已是最新」，从没查过就说明会自动查。 */
     private fun renderUpdateState() {
         val b = _binding ?: return
-        val s = UpdateChecker.cachedNotices(requireContext().applicationContext)
+        // 传当前版本：落盘文案里写着检查时的版本号，App 升级后就别再展示了（见 UpdateChecker）
+        val s = UpdateChecker.cachedNotices(requireContext().applicationContext, currentVersionName())
         val version = currentVersionName()
         // 当前版本**始终显示**(用户要求「应用设置里能看到本 App 版本」):反馈问题时报版本号最有用。
         val lines = listOf(s.appNotice, s.firmwareNotice).filter { it.isNotBlank() }
