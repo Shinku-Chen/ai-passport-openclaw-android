@@ -161,6 +161,14 @@ class BleCentral(
             val name = result.scanRecord?.deviceName ?: device.name
             // 兜底:即便广播过滤失效,也按名字前缀再过滤一次(前缀与大小写敏感规则来自设备档案)
             if (!profile.matchesName(name)) return
+            // 只认上次连过的那台:现场常有多台同名 Passport-* 同时在广播(别人的、备用机)。
+            // 只按名字前缀连会随到随连 —— 连到别人那台后对方唯一的连接槽已满,只能干等 10s 超时,
+            // 再扫描再连错,用户体感就是“设备重启后自动连接特别慢”(真机:关掉旁边那台立刻就好)。
+            // “忘记设备”会清掉记住的地址 → 那种情况下什么都能连,不影响配对/换机。
+            if (!ScanPick.shouldConnect(lastDeviceAddr, device.address)) {
+                Log.i(tag, "发现同名设备 ${device.address} $name:不是上次那台($lastDeviceAddr),忽略")
+                return
+            }
             Log.i(tag, "发现设备 ${device.address} $name")
             alreadyStartedAttempts = 0   // 扫到了:重置 code=1 计数
             stopScan()

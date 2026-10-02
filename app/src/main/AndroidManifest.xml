@@ -47,9 +47,12 @@
         android:networkSecurityConfig="@xml/network_security_config"
         android:allowBackup="true">
 
+        <!-- launchMode=singleTop:再次启动（含诊断用的 am start 带 extra 那种）会打到**已在栈顶的同一个实例**，
+             走 onNewIntent 而不是新建一个 Activity。主界面是常驻的仪表板，重复启动没有理由重建它。 -->
         <activity
             android:name=".MainActivity"
             android:exported="true"
+            android:launchMode="singleTop"
             android:windowSoftInputMode="adjustResize">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />

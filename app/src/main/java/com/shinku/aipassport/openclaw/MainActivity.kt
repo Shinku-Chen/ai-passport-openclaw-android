@@ -117,6 +117,7 @@ class MainActivity : AppCompatActivity() {
         val text = intent?.getStringExtra(VoiceBridgeService.EXTRA_TTS_TEST_TEXT)
             ?.takeIf { it.isNotBlank() } ?: return
         val gapMs = intent.getIntExtra(VoiceBridgeService.EXTRA_TTS_TEST_GAP_MS, 0)
+        Log.i("MainActivity", "【诊断】收到试推意图: ${text.length} 字,间隔=${gapMs}ms")
         Toast.makeText(
             this,
             "诊断：试推设备朗读（${text.length} 字，间隔=${if (gapMs > 0) "${gapMs}ms" else "生产"}）",
