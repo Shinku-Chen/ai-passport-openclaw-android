@@ -353,6 +353,9 @@ class VoicePipeline(
         when {
             ev == "turn_start" -> onTurnStart()
             ev == "turn_end" -> onTurnEnd()
+            // 设备撤销本轮(短按 OK 只唤醒屏幕):固件按下就开轮(保证识别零延迟),
+            // 但短于此门限松手会改成 turn_cancel —— 这里静默丢弃,绝不回「无语音」。
+            ev == "turn_cancel" -> onTurnCancel()
             // 设备的 hello:带上固件版本与协议版本 —— 与本 App 比对(同一版本号成对发布),
             // 不一致时双侧提示用户更新(只提示、不阻断对话)。
             ev == "hello" -> onDeviceHello(obj)
@@ -402,6 +405,22 @@ class VoicePipeline(
         val myTurn = turnId
         stt.startTurn { onRecordingReady(myTurn) }
         onState("录音中…")
+    }
+
+    /**
+     * 设备撤销本轮(固件 `{"ev":"turn_cancel"}`,短按 OK 只唤醒屏幕)。
+     *
+     * 与 barge 走同一条「作废旧轮」路径:`turnId++` 让仍在飞行中的 `endTurn` 结果失效,
+     * `stt.barge()` 丢掉本轮音频。**不发任何 TEXT 气泡**(旧行为会回一条「无语音」),
+     * 状态卡几秒后回到就绪。
+     */
+    private fun onTurnCancel() {
+        turnId++
+        turnBodies = TurnBodies(turnId)
+        turnActive = false
+        stt.barge()
+        Log.i(tag, "设备取消本轮(短按唤醒):丢弃音频与识别结果,不发气泡")
+        publishReadyAfter(turnId, 500L)
     }
 
     /**
