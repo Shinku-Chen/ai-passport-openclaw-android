@@ -1,9 +1,8 @@
 {
   "schema": 1,
-  "updated": "2026-10-02T13:30:00Z",
+  "updated": "2026-10-02T13:40:21Z",
   "app": {
     "version": "1.12",
-    "versionCode": 8,
     "url": "https://github.com/Shinku-Chen/ai-passport-openclaw-android/releases/latest",
     "notes": "版本更新提醒；设备卡显示固件版本；应用设置常显当前版本"
   },
