@@ -3,6 +3,8 @@ package com.shinku.aipassport.openclaw.ui
 import android.content.Intent
 import android.net.Uri
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.provider.Settings
 import android.view.LayoutInflater
 import android.view.View
@@ -68,6 +70,13 @@ class SettingsFragment : Fragment() {
 
     private lateinit var settings: GatewaySettings
     private lateinit var xzSettings: XiaozhiSettings
+
+    /** 提示词防抖落盘(见 schedulePromptSave)。 */
+    private val promptSaveHandler = Handler(Looper.getMainLooper())
+    private var promptSaveTask: Runnable? = null
+
+    /** 最近一次落盘的语音附加提示(判断是否真的变了)。 */
+    private var lastPromptSuffix: String = ""
 
     /**
      * 当前语音桥服务实际使用的网关类型(页面加载时的落盘值)。
@@ -297,7 +306,11 @@ class SettingsFragment : Fragment() {
         binding.inputReplyTimeout.setText(settings.openclawReplyTimeoutSeconds.toString())
         binding.inputSessionName.setText(settings.openclawSessionName)
         // 语音附加提示(与网关类型无关,所有通道共用)
+        // 语音附加提示:用户要求「要不实时保存」—— 不设保存闸门,输入停手 0.7s 即落盘,
+        // 并通知服务更新运行中的流水线(只影响上行文本,不会重连网关)。
         binding.inputVoicePromptSuffix.setText(settings.voicePromptSuffix)
+        lastPromptSuffix = settings.voicePromptSuffix
+        binding.inputVoicePromptSuffix.doAfterTextChanged { schedulePromptSave(it?.toString().orEmpty()) }
         // App 调试展示开关(默认开):切换即落盘(纯 App 展示,与网关连接无关,不走保存校验)
         binding.checkShowRawStream.isChecked = settings.showRawStream
         binding.checkShowRawStream.setOnCheckedChangeListener { _, checked ->
@@ -929,6 +942,38 @@ class SettingsFragment : Fragment() {
         scope.launch { log(line) }
     }
 
+    /** 提示词防抖:打字过程中不写盘、不打扰服务。 */
+    private fun schedulePromptSave(text: String) {
+        promptSaveTask?.let { promptSaveHandler.removeCallbacks(it) }
+        val task = Runnable { savePromptSuffix(text) }
+        promptSaveTask = task
+        promptSaveHandler.postDelayed(task, PROMPT_SAVE_DEBOUNCE_MS)
+    }
+
+    /** 立刻结算待落盘的提示词(离开页面时调用,避免丢掉最后一次编辑)。 */
+    private fun flushPromptSave() {
+        val pending = promptSaveTask
+        promptSaveTask = null
+        if (pending != null) {
+            promptSaveHandler.removeCallbacks(pending)
+            pending.run()
+        }
+    }
+
+    /**
+     * 落盘语音附加提示,并在值真的变了时通知服务重载。
+     * 只影响上行文本,与网关连接无关(服务侧 reloadGatewaySettings 会把它同步给流水线)。
+     */
+    private fun savePromptSuffix(text: String) {
+        val trimmed = text.trim()
+        promptSaveTask = null
+        if (trimmed == lastPromptSuffix) return
+        settings.voicePromptSuffix = trimmed
+        lastPromptSuffix = trimmed
+        context?.applicationContext?.let { VoiceBridgeService.reloadSettings(it) }
+        log("语音附加提示已保存(即时生效)")
+    }
+
     private fun log(line: String) {
         val b = _binding ?: return
         val cur = b.logText.text.toString()
@@ -936,6 +981,8 @@ class SettingsFragment : Fragment() {
     }
 
     override fun onDestroyView() {
+        // 输完提示词立刻切页/切 Tab 时,最后一次编辑也要落盘。
+        flushPromptSave()
         _binding = null
         super.onDestroyView()
     }
@@ -947,6 +994,9 @@ class SettingsFragment : Fragment() {
 
     companion object {
         /** 重启服务时 stop 与 start 之间的间隔,等旧实例走完 onDestroy。 */
+        /** 语音附加提示的防抖落盘间隔(输入停手后才写盘)。 */
+        private const val PROMPT_SAVE_DEBOUNCE_MS = 700L
+
         private const val RESTART_GAP_MS = 600L
 
         /**

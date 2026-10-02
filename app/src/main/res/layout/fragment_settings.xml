@@ -758,7 +758,7 @@
             android:id="@+id/titleVoicePrompt"
             style="@style/FieldLabel"
             android:layout_marginTop="12dp"
-            android:text="语音附加提示（仅语音输入时追加）" />
+            android:text="语音附加提示（仅语音输入；改完即时生效）" />
 
         <EditText
             android:id="@+id/inputVoicePromptSuffix"
