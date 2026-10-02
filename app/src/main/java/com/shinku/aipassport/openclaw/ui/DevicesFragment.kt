@@ -34,6 +34,7 @@ class DevicesFragment : Fragment() {
                 deviceName = intent.getStringExtra(VoiceBridgeService.EXTRA_DEVICE_NAME),
                 deviceAddr = intent.getStringExtra(VoiceBridgeService.EXTRA_DEVICE_ADDR),
                 linkState = intent.getStringExtra(VoiceBridgeService.EXTRA_DEVICE_STATE),
+                deviceFirmware = intent.getStringExtra(VoiceBridgeService.EXTRA_DEVICE_FW),
             )
         }
     }
@@ -125,9 +126,10 @@ class DevicesFragment : Fragment() {
         deviceName: String?,
         deviceAddr: String?,
         linkState: String?,
+        deviceFirmware: String?,
     ) {
         binding.deviceStatusText.text = statusLine(status, linkState)
-        adapter.set(buildDeviceList(deviceName, deviceAddr, linkState))
+        adapter.set(buildDeviceList(deviceName, deviceAddr, linkState, deviceFirmware))
     }
 
     /**
@@ -156,12 +158,16 @@ class DevicesFragment : Fragment() {
         deviceName: String?,
         deviceAddr: String?,
         linkState: String?,
+        deviceFirmware: String?,
     ): List<DeviceAdapter.DeviceItem> {
         if (!isLinkPresent(linkState) || deviceAddr.isNullOrBlank()) return emptyList()
         return listOf(
             DeviceAdapter.DeviceItem(
                 name = deviceName?.takeIf { it.isNotBlank() } ?: "AI Passport 设备",
-                address = deviceAddr,
+                // 地址行顺带把固件版本带上:设备 hello 报过才有(老固件不上报就不显示)
+                address = deviceAddr + deviceFirmware
+                    ?.takeIf { it.isNotBlank() }
+                    ?.let { "  ·  固件 $it" }.orEmpty(),
                 // 必须用映射后的中文状态:真机反馈过「没配对却在列表里显示已连接」——
                 // 这里以前直接用了原始 linkState(值为「已连接」)，把"连上但未加密"写成了已连接。
                 state = when (linkState) {

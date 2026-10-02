@@ -159,6 +159,9 @@ class VoiceBridgeService : Service() {
         /** BLE 链路状态(只由 BLE 回调写,不掺网关状态):正在扫描/正在连接/已连接/已加密/已就绪/未连接。 */
         const val EXTRA_DEVICE_STATE = "device_state"
 
+        /** 设备固件版本(来自设备 hello 的 fw);没有就带空串。 */
+        const val EXTRA_DEVICE_FW = "device_fw"
+
         /** 链路状态取值(设备页卡片与状态行直接用这几个词)。 */
         const val LINK_SCANNING = "正在扫描"
         const val LINK_CONNECTING = "正在连接"
@@ -475,6 +478,8 @@ class VoiceBridgeService : Service() {
             // 录音/识别真的就绪 → 下发 EVENT {"ev":"turn_ready"}(设备侧「按下即红、就绪变绿」)
             sendEvent = { json -> sendEventFrame(json) },
             appVersion = appVersionName(),
+            // 设备 hello 到齐(含固件版本)后重发一次状态:设备页据此显示固件版本
+            onDeviceInfo = { publishStatus(lastStatusText ?: "已就绪") },
             onState = { status ->
                 // 流水线状态也上状态卡;同时把与网关有关的那几条(已就绪/中断原因)同步给设备:
                 // 否则一轮跑完后设备会停在「网关 工作中」,直到下一次状态变化才纠正。
@@ -1362,6 +1367,11 @@ class VoiceBridgeService : Service() {
                 .putExtra(EXTRA_DEVICE_NAME, lastDeviceName)
                 .putExtra(EXTRA_DEVICE_ADDR, lastDeviceAddr)
                 .putExtra(EXTRA_DEVICE_STATE, deviceLinkState)
+                // 固件版本:只有设备 hello 报过才有(老固件不上报 → 空串,设备页就不显示)
+                .putExtra(
+                    EXTRA_DEVICE_FW,
+                    if (::pipeline.isInitialized) pipeline.deviceFirmwareVersion.orEmpty() else "",
+                )
         )
     }
 

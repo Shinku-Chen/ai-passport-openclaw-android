@@ -100,6 +100,12 @@ class VoicePipeline(
      */
     private val sendEvent: (String) -> Boolean = { false },
     private val onState: (String) -> Unit,
+
+    /**
+     * 设备信息(固件版本等)补齐时回调一次:设备页要显示固件版本,而版本是随设备 hello
+     * 才到的(晚于链路就绪),所以需要这一次通知去刷新广播。
+     */
+    private val onDeviceInfo: () -> Unit = {},
     private val clearPendingWrites: () -> Unit = {},
     /**
      * 语音输入末尾自动附加的提示词(设置页可改,见 [VoicePrompt]);
@@ -162,6 +168,8 @@ class VoicePipeline(
         helloChecked = true
         val fw = obj?.get("fw")?.takeIf { it.isJsonPrimitive }?.asString
         deviceFirmwareVersion = fw?.trim()?.takeIf { it.isNotEmpty() }
+        // 固件版本到齐了:通知服务重发一次状态,设备页才能显示出版本号
+        onDeviceInfo()
         val proto = obj?.get("proto")?.takeIf { it.isJsonPrimitive }?.asInt
         // 设备能力:hello 的 caps 里有没有 tts_opus(固件只在解码器就绪时报,见协议文档)
         val caps = obj?.get("caps")?.takeIf { it.isJsonArray }?.asJsonArray
