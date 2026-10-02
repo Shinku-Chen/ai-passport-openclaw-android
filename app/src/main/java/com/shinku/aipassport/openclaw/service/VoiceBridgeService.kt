@@ -1071,6 +1071,29 @@ class VoiceBridgeService : Service() {
             }
         }
 
+        /**
+         * 设备在**朗读推送途中**掉线 → 判定这台设备扛不住这段下行音频,自我保护。
+         *
+         * 真机实测(HyperOS / Android 16 + AI Passport 固件 v1.10-intercom):开始推 TTS 后
+         * 约 5–6 秒设备断开重启(`设备未连接,丢弃控制帧: {"ev":"tts_abort"}` → `已加密` 重连),
+         * 重连后再推又崩,两次完全一致。原因在**固件侧**(解码队列/内存或采样率不匹配),
+         * App 能做的只有:停手、关掉开关、把原因明确告知用户(否则用户每说一句设备重启一次)。
+         *
+         * 代价不对称:误判(其实是环境掉线)只是让用户重新打开开关;不判则设备反复重启。
+         */
+        private fun onDeviceTtsLookedTooHeavy(sent: Int, total: Int) {
+            Log.e(
+                TAG,
+                "设备朗读途中设备掉线(已发 $sent/$total 帧):判定该设备扛不住下行音频,自动关闭设备朗读",
+            )
+            try {
+                settings.ttsEnabled = false
+            } catch (e: Exception) {
+                Log.w(TAG, "自动关闭设备朗读开关失败:${e.message}")
+            }
+            publishStatus("设备朗读已自动关闭:设备在播报途中掉线(已发 $sent/$total 帧),请先不要打开")
+        }
+
         /** 一轮下发的完整流程;每一步前都检查 [pushId],确保被 barge 后立刻停手。 */
         private suspend fun pushAudio(text: String, id: Int) {
             if (!::ble.isInitialized || !ble.isConnected()) {
@@ -1128,6 +1151,13 @@ class VoiceBridgeService : Service() {
                 if (wait > 0) delay(wait)
                 if (id != pushId) {
                     Log.i(TAG, "设备朗读被打断: 已发 $sent/${plan.packets.size} 帧")
+                    return
+                }
+                // 设备在**推送途中**掉线:极可能是它被这段音频搞崩了(真机实测:推出约 90 帧
+                // ≈5.5s 后设备重启,重连后再次崩,两次一致)。继续推只会让“连上→崩→重连”反复发生,
+                // 所以立刻停手、关掉开关并把原因播出来 —— 既不再折磨设备,也让用户看得见。
+                if (!ble.isConnected()) {
+                    onDeviceTtsLookedTooHeavy(sent, plan.packets.size)
                     return
                 }
                 ble.writeBytes(vbEncodeTtsOpusFrame(seq, plan.rateKhz, plan.frameMs, packet))
