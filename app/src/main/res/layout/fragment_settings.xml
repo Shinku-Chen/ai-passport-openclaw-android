@@ -927,6 +927,27 @@
             android:padding="8dp"
             android:background="@drawable/bg_input" />
 
+        <!-- 小智 AI 作为网关类型时显示:连接/就绪状态(来自语音桥服务的状态广播,与顶部状态卡同源)。
+             小智网关没有独立连接 —— 「可收发」就是识别通道那条 WS 是否握手,所以直接复用服务状态。 -->
+        <TextView
+            android:id="@+id/xzConnectStatus"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text=""
+            android:textSize="12sp"
+            android:textColor="#9E9E9E"
+            android:padding="4dp" />
+
+        <!-- 小智 AI 的说明行:一句话讲清这个模式与其它网关的区别(回复与音色都来自小智)。 -->
+        <TextView
+            android:id="@+id/xzGatewayHint"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="回复由小智生成,并用小智的声音在设备上朗读。"
+            android:textColor="#9E9E9E"
+            android:textSize="12sp"
+            android:padding="4dp" />
+
         <TextView
             android:id="@+id/titleLog"
             android:layout_width="wrap_content"

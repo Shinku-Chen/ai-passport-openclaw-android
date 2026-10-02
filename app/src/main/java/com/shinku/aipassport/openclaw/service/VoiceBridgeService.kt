@@ -52,6 +52,8 @@ import com.shinku.aipassport.openclaw.tts.TtsFlowControl
 import com.shinku.aipassport.openclaw.tts.TtsFraming
 import com.shinku.aipassport.openclaw.tts.TtsPlaybackReport
 import com.shinku.aipassport.openclaw.tts.TtsPushPlan
+import com.shinku.aipassport.openclaw.tts.XiaozhiTtsDownlink
+import com.shinku.aipassport.openclaw.tts.XiaozhiTtsRelay
 import com.shinku.aipassport.openclaw.tts.buildTtsPushPlan
 import com.shinku.aipassport.openclaw.tts.ttsPlaybackLogLine
 import com.theeasiestway.opus.Constants
@@ -120,6 +122,30 @@ class VoiceBridgeService : Service() {
 
         /** 设置页「检查更新」：立即查一次（用户手点，会绕过 CDN 缓存）。 */
         const val ACTION_CHECK_UPDATE = "com.shinku.aipassport.openclaw.action.CHECK_UPDATE"
+
+        /**
+         * 小智 TTS 直通的待发队列上限(帧)。
+         *
+         * 14s 音频:小智按句推、下游按流控实时发,正常绝不会积到这个量;
+         * 设上限只是防链路异常时内存无限涨。
+         */
+        const val MAX_XIAOZHI_TTS_QUEUE_FRAMES = 240
+
+        /** 小智 TTS 直通 drain 协程在空队列时的轮询间隔(句间间隙)。 */
+        const val XIAOZHI_TTS_IDLE_POLL_MS = 10L
+
+        /**
+         * 小智 TTS 直通空队列多久后降频轮询(ms)。
+         *
+         * 超过它仍无新帧也没有 `tts_stop`,基本就是 `stop` 丢了(或服务端异常)。
+         * 这里**不**主动发 `tts_stop`:句子间的生成间隙本来就可能有几秒,
+         * 提前收尾会让后面的句子因为没有 `tts_start` 而被丢(听感上“后半段没声音”)。
+         * 改为降频等待,由下一轮 `turn_start` 的 `tts_abort` 或迟到的 `stop` 终止。
+         */
+        const val XIAOZHI_TTS_SLOW_POLL_AFTER_MS = 5_000L
+
+        /** 降频后的轮询间隔(ms):几乎不耗 CPU,但也不会把协程永久卡在 10ms 轮询上。 */
+        const val XIAOZHI_TTS_SLOW_POLL_MS = 200L
 
         /** 更新检查结论广播（供顶部状态卡与设置页渲染）。 */
         const val ACTION_UPDATE_STATE = "com.shinku.aipassport.openclaw.action.UPDATE_STATE"
@@ -307,8 +333,18 @@ class VoiceBridgeService : Service() {
     /** 设备朗读编排(关/开+引擎的门都在这里,见 [DeviceTtsSession])。 */
     private lateinit var deviceTts: DeviceTtsSession
 
-    /** 设备朗读的下行通路实现(合成 → Opus → `TYPE_TTS_OPUS` 帧)。 */
+    /** 设备朗读的下行通路实现(合成 → Opus → `TYPE_TTS_OPUS` 帧;小智直通也复用它)。 */
     private lateinit var deviceTtsPush: DeviceTtsPush
+
+    /**
+     * 小智 TTS 直通(增量 3:小智回的下行 opus 原样转发给设备)。
+     *
+     * 它是识别通道那条 [com.shinku.aipassport.openclaw.stt.XiaozhiSession] 的 TTS 观察者:
+     * 会话/音频**共用同一条 WS**(与「小智 AI 网关」、STT 一样),不另建连接。
+     * null = 服务还没 startBridge(或已释放)。
+     */
+    @Volatile
+    private var xiaozhiTtsRelay: XiaozhiTtsRelay? = null
 
     @Volatile
     private var initialized = false
@@ -422,6 +458,12 @@ class VoiceBridgeService : Service() {
 
     override fun onDestroy() {
         scope.cancel()
+        // 先摘 TTS 直通观察者(会话归 STT 所有,这里不能关它),再停 BLE:顺序反过来不影响正确性,
+        // 但先摘掉可避免服务销毁后旧实例的 WS 回调又把音频写进已取消的 scope。
+        xiaozhiTtsRelay?.let { relay ->
+            if (::stt.isInitialized) stt.session.clearTtsObserver(relay)
+        }
+        xiaozhiTtsRelay = null
         if (::ble.isInitialized) ble.stop()
         if (::gateway.isInitialized) gateway.close()
         if (::tts.isInitialized) tts.shutdown()
@@ -470,6 +512,23 @@ class VoiceBridgeService : Service() {
         // 开关默认关(设置页「设备朗读回复（TTS）」),引擎默认系统 TTS。
         deviceTtsPush = DeviceTtsPush()
         deviceTts = DeviceTtsSession(enabled = { this.settings.ttsEnabled }, downlink = deviceTtsPush)
+        // 小智 TTS 直通(增量 3):只挂观察者,不建连接 —— 音频在小智会话里已经下来,
+        // 直接按 [SEQ][rate_khz][frame_ms]+opus 组 TTS_OPUS 帧转发给设备(不本地合成/不重编码)。
+        // enabled 门同时要求「当前网关类型是小智 AI」:小智服务端并不知道 App 用哪个后端,
+        // 任何类型下它都会推自己的 TTS 音频;不挡住就会和本地合成的朗读叠着出声。
+        XiaozhiTtsRelay(
+            enabled = {
+                this.settings.type == GatewaySettings.TYPE_XIAOZHI &&
+                    this.settings.ttsEnabled &&
+                    // 设备没在 hello 里报 tts_opus 时绝不能发 0x06(未知类型会被当错位帧,
+                    // 连带丢掉后面一帧)—— 与本地合成那条路的设备能力门控同一语义。
+                    (!::pipeline.isInitialized || pipeline.deviceTtsSupported)
+            },
+            downlink = deviceTtsPush,
+        ).also {
+            xiaozhiTtsRelay = it
+            stt.session.setTtsObserver(it)
+        }
         Log.i(TAG, "设备朗读(TTS): enabled=${settings.ttsEnabled} engine=${settings.ttsEngine}")
         // 开关打开时预热一次合成引擎(幂等):
         //  ① 去掉第一条回复的合成延迟(与识别通道预热同理);
@@ -1113,7 +1172,7 @@ class VoiceBridgeService : Service() {
     @Volatile
     private var ttsPacingOverrideMs: Int = 0
 
-    private inner class DeviceTtsPush : DeviceTtsDownlink {
+    private inner class DeviceTtsPush : DeviceTtsDownlink, XiaozhiTtsDownlink {
 
         /**
          * 预热合成引擎(幂等,只记日志):服务启动时调用一次 —— 去掉首条回复的合成延迟,
@@ -1164,9 +1223,203 @@ class VoiceBridgeService : Service() {
             pushId++
             pushJob?.cancel()
             pushJob = null
+            // 小智直通也一并作废:它与本地合成共用同一套续命语义(旧轮音频绝不能续到新一轮)。
+            // 每轮 turn_start 都会走这里,所以「无条件发 tts_abort 防残留」这条既有不变量不变。
+            xzPushId++
+            xzJob?.cancel()
+            xzJob = null
+            synchronized(xzLock) { xzFrames.clear() }
+            xzStarted = false
             // 无论有没有在途下发都要发:设备最多缓存 ~2s 音频,上一轮 tts_stop 之后它可能还在播。
             sendControlJson(TtsControl.ABORT_JSON)
             if (active) Log.i(TAG, "设备朗读已中止(tts_abort)")
+        }
+
+        // ---- 小智 TTS 直通(增量 3:小智回的下行 opus 原样转发给设备)----
+        //
+        // 与上面的本地合成路径**互斥**(由网关类型决定走哪条),但复用同一套东西:
+        //  - CONTROL 事件:`tts_start` / `tts_stop` / `tts_abort`(打断走上面的 [abort]);
+        //  - 流控:同一个 [TtsFlowControl](领先量 ≤ 目标、在途上限);
+        //  - 写队列:同样的 [BleCentral.writeBytes] + 批量写(WRITE_NO_RESPONSE);
+        //  - 对账:同一份 lastFrames 与设备 tts_playback_* 回报日志。
+        // 唯一区别:**不合成、不编码** —— 小智给的 opus 包直接进 [VbFrame.TYPE_TTS_OPUS]。
+
+        /** 待发队列:一帧音频,或「一段结束」标记(见 [XiaozhiTtsItem],定义在文件级 —— inner class 内不允许嵌套接口)。 */
+        private val xzFrames = ArrayDeque<XiaozhiTtsItem>()
+
+        /** [xzFrames] 的锁(WS 回调线程 / drain 协程 / abort 三处)。 */
+        private val xzLock = Any()
+
+        /** 本段是否已下发 `tts_start`;false 时丢帧(没有 bracket 的音频帧会被设备当错位处理)。 */
+        @Volatile
+        private var xzStarted = false
+
+        /** 小智直通推送编号:start/abort 自增,在途 drain 下一项前退出。 */
+        @Volatile
+        private var xzPushId = 0
+
+        @Volatile
+        private var xzJob: Job? = null
+
+        /** 本段下发起始时刻([TtsFlowControl] 的实时节奏基准)。 */
+        @Volatile
+        private var xzSentAtMs = 0L
+
+        override fun start() {
+            if (!sendControlJson(TtsControl.START_JSON)) {
+                // 设备没连/没初始化:整段放弃(帧没有 bracket 会被当错位处理,不如不发)。
+                xzStarted = false
+                synchronized(xzLock) { xzFrames.clear() }
+                return
+            }
+            xzPushId++                 // 旧 drain 立即失效(不会把上一段尚未推完的帧接着推)
+            xzJob?.cancel()
+            xzJob = null
+            synchronized(xzLock) { xzFrames.clear() }
+            xzSentAtMs = System.currentTimeMillis()
+            xzStarted = true
+            Log.i(TAG, "小智 TTS 直通:下发 tts_start(采样率/帧长由帧头携带)")
+        }
+
+        override fun pushFrame(rateKhz: Int, frameMs: Int, payload: ByteArray) {
+            // rateKhz 已经在 payload 的帧头里(由 XiaozhiTtsRelay 组好),这里不再用;
+            // 保留形参是为了满足 [XiaozhiTtsDownlink] 的接口形状(体上看到的速率/帧长)。
+            if (!xzStarted) return
+            val overflow: Boolean
+            synchronized(xzLock) {
+                overflow = xzFrames.size >= MAX_XIAOZHI_TTS_QUEUE_FRAMES
+                if (!overflow) xzFrames.addLast(XiaozhiTtsItem.Frame(frameMs, payload))
+            }
+            if (overflow) {
+                // 上限 ≈14s 音频:正常绝不会到(链路/设备异常时才会),丢新帧并记日志。
+                Log.w(TAG, "小智 TTS 直通:待发队列已满($MAX_XIAOZHI_TTS_QUEUE_FRAMES 帧),丢弃一帧")
+                return
+            }
+            ensureXzDrain()
+        }
+
+        override fun stop() {
+            if (!xzStarted) return
+            // 收尾交给 drain:先把它排在队尾,保证 tts_stop 一定在最后一帧之后发出。
+            val queued: Boolean
+            synchronized(xzLock) {
+                queued = xzFrames.size < MAX_XIAOZHI_TTS_QUEUE_FRAMES
+                if (queued) xzFrames.addLast(XiaozhiTtsItem.Stop)
+            }
+            if (queued) {
+                ensureXzDrain()
+            } else {
+                // 极端(队列已满):直接收尾,不能让设备一直停在播放态(同时丢掉未发的音频)。
+                Log.w(TAG, "小智 TTS 直通:队列已满,直接下发 tts_stop")
+                xzPushId++
+                xzJob?.cancel()
+                xzJob = null
+                synchronized(xzLock) { xzFrames.clear() }
+                xzStarted = false
+                sendControlJson(TtsControl.STOP_JSON)
+            }
+        }
+
+        /** 确保有一个 drain 协程在跑(幂等)。 */
+        private fun ensureXzDrain() {
+            if (xzJob?.isActive == true) return
+            val id = ++xzPushId
+            xzJob = scope.launch { drainXiaozhiTts(id) }
+        }
+
+        /**
+         * 逐项出队下发(流控与本地合成那条路同一套规则)。
+         *
+         * 队列空时等 [XIAOZHI_TTS_IDLE_POLL_MS] 再查(小智按句推,句间可能有几十 ms 到几秒的生成间隙);
+         * 超过 [XIAOZHI_TTS_SLOW_POLL_AFTER_MS] 仍无新项则降频等待 —— 不主动收尾(见该常量注释),
+         * 由下一轮 `abort`/`stop` 终止。
+         */
+        private suspend fun drainXiaozhiTts(id: Int) {
+            if (!::ble.isInitialized || !ble.isConnected()) {
+                Log.d(TAG, "设备未连接,跳过小智 TTS 直通下发")
+                synchronized(xzLock) { xzFrames.clear() }
+                xzStarted = false
+                return
+            }
+            // 与本地合成同一理由:带响应写只有 11 帧/秒,低于实时所需的 16.7 帧/秒。
+            ble.setBulkWrite(true)
+            val deliveredBase = ble.deliveredFrameCount()
+            var sent = 0
+            var idleMs = 0L
+            var slow = false
+            try {
+                while (true) {
+                    if (id != xzPushId) {
+                        Log.i(TAG, "小智 TTS 直通被打断:已发 $sent 帧")
+                        return
+                    }
+                    val item = synchronized(xzLock) { xzFrames.removeFirstOrNull() }
+                    if (item == null) {
+                        if (!slow && idleMs >= XIAOZHI_TTS_SLOW_POLL_AFTER_MS) {
+                            slow = true
+                            Log.w(TAG, "小智 TTS 直通:${idleMs}ms 无新帧也无 tts_stop,降频等待下一轮/迟到的 stop")
+                        }
+                        val poll = if (slow) XIAOZHI_TTS_SLOW_POLL_MS else XIAOZHI_TTS_IDLE_POLL_MS
+                        delay(poll)
+                        idleMs += poll
+                        continue
+                    }
+                    idleMs = 0L
+                    slow = false
+                    when (item) {
+                        is XiaozhiTtsItem.Stop -> {
+                            finishXiaozhiTts(sent)
+                            return
+                        }
+
+                        is XiaozhiTtsItem.Frame -> {
+                            // 节奏:与本地合成同一条 TtsFlowControl(领先设备 ≤2s,目标 1200ms)。
+                            val wait = TtsFlowControl.waitMs(
+                                sent,
+                                System.currentTimeMillis() - xzSentAtMs,
+                                frameMs = item.frameMs,
+                            )
+                            if (wait > 0) delay(wait)
+                            // 在途积压上限:入队快、送达慢时手机会凭空「领先」,设备侧却是空的。
+                            var backlogGuard = 0
+                            while (TtsFlowControl.inFlightExceeds(
+                                    sent,
+                                    (ble.deliveredFrameCount() - deliveredBase).toInt().coerceAtLeast(0),
+                                ) && backlogGuard < 200
+                            ) {
+                                if (id != xzPushId || !ble.isConnected()) break
+                                delay(5)
+                                backlogGuard++
+                            }
+                            if (id != xzPushId) {
+                                Log.i(TAG, "小智 TTS 直通被打断:已发 $sent 帧")
+                                return
+                            }
+                            // 推送途中掉线:与本地合成同一判定(该设备可能扛不住下行音频),停手并关开关。
+                            if (!ble.isConnected()) {
+                                val remaining = synchronized(xzLock) { xzFrames.size }
+                                onDeviceTtsLookedTooHeavy(sent, sent + remaining)
+                                return
+                            }
+                            // payload 已含 [SEQ][rate_khz][frame_ms](由 XiaozhiTtsRelay 组好),
+                            // 这里只包 6B 帧头 —— 不解析、不重编码。
+                            ble.writeBytes(vbEncodeFrame(VbFrame.TYPE_TTS_OPUS, 0, item.payload))
+                            sent++
+                            lastFrames = sent
+                        }
+                    }
+                }
+            } finally {
+                ble.setBulkWrite(false)   // 正常/打断/掉链都要恢复带响应写
+            }
+        }
+
+        /** 一段小智直通收尾:发 `tts_stop` 并复位记账(幂等)。 */
+        private fun finishXiaozhiTts(sent: Int) {
+            xzStarted = false
+            synchronized(xzLock) { xzFrames.clear() }
+            sendControlJson(TtsControl.STOP_JSON)
+            Log.i(TAG, "小智 TTS 直通下发完成: frames=$sent")
         }
 
         override fun onPlaybackReport(report: TtsPlaybackReport) {
@@ -1702,4 +1955,21 @@ class VoiceBridgeService : Service() {
             stopForeground(true)
         }
     }
+}
+
+/**
+ * 小智 TTS 直通的待发项(`DeviceTtsPush` 内部队列的元素)。
+ *
+ * 为什么需要 [Stop] 标记而不是「收尾时直接发 `tts_stop`」:音频帧按流控实时下发,`stop` 到达时
+ * 队列里可能还剩几百 ms 未发完 —— 只有把「结束」排在同一队列的末尾,才能保证设备一定是在
+ * **最后一帧之后**才收到 `tts_stop`。
+ *
+ * 定义在文件级的原因:Kotlin 不允许在 inner class 内嵌套接口。
+ */
+private sealed interface XiaozhiTtsItem {
+    /** 一帧已组好 `[SEQ][rate_khz][frame_ms] + opus` 的下行音频([frameMs] 用于流控节奏)。 */
+    data class Frame(val frameMs: Int, val payload: ByteArray) : XiaozhiTtsItem
+
+    /** 一段朗读结束:出队时发 `{"ev":"tts_stop"}`。 */
+    data object Stop : XiaozhiTtsItem
 }

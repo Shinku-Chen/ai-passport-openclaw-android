@@ -1,7 +1,11 @@
 package com.shinku.aipassport.openclaw.ui
 
+import android.content.BroadcastReceiver
+import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
@@ -87,6 +91,21 @@ class SettingsFragment : Fragment() {
      * 保存成功且类型变化时才重启服务。
      */
     private var appliedType: String = GatewaySettings.TYPE_OPENCLAW
+
+    /**
+     * 语音桥服务广播的**最近一条状态**(小智模式的「连接/就绪状态」行用)。
+     * 与主界面顶部状态卡同源(ACTION_STATUS);"" = 本页还没收到过广播。
+     */
+    private var lastStatus: String = ""
+
+    /** 语音桥状态广播接收器:只在「网关设置」且选中「小智 AI」时渲染状态行(见 [renderXiaozhiStatus])。 */
+    private val statusReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            val s = intent?.getStringExtra(VoiceBridgeService.EXTRA_STATUS) ?: return
+            lastStatus = s
+            renderXiaozhiStatus()
+        }
+    }
 
     override fun onCreateView(
         inflater: LayoutInflater,
@@ -192,6 +211,9 @@ class SettingsFragment : Fragment() {
                 binding.titleGateway, binding.labelGatewayType, binding.spinnerType,
                 binding.textCleartextHint,
                 binding.groupOpenclaw, binding.groupHermes, binding.groupOpenai, binding.btnSave,
+                // 小智 AI 的网关内容(选中该类型时才显示,见 applyTypeVisibility):激活状态 + 连接状态 + 说明
+                binding.titleXiaozhi, binding.xzStatus, binding.xzConnectStatus,
+                binding.xzGatewayHint, binding.btnActivateXz, binding.xzActiveStatus,
             ),
             Section.DEVICE to listOf(binding.groupDevice),
             Section.CHAT to listOf(
@@ -216,6 +238,8 @@ class SettingsFragment : Fragment() {
             // 网关三套配置的内部可见性由类型决定(见 applyTypeVisibility),
             // 这里把当前类型对应的那套放出来,其余保持隐藏。
             if (section == Section.GATEWAY) applyTypeVisibility()
+            // 「对话设置」里依赖本地管线的两项在小智模式下隐藏(见 applyChatItemVisibility)。
+            if (section == Section.CHAT) applyChatItemVisibility()
             // 「前台服务被拒」的警告/修复按钮是**状态驱动**可见性,不能跟着 section 无条件露出来。
             applyKeepAliveVisibility()
             binding.root.scrollTo(0, 0)
@@ -225,12 +249,14 @@ class SettingsFragment : Fragment() {
     // ---- 类型选择 ----
 
     /** 网关类型下拉选项(下标即 settings.type 的取值,顺序即 spinner position)。 */
-    private val typeLabels = listOf("OpenClaw", "Hermes", "自定义 OpenAI 兼容", "Echo(本地回环)")
+    private val typeLabels =
+        listOf("OpenClaw", "Hermes", "自定义 OpenAI 兼容", "Echo(本地回环)", "小智 AI")
     private val typeValues = listOf(
         GatewaySettings.TYPE_OPENCLAW,
         GatewaySettings.TYPE_HERMES,
         GatewaySettings.TYPE_OPENAI,
         GatewaySettings.TYPE_ECHO,
+        GatewaySettings.TYPE_XIAOZHI,
     )
 
     /** 已向用户播报过的类型(避免回填触发选中回调时误报「已切换」)。 */
@@ -255,6 +281,49 @@ class SettingsFragment : Fragment() {
             if (type == GatewaySettings.TYPE_HERMES) View.VISIBLE else View.GONE
         binding.groupOpenai.visibility =
             if (type == GatewaySettings.TYPE_OPENAI) View.VISIBLE else View.GONE
+        // 小智 AI 的网关内容是「激活状态 / 连接状态 / 一句说明」,只在选中它时出现。
+        // 只在「网关设置」这个二级菜单里拨:同样的几个控件在「高级」菜单里是常驻项(见 showSection)。
+        if (currentSection == Section.GATEWAY) {
+            val xz = if (type == GatewaySettings.TYPE_XIAOZHI) View.VISIBLE else View.GONE
+            binding.titleXiaozhi.visibility = xz
+            binding.xzStatus.visibility = xz
+            binding.xzConnectStatus.visibility = xz
+            binding.xzGatewayHint.visibility = xz
+            binding.btnActivateXz.visibility = xz
+            binding.xzActiveStatus.visibility = xz
+            renderXiaozhiStatus()
+        }
+    }
+
+    /**
+     * 「对话设置」里依赖**本地管线**的两项(语音附加提示 / 完整回传流)在小智模式下隐藏。
+     *
+     * 为什么:小智的正文与提示词都在云端 —— 附加提示不会参与它的对话,回传流也只有 `llm` 一条正文,
+     * 留着会让用户以为改了有效。设备朗读开关**不**在其中:它在小智模式下控制的是
+     * 「小智的音频要不要转发给设备」,语义仍然成立。
+     *
+     * 用已落盘的 settings.type(生效中的模式)而不是下拉框当前选择 —— 类型要保存后才真的切换。
+     */
+    private fun applyChatItemVisibility() {
+        val v = if (settings.type == GatewaySettings.TYPE_XIAOZHI) View.GONE else View.VISIBLE
+        binding.titleVoicePrompt.visibility = v
+        binding.inputVoicePromptSuffix.visibility = v
+        binding.checkShowRawStream.visibility = v
+    }
+
+    /**
+     * 小智模式的「连接/就绪状态」行。
+     *
+     * 数据来自语音桥服务的状态广播(与主界面顶部状态卡**同源**):小智网关没有独立连接 ——
+     * 它的「可收发」就是识别通道那条 WS 是否握手(见 `XiaozhiGateway.isReady`),
+     * 服务侧统一的网关状态文案已经包含「网关连接中 / 已就绪 / …」,这里不再引入第二套探活。
+     */
+    private fun renderXiaozhiStatus() {
+        val b = _binding ?: return
+        if (currentSection != Section.GATEWAY) return
+        if (selectedType() != GatewaySettings.TYPE_XIAOZHI) return
+        b.xzConnectStatus.text =
+            "连接状态:${lastStatus.ifBlank { "等待语音桥服务上报…" }}"
     }
 
     /** 读下拉框上选中的类型(未选中时回退 OpenClaw,与旧单选默认一致)。 */
@@ -529,6 +598,10 @@ class SettingsFragment : Fragment() {
 
             GatewaySettings.TYPE_ECHO -> Unit   // 本地回环无字段
 
+            // 小智 AI 无字段(ws/OTA 地址与 token 写死在 XiaozhiSettings)。
+            // **必须显式写**:落进 else 就会拿空表单去写 OpenClaw 配置,把用户已存的 OpenClaw 清掉。
+            GatewaySettings.TYPE_XIAOZHI -> Unit
+
             else -> settings.save(        // OpenClaw
                 host = form.openclawHost,
                 port = form.openclawPort,
@@ -669,6 +742,17 @@ class SettingsFragment : Fragment() {
 
     private fun saveSettings() {
         val form = snapshotForm()
+        // 「小智 AI」没有任何可填的连接参数(ws/OTA 地址与 token 写死在 XiaozhiSettings,会话由识别通道提供),
+        // 所以**不走探活闸门**:不造假的必填项,也不拿一个没有会话的适配器去 connect。
+        // 落盘即生效——与其它类型一样不重启服务(仅类型变了才重启)。
+        if (form.type == GatewaySettings.TYPE_XIAOZHI) {
+            persistForm(form)
+            if (view != null) loadSettings()
+            log("小智 AI 无需连接参数,网关设置已保存(类型 ${form.type})")
+            toast("已保存")
+            applySavedServiceConfig()
+            return
+        }
         val draft = buildDraft(form) ?: return
         binding.btnSave.isEnabled = false
         binding.btnSave.text = "校验中…"
@@ -888,6 +972,10 @@ class SettingsFragment : Fragment() {
 
             GatewaySettings.TYPE_ECHO -> GatewayDraft.Echo
 
+            // 小智 AI 无字段。正常流程已在 [saveSettings] 里直接落盘、不会走到这里;
+            // 这里显式列出是为了不让它默默落进 else 的 OpenClaw 分支。
+            GatewaySettings.TYPE_XIAOZHI -> GatewayDraft.Xiaozhi
+
             else -> {
                 val host = form.openclawHost.trim()
                 val port = form.openclawPort.trim()
@@ -1067,6 +1155,40 @@ class SettingsFragment : Fragment() {
         val b = _binding ?: return
         val cur = b.logText.text.toString()
         b.logText.text = if (cur.isBlank() || cur == "(空)") line else "$cur\n$line"
+    }
+
+    override fun onStart() {
+        super.onStart()
+        // 小智模式的连接/就绪状态来自语音桥服务的状态广播;与其它页面一样在可见期间监听。
+        val filter = IntentFilter(VoiceBridgeService.ACTION_STATUS)
+        try {
+            if (Build.VERSION.SDK_INT >= 33) {
+                requireContext().registerReceiver(statusReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
+            } else {
+                @Suppress("DEPRECATION")
+                requireContext().registerReceiver(statusReceiver, filter)
+            }
+        } catch (e: Exception) {
+            log("监听语音桥状态失败(小智状态行可能不刷新):${e.message}")
+        }
+        // 广播只在状态变化时发:进页面主动问一次(与设备页同款做法),否则小智的连接/就绪行会一直空着。
+        try {
+            requireContext().startService(
+                Intent(requireContext(), VoiceBridgeService::class.java)
+                    .setAction(VoiceBridgeService.ACTION_REQUEST_STATUS),
+            )
+        } catch (e: Exception) {
+            log("请求语音桥状态失败:${e.message}")
+        }
+    }
+
+    override fun onStop() {
+        try {
+            requireContext().unregisterReceiver(statusReceiver)
+        } catch (_: IllegalArgumentException) {
+            // 已注销/未注册:忽略
+        }
+        super.onStop()
     }
 
     override fun onDestroyView() {

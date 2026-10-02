@@ -2,13 +2,31 @@
 
 ## Unreleased
 
+- 新增：「小智 AI」网关的**设备朗读直通**——小智回的下行 opus 音频**原样转发**给设备，用**小智的音色**朗读。
+  新增纯逻辑 `tts/XiaozhiTtsRelay`（`XiaozhiTtsObserver` ←会话层）：把 `tts.state=start|sentence_start|sentence_end|stop`
+  映射到既有的 `tts_start`/`tts_stop` 生命周期（首句即开、`stop` 收尾），音频按小智 hello 自报的
+  **24 kHz / 60 ms** 组 `[SEQ][rate_khz][frame_ms]+opus` 的 `TTS_OPUS` 帧，**不本地合成、不解码、不重采样**；
+  下行仍复用同一套 `TtsFlowControl`（领先量/在途上限）、`BleCentral` 写队列、`tts_abort` 与设备
+  `tts_playback_done/aborted` 回报对账（`VoiceBridgeService.DeviceTtsPush` 同时实现两条下行）。
+  既有不变量不变：每轮 `turn_start` 仍**无条件**发 `tts_abort`；打断同时走小智 `listen.stop` 与设备 `tts_abort`，
+  两条路径都幂等。设备朗读开关在小智模式下语义不变（关掉就不下发音频）；设备未报 `caps:["tts_opus"]` 时也不发。
+  新增 6 项 JVM 单测（帧头/SEQ 回绕、状态映射、打断幂等、关掉不下发、非法帧丢弃）。
+
+- 新增：「设置 → 网关设置 → 网关类型」新增第 5 项「小智 AI」（`xiaozhi`），选中后只显示小智相关项：
+  激活状态（复用原有激活按钮/6 位绑定码与授权进度文案）、连接/就绪状态（来自语音桥服务的状态广播，与顶部状态卡同源）
+  与一行说明「回复由小智生成，并用小智的声音在设备上朗读」。「对话设置」中依赖本地管线的两项
+  （语音附加提示、完整回传流）在小智模式下**隐藏**（设备朗读开关保留：它控制小智音频是否转发给设备）。
+  小智模式没有可填的 host/token，保存时**不造必填项、也不做无意义的网络探活**，直接落盘即生效；
+  显式列出 `TYPE_XIAOZHI` 的落盘分支，避免落进 `else` 把已存的 OpenClaw 配置清空。**不改**其它四种网关的行为。
+
 - 新增：「小智 AI」作为一种**网关类型**接通**文本这条路**（`GatewaySettings.TYPE_XIAOZHI`，显示名「小智 AI」）。
   实现方式是新增 `gateway/XiaozhiGateway` 实现现有 `GatewayAdapter`，**不新增管线模式**：它复用识别通道
   那条 `XiaozhiSession`（`XiaozhiStt.session`，由语音桥服务同时交给 STT 与网关），`chatMulti` 不发任何
   HTTP/WS 请求，只等会话层推来的 `llm.text` 作为**单条**回复（整段一次上屏，见设计文档 §6 方案 A），
   于是「上屏 / 对话历史 / TTS」全部复用流水线原有流程；等不到正文时按现有失败语义返回可读原因并带超时，
   每轮 `turn_start` 的 `interrupt()` 会作废旧轮等待（不留悬挂的 deferred）。**不改**其它四种网关的行为。
-  本次不含设置页入口、激活界面与 TTS 音频直通（增量 3/4）；新增 8 项 JVM 单测覆盖正常 / 超时 / 打断三条路径。
+  本次不含设置页入口、激活界面与 TTS 音频直通（见本区块前两条，增量 3/4 已在同一条 Unreleased 里补齐）；
+  新增 8 项 JVM 单测覆盖正常 / 超时 / 打断三条路径。
 
 - 重构（无行为变化）：小智 WS 会话层从 `stt/XiaozhiStt.kt` 抽为 `stt/XiaozhiSession.kt`（771 行 → 适配器 73 行 + 会话 828 行），并把 `stt`/`llm`/`tts` 三类消息分流为回调 —— 为「小智 AI 网关」（`docs/design/xiaozhi-ai-gateway.md`）打地基；STT 路径、日志文案与超时数值逐条核对未变，329 项单测全绿。
 

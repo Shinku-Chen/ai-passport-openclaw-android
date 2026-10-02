@@ -87,6 +87,12 @@ class XiaozhiGateway(
      */
     override fun isReady(): Boolean = source?.let { it.isAvailable && it.isWarmReady() } == true
 
+    /**
+     * 小智本轮朗读用的是它自己的音色:音频随同一条会话以 opus 直通给设备(见 `XiaozhiTtsRelay`),
+     * 因此流水线**不做**本地合成/手机朗读,否则两种声音会叠着播。
+     */
+    override val providesDeviceTtsAudio: Boolean get() = true
+
     /** 单条回复版:正文由 [chatMulti] 给出,失败/打断时为 null(失败原因在 [lastError])。 */
     override suspend fun chat(text: String): String? = chatMulti(text).messages.firstOrNull()
 

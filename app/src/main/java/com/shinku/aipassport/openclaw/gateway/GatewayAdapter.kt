@@ -107,6 +107,15 @@ interface GatewayAdapter {
     val supportsBodyCorrection: Boolean get() = false
 
     /**
+     * 是否由网关**自己**提供设备朗读音频(小智 AI:音频随会话下行的 opus 直通给设备)。
+     *
+     * true 时流水线**不做**本地合成 —— 既不下发本地合成的 `TTS_OPUS`,也不回退手机朗读:
+     * 音频已经由网关侧的音色给出,再本地合成一遍就是两种声音叠着播。
+     * 默认 false(OpenClaw / Hermes / 自定义 OpenAI 兼容 / Echo 仍是「文本进 → 本地合成」)。
+     */
+    val providesDeviceTtsAudio: Boolean get() = false
+
+    /**
      * 是否处于「等待网关授权(设备未在网关被批准)」状态。
      *
      * 语义:这【不是】配置错误,而是可自动恢复的状态 —— 保持重连/重试循环,批准后下一次重试即恢复。
@@ -155,6 +164,14 @@ sealed interface GatewayDraft {
 
     /** 本地回显:恒通过。 */
     data object Echo : GatewayDraft
+
+    /**
+     * 小智 AI:没有可填的连接参数(ws/OTA 地址与 token 写死在
+     * [com.shinku.aipassport.openclaw.stt.XiaozhiSettings],会话由识别通道提供),
+     * 因此保存时**不做网络探活、直接落盘**(见 `SettingsFragment.saveSettings`)。
+     * 保留显式草稿类型,保证这里的 `when` 不会把新类型默默归到 OpenClaw。
+     */
+    data object Xiaozhi : GatewayDraft
 }
 
 /**
@@ -247,6 +264,11 @@ object GatewayFactory {
         )
 
         GatewayDraft.Echo -> EchoGateway()
+
+        // 小智 AI 的适配器必须**共用**识别通道那条会话,而保存校验这里拿不到它(草稿只用于探活)。
+        // 因此 source = null:若真被 connect() 会立刻返回可读原因,不会挂死;
+        // 设置页对 TYPE_XIAOZHI 不走探活闸门(直接落盘),所以正常不会走到 connect()。
+        GatewayDraft.Xiaozhi -> XiaozhiGateway(source = null)
 
         is GatewayDraft.OpenAi -> OpenAiCompatibleGateway(
             config = draft.config,

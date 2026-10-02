@@ -155,6 +155,14 @@ class VoicePipeline(
         private set
 
     /**
+     * 设备是否在 hello 里声明了 `tts_opus`(支持下行朗读)。
+     *
+     * 小智 TTS 直通也据此门控(见 `XiaozhiTtsRelay`):设备没报这个能力就**绝不能**发 0x06
+     * 音频帧 —— 固件会把未知类型当错位处理,连带丢掉它后面一帧。
+     */
+    val deviceTtsSupported: Boolean get() = deviceTtsCapable
+
+    /**
      * 处理设备的 hello:核对固件/App 版本是否配套。
      *
      * 版本号按【大版本 X.Y 相同即配套】的约定比对（[VersionCompat]）：App 可以发小版本
@@ -778,6 +786,8 @@ class VoicePipeline(
      * 把一句回复念出来。
      *
      * 分派规则(「设备朗读回复」开关打开时才有声音,见构造参数 [ttsEnabled]):
+     *  - 网关自带设备朗读音频(小智 AI,见 [GatewayAdapter.providesDeviceTtsAudio]) → 什么都不做,
+     *    音频由 TTS 直通下发(不再本地合成,也不回退手机朗读);
      *  - 设备在 hello 里报了 `tts_opus` → 下发**设备朗读**(手机合成 PCM → Opus → BLE → 设备放);
      *  - 设备播不了(老固件未上报/设备未连接) → 退回**手机自己念**([speak]);
      *  - 开关关闭(默认) → 什么都不做。
@@ -786,7 +796,11 @@ class VoicePipeline(
      * 在没装 TTS 引擎的手机上默默无声,一旦换了有引擎的手机就会**突然开口** ✗(真机实测)。
      */
     private fun speakReply(text: String) {
-        if (text.isBlank() || !ttsEnabled()) return
+        if (text.isBlank()) return
+        // 小智 AI:本轮音频已由网关侧（小智音色）随会话下行、原样直通给设备（见 `XiaozhiTtsRelay`）。
+        // 本地再合成一遍就是两种声音叠着播，也可能让设备收到两段无 bracket 的 TTS_OPUS。
+        if (gateway.providesDeviceTtsAudio) return
+        if (!ttsEnabled()) return
         if (deviceTtsCapable) {
             deviceTts.onReply(text)
         } else {

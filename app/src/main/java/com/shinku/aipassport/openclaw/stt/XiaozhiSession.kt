@@ -55,6 +55,40 @@ interface XiaozhiLlmSource {
 }
 
 /**
+ * 小智**下行 TTS 音频**的观察者(见 `docs/design/xiaozhi-ai-gateway.md` §4.3)。
+ *
+ * 为什么与 [XiaozhiLlmSource] 分开:正文与音频是两条独立的下行,消费方也不同 —— 正文归
+ * [com.shinku.aipassport.openclaw.gateway.XiaozhiGateway](回答文本),音频归 TTS 直通
+ * (原样转发给设备播放)。两条出口各自可挂/可摘,互不影响。
+ *
+ * 与 [XiaozhiLlmSource.setLlmObserver] 同一套线程语义:回调可能运行在 OkHttp 的 WS 回调线程,
+ * 实现必须线程安全且**不得阻塞**(设备推送要另起协程)。
+ */
+interface XiaozhiTtsObserver {
+
+    /**
+     * 会话开始新一轮(设备 PTT 按下):把上一轮的朗读记账作废。
+     *
+     * 为什么必须由会话层通知:打断(barge)时服务端不一定回 `tts.stop`,若直通方还认为
+     * 「本段朗读仍在进行」,下一轮的音频就会缺一个 `tts_start` 而直接甩给设备。
+     * 设备侧的 `tts_abort` 由流水线另行下发(两条路径互不替代)。
+     */
+    fun onTurnStart()
+
+    /** 下行 TTS 状态:`start` / `sentence_start` / `sentence_end` / `stop`(带该句文本)。 */
+    fun onTtsState(state: String, text: String)
+
+    /**
+     * 下行 TTS 的一帧 opus 音频(原样转发,**不**解码/重编码)。
+     *
+     * @param rateKhz 采样率(kHz),取自 server hello 的 `audio_params.sample_rate`(小智 24);
+     *   `0` = 服务器还没上报(此时不会有音频帧)
+     * @param frameMs 帧长(ms),取自 hello(`frame_duration`,小智 60);`0` = 未上报
+     */
+    fun onTtsAudio(opus: ByteArray, rateKhz: Int, frameMs: Int)
+}
+
+/**
  * 小智(xiaozhi.me)云端的 **WebSocket 会话层** —— 连接/握手/上行音频/预热/重连重放,
  * 并把服务器消息按类型分流给回调。
  *
@@ -65,9 +99,9 @@ interface XiaozhiLlmSource {
  *  3. **回复**:`{"type":"llm","text":…}` → [onLlm];
  *  4. **语音**:`{"type":"tts","state":…}`(JSON)→ [onTtsState],以及**二进制 opus 帧** → [onTtsAudio]。
  *
- * 后三组回调只是**接入面**:本阶段(纯重构)只把消息分流出来并 `Log.d` 记录,
- * **不实现任何 LLM/TTS 逻辑**,STT 路径的行为、日志文案与级别、超时数值、线程语义都与抽离前逐字一致。
- * 「小智 AI 网关」(增量 2)通过 [setLlmObserver] 取 `llm.text` 作为本轮回复;TTS 音频直通是增量 3。
+ * 后三组回调是**接入面**:STT 路径的行为、日志文案与级别、超时数值、线程语义与抽离前逐字一致。
+ * 「小智 AI 网关」(增量 2)通过 [setLlmObserver] 取 `llm.text` 作为本轮回复;
+ * TTS 音频直通(增量 3)通过 [setTtsObserver] 取 `tts` 状态与 opus 音频帧(见 [XiaozhiTtsObserver])。
  *
  * 链路(manual 模式,对应设备 PTT 的 turn_start/turn_end):
  *  设备麦克风 → [固件 Opus 编码] → BLE → App feedOpus(已剥掉 SEQ) → 原样转发小智
@@ -106,10 +140,10 @@ interface XiaozhiLlmSource {
  *    就重连并**把这一轮重放**上去 —— 结果只是晚 1–2s,而不是变成「无语音」。
  *
  * @param onStt 识别文本分流(每条 `stt` 回调一次;小智边识边发,可能是部分结果)。
- * @param onLlm 回复正文分流(`{"type":"llm"}`);当前只有 `Log.d`,留给「小智 AI 网关」。
+ * @param onLlm 回复正文分流(`{"type":"llm"}`)。
  *   共用本会话的网关不靠它,而是用 [setLlmObserver] 挂观察者(两条出口互不覆盖)。
- * @param onTtsState TTS 状态分流(`state`, `text`);当前只有 `Log.d`,留给「小智 AI 网关」。
- * @param onTtsAudio 下行 TTS 音频分流(`opus`, `rateKhz`, `frameMs`);当前只有 `Log.d`。
+ * @param onTtsState TTS 状态分流(`state`, `text`);共用本会话的 TTS 直通用 [setTtsObserver]。
+ * @param onTtsAudio 下行 TTS 音频分流(`opus`, `rateKhz`, `frameMs`)。
  *   `rateKhz`/`frameMs` 取自服务器 hello 的 `audio_params`(小智为 24 kHz/60 ms),**0 = 尚未上报**。
  */
 class XiaozhiSession(
@@ -133,6 +167,13 @@ class XiaozhiSession(
 
     /** [setLlmObserver]/[clearLlmObserver] 的锁:保证「挂」与「按身份摘」不交叉。 */
     private val llmObserverLock = Any()
+
+    /** TTS 直通观察者(下行 `tts` 状态与 opus 音频;见 [XiaozhiTtsObserver])。 */
+    @Volatile
+    private var ttsObserver: XiaozhiTtsObserver? = null
+
+    /** [setTtsObserver]/[clearTtsObserver] 的锁(同 [llmObserverLock] 的理由)。 */
+    private val ttsObserverLock = Any()
 
     /** 小智 Client-Id:每次 App 启动随机生成(同一进程内稳定,重启换新),避免旧会话占位被拒。 */
     private val clientId: String = UUID.randomUUID().toString()
@@ -170,6 +211,16 @@ class XiaozhiSession(
     override fun clearLlmObserver(observer: (String) -> Unit) {
         // 身份比较:旧网关实例的 close() 不能摘掉新实例刚挂上的观察者(见 [XiaozhiLlmSource])。
         synchronized(llmObserverLock) { if (llmObserver === observer) llmObserver = null }
+    }
+
+    /** 挂上/替换 TTS 直通观察者(下行 `tts` 状态与 opus 音频的唯一出口)。 */
+    fun setTtsObserver(observer: XiaozhiTtsObserver?) {
+        synchronized(ttsObserverLock) { ttsObserver = observer }
+    }
+
+    /** 仅当当前观察者**仍是** [observer] 时摘掉它(与 [clearLlmObserver] 同一套身份比较理由)。 */
+    fun clearTtsObserver(observer: XiaozhiTtsObserver) {
+        synchronized(ttsObserverLock) { if (ttsObserver === observer) ttsObserver = null }
     }
 
     /** 热连接最近一次活动(建立/复用/一轮结束)的时刻,用于闲置超时判定。 */
@@ -288,6 +339,9 @@ class XiaozhiSession(
     }
 
     fun startTurn(onReady: () -> Unit) {
+        // 新一轮开始:先把上一轮的 TTS 直通记账作废(打断时服务端不一定回 `tts.stop`,
+        // 否则下一段音频会缺一个 `tts_start` 而直接甩给设备)。设备侧 `tts_abort` 由流水线另发。
+        ttsObserver?.onTurnStart()
         // 立即允许 feedPcm/feedOpus 累积编码上送(不等握手,避免开头 PCM 丢失)
         listening = false
         turnRunning = true          // 先置 true:闲置超时定时器据此不动热连接
@@ -718,8 +772,10 @@ class XiaozhiSession(
          */
         override fun onMessage(webSocket: WebSocket, bytes: okio.ByteString) {
             if (ws !== webSocket) return
-            Log.d(tag, "收到小智音频帧 ${bytes.size}B(下行 ${ttsRateKhz}kHz/${ttsFrameMs}ms,仅记录)")
+            Log.d(tag, "收到小智音频帧 ${bytes.size}B(下行 ${ttsRateKhz}kHz/${ttsFrameMs}ms)")
+            // 两条出口:构造参数(直接构造会话的调用方)与观察者(共用本会话的 TTS 直通)。
             onTtsAudio?.invoke(bytes.toByteArray(), ttsRateKhz, ttsFrameMs)
+            ttsObserver?.onTtsAudio(bytes.toByteArray(), ttsRateKhz, ttsFrameMs)
         }
 
         override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
@@ -833,8 +889,9 @@ class XiaozhiSession(
                 "tts" -> {
                     val state = obj.stringOrNull("state").orEmpty()
                     val sentence = obj.stringOrNull("text").orEmpty()
-                    Log.d(tag, "收到小智 tts[$state](仅记录): ${sentence.take(200)}")
+                    Log.d(tag, "收到小智 tts[$state]: ${sentence.take(200)}")
                     onTtsState?.invoke(state, sentence)
+                    ttsObserver?.onTtsState(state, sentence)
                 }
                 "error" -> Log.w(tag, "小智端错误: ${obj.toString()}")
                 else -> Unit
