@@ -94,7 +94,14 @@ jobs:
         run: |
           set -euo pipefail
           VERSION="${GITHUB_REF_NAME#v}"
-          FW_TAG=$(gh api repos/Shinku-Chen/ai-passport/releases/latest --jq .tag_name || echo "")
+          # 固件 release 可能与本 App 几乎同时发布:重试几次,免得拿到上一版 tag
+          # (实测踩过:App CI 先跑完,versions.json 的 firmware 字段停在上一版)。
+          FW_TAG=""
+          for _ in 1 2 3 4 5 6; do
+            FW_TAG=$(gh api repos/Shinku-Chen/ai-passport/releases/latest --jq .tag_name 2>/dev/null || true)
+            if [ -n "${FW_TAG}" ]; then break; fi
+            sleep 30
+          done
           FW_VERSION="${FW_TAG#v}"
           FW_VERSION="${FW_VERSION%%-*}"
           git fetch --depth=1 origin main
@@ -133,3 +140,6 @@ jobs:
             git commit -m "chore(release): 同步 versions.json 到 ${VERSION} [skip ci]"
             git push origin HEAD:main
           fi
+          # jsDelivr 对 @main 固定缓存 12 小时,而且查询参数绕不过它(实测),
+          # 所以发版后必须主动 purge,否则新版本最多 12 小时后才会被 App 检测到。
+          curl -fsS --max-time 30 "https://purge.jsdelivr.net/gh/${GITHUB_REPOSITORY}@main/versions.json" >/dev/null || true
