@@ -766,7 +766,7 @@ class SettingsFragment : Fragment() {
      */
     private fun checkUpdateNow() {
         val appContext = context?.applicationContext ?: return
-        binding.updateStatusText.text = "正在检查更新…"
+        binding.updateStatusText.text = "当前版本 ${currentVersionName()} · 正在检查更新…"
         appContext.startService(
             Intent(appContext, VoiceBridgeService::class.java)
                 .setAction(VoiceBridgeService.ACTION_CHECK_UPDATE),
@@ -781,11 +781,13 @@ class SettingsFragment : Fragment() {
     private fun renderUpdateState() {
         val b = _binding ?: return
         val s = UpdateChecker.cachedNotices(requireContext().applicationContext)
+        val version = currentVersionName()
+        // 当前版本**始终显示**(用户要求「应用设置里能看到本 App 版本」):反馈问题时报版本号最有用。
         val lines = listOf(s.appNotice, s.firmwareNotice).filter { it.isNotBlank() }
         b.updateStatusText.text = when {
-            lines.isNotEmpty() -> lines.joinToString("\n")
-            s.checkedAt <= 0L -> "还没检查过；App 每天会自动检查一次"
-            else -> "已是最新（App ${currentVersionName()}）"
+            lines.isNotEmpty() -> "当前版本 $version" + "\n" + lines.joinToString("\n")
+            s.checkedAt <= 0L -> "当前版本 $version · 还没检查过；App 每天会自动检查一次"
+            else -> "当前版本 $version · 已是最新"
         }
     }
 
