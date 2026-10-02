@@ -28,6 +28,7 @@ import com.shinku.aipassport.openclaw.gateway.GatewaySaveGuard.SaveValidation
 import com.shinku.aipassport.openclaw.gateway.GatewaySettings
 import com.shinku.aipassport.openclaw.gateway.OpenClawConfig
 import com.shinku.aipassport.openclaw.service.KeepAliveState
+import com.shinku.aipassport.openclaw.service.UpdateChecker
 import com.shinku.aipassport.openclaw.service.VoiceBridgeService
 import com.shinku.aipassport.openclaw.stt.XiaozhiSettings
 import com.shinku.aipassport.openclaw.tts.TtsSupport
@@ -199,6 +200,7 @@ class SettingsFragment : Fragment() {
             ),
             Section.APP to listOf(
                 binding.checkBootAutoStart, binding.hintBootAutostart,
+                binding.btnCheckUpdate, binding.updateStatusText,
                 binding.textForegroundWarning, binding.btnFixBackground,
             ),
             Section.ADVANCED to listOf(
@@ -351,6 +353,10 @@ class SettingsFragment : Fragment() {
         // 用户手动关掉后 prefs 里就是 false,不会再被改写回 true。
         // 手机自己都合不成语音时,这个开关没有任何意义:关掉并置灰(见 applyTtsAvailability)。
         applyTtsAvailability()
+
+        // 版本更新（App 新版 / 设备固件新版）：显示上次结论，点一下立刻检查。
+        binding.btnCheckUpdate.setOnClickListener { checkUpdateNow() }
+        renderUpdateState()
 
         // Hermes
         binding.inputHermesHost.setText(settings.hermesHost)
@@ -752,6 +758,45 @@ class SettingsFragment : Fragment() {
     }
 
     /** Toast 包装:视图已销毁(context 为 null) 时静默跳过,不让后台的重试循环把进程弄挂。 */
+    /**
+     * 手动检查更新：让服务立刻查一次（绕过 CDN 缓存），几秒后读回结论渲染。
+     *
+     * 失败不弹窗（服务侧静默保留上次结论，见 UpdateChecker）—— 就是个后台小检查，
+     * 不该用「检查失败」打断用户。
+     */
+    private fun checkUpdateNow() {
+        val appContext = context?.applicationContext ?: return
+        binding.updateStatusText.text = "正在检查更新…"
+        appContext.startService(
+            Intent(appContext, VoiceBridgeService::class.java)
+                .setAction(VoiceBridgeService.ACTION_CHECK_UPDATE),
+        )
+        scope.launch {
+            delay(6000)
+            renderUpdateState()
+        }
+    }
+
+    /** 渲染更新结论：有新版就列出来，没有就说「已是最新」，从没查过就说明会自动查。 */
+    private fun renderUpdateState() {
+        val b = _binding ?: return
+        val s = UpdateChecker.cachedNotices(requireContext().applicationContext)
+        val lines = listOf(s.appNotice, s.firmwareNotice).filter { it.isNotBlank() }
+        b.updateStatusText.text = when {
+            lines.isNotEmpty() -> lines.joinToString("\n")
+            s.checkedAt <= 0L -> "还没检查过；App 每天会自动检查一次"
+            else -> "已是最新（App ${currentVersionName()}）"
+        }
+    }
+
+    /** 本 App 的 versionName（运行时读取，不依赖 BuildConfig —— AGP 8 默认不生成它）。 */
+    private fun currentVersionName(): String = try {
+        val ctx = requireContext()
+        ctx.packageManager.getPackageInfo(ctx.packageName, 0).versionName ?: "?"
+    } catch (e: Exception) {
+        "?"
+    }
+
     private fun toast(message: String) {
         val ctx = context ?: return
         Toast.makeText(ctx, message, Toast.LENGTH_SHORT).show()

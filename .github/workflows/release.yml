@@ -83,3 +83,53 @@ jobs:
         with:
           files: app/build/outputs/apk/release/app-release.apk
           fail_on_unmatched_files: true
+
+      # 发版后把仓库根目录的 versions.json 同步成新版本(App 端「检查更新」读它)。
+      # 数据源:本 tag(去掉 v)+ 固件仓的最新 release tag;注释沿用「同版本」时的旧值,
+      # 换版本则清空(免得把上一版的说明挂到新版本上)。
+      - name: Sync versions.json
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          FW_TAG=$(gh api repos/Shinku-Chen/ai-passport/releases/latest --jq .tag_name || echo "")
+          FW_VERSION="${FW_TAG#v}"
+          FW_VERSION="${FW_VERSION%%-*}"
+          git fetch --depth=1 origin main
+          git checkout -B sync-versions origin/main
+          python3 - "$VERSION" "$FW_VERSION" "$FW_TAG" <<'PY'
+          import datetime, json, pathlib, sys
+
+          version, fw_version, fw_tag = sys.argv[1], sys.argv[2], sys.argv[3]
+          path = pathlib.Path("versions.json")
+          old = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+          old_app = old.get("app") or {}
+          old_fw = old.get("firmware") or {}
+          manifest = {
+              "schema": 1,
+              "updated": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+              "app": {
+                  "version": version,
+                  "url": "https://github.com/Shinku-Chen/ai-passport-openclaw-android/releases/latest",
+                  "notes": (old_app.get("notes") or "") if old_app.get("version") == version else "",
+              },
+              "firmware": {
+                  "version": fw_version,
+                  "tag": fw_tag,
+                  "url": "https://github.com/Shinku-Chen/ai-passport/releases/latest",
+                  "notes": (old_fw.get("notes") or "") if old_fw.get("version") == fw_version else "",
+              },
+          }
+          path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + chr(10), encoding="utf-8")
+          PY
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add versions.json
+          if git diff --cached --quiet; then
+            echo "versions.json 无变化"
+          else
+            git commit -m "chore(release): 同步 versions.json 到 ${VERSION} [skip ci]"
+            git push origin HEAD:main
+          fi

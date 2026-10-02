@@ -27,6 +27,7 @@ import com.shinku.aipassport.openclaw.databinding.ActivityMainBinding
 import com.shinku.aipassport.openclaw.gateway.AWAITING_PAIRING_PREFIX
 import com.shinku.aipassport.openclaw.gateway.GatewayFactory
 import com.shinku.aipassport.openclaw.gateway.GatewaySettings
+import com.shinku.aipassport.openclaw.service.UpdateChecker
 import com.shinku.aipassport.openclaw.service.VoiceBridgeService
 import com.shinku.aipassport.openclaw.ui.ChatFragment
 import com.shinku.aipassport.openclaw.ui.OverviewFragment
@@ -69,12 +70,23 @@ class MainActivity : AppCompatActivity() {
 
     private val statusReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
+            if (intent.action == VoiceBridgeService.ACTION_UPDATE_STATE) {
+                renderUpdateLine(
+                    appNotice = intent.getStringExtra(VoiceBridgeService.EXTRA_UPDATE_APP).orEmpty(),
+                    fwNotice = intent.getStringExtra(VoiceBridgeService.EXTRA_UPDATE_FIRMWARE).orEmpty(),
+                    url = intent.getStringExtra(VoiceBridgeService.EXTRA_UPDATE_URL).orEmpty(),
+                )
+                return
+            }
             val s = intent.getStringExtra(VoiceBridgeService.EXTRA_STATUS) ?: return
             binding.statusText.text = s
             updateStatusDot(s)
             updateApprovalAffordance(s)
         }
     }
+
+    /** 「有新版本」那一行当前要打开的地址(点整行跳 Release 页)。 */
+    private var updateUrl: String = ""
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -312,6 +324,27 @@ class MainActivity : AppCompatActivity() {
      * 「断开/错误/失败/不可达」算异常(红),「连接中/重连/扫描/探活」算过渡态(黄),
      * 其余灰;顺序不能颠倒——「网关断开(…)— 正在重连…」同时含「断开」与「重连」,应先判红。
      */
+    /**
+     * 顶部「有新版本」那一行：只显示 App / 固件的新版提示，没有新版时整行隐藏。
+     * 只提示、不阻断；点整行打开 Release 页（不自动下载安装）。
+     */
+    private fun renderUpdateLine(appNotice: String, fwNotice: String, url: String) {
+        val lines = listOf(appNotice, fwNotice).filter { it.isNotBlank() }
+        binding.updateLine.text = lines.joinToString("\n")
+        binding.updateLine.visibility = if (lines.isEmpty()) View.GONE else View.VISIBLE
+        updateUrl = url
+        binding.updateLine.setOnClickListener {
+            val target = updateUrl.takeIf { it.isNotBlank() } ?: return@setOnClickListener
+            runCatching { startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(target))) }
+        }
+    }
+
+    /** 用上次落盘的结论先渲染一次（不联网，打开就有东西看）。 */
+    private fun renderUpdateFromCache() {
+        val n = UpdateChecker.cachedNotices(this)
+        renderUpdateLine(n.appNotice, n.firmwareNotice, n.url)
+    }
+
     private fun updateStatusDot(status: String) {
         val color = when {
             status.contains("就绪") || status.contains("已加密") || status.contains("健康") -> Color.GREEN
@@ -338,6 +371,8 @@ class MainActivity : AppCompatActivity() {
             @Suppress("DEPRECATION")
             registerReceiver(statusReceiver, filter)
         }
+        // 进页面先用上次落盘的结论渲染一次(不联网);有新版本时状态卡下面会多一行
+        renderUpdateFromCache()
         // 回到前台时补一次前台服务。
         // 系统会在后台启动路径上**静默拒绝** startForeground（App 收不到异常，只写一条系统日志），
         // 服务于是降级成普通后台服务、App 闲置 60s 后被停掉；而"用户回到前台"这一刻是被允许的，

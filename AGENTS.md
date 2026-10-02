@@ -82,7 +82,9 @@ OpenClaw 首次 connect 需网关主机 `openclaw devices approve` 批准本设�
 ## 代码约定
 
 - Kotlin,包名 `com.shinku.aipassport.openclaw`,命名遵循 Kotlin 惯例。
-- **版本号硬约定**：App `versionName` 必须与固件发布 tag 里的 `X.Y.Z` 一致（固件 `vX.Y-intercom` ↔ App `X.Y`（两段式，例如固件 `v1.10-intercom` ↔ App `1.10`））；社区作品说明里也注明同一版本号。三处一致才能保证“固件/App/社区”功能一致，发新版时一起升。
+- **版本号约定**：**固件发大版本** `X.Y`（tag `vX.Y-intercom`，如 `v1.11-intercom`）；**App 可以发小版本** `X.Y` 或 `X.Y.Z`（如 `1.11`、`1.11.1`）；社区作品说明里注明同一大版本号。
+  **配套判定只看大版本 `X.Y`**：`App 1.11.2` 配 `固件 1.11` 就是配套，App 的小版本升级**不是**版本不匹配（App 侧 `protocol/VersionCompat.kt`、固件侧 `main/oc_version.c` 都按此实现；App 上报 `hello` 时 `app` 只报大版本、`appFull` 报完整版本）。
+  App「设置 → 应用设置 → 检查更新」会读仓库根目录的 `versions.json`（发版 CI 自动维护，三级回退 jsDelivr → raw.githubusercontent → GitHub Releases API）判断 App/固件是否有新版。
 - 线协议 `VbFrame.kt` 与固件 `voice_bridge_frame.h` 必须逐字一致;改协议两边同改。
 - BLE 回调(后台线程)只做轻量派发;STT/TTS/网关调用在协程里,不阻塞 BLE 线程。
 - 网关 token 是运行时 secret:绝不写进提交的代码;域名/端口可提交(BuildConfig/设置读),token 从 App 内设置读。

@@ -13,11 +13,16 @@
     <LinearLayout
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:orientation="horizontal"
-        android:gravity="center_vertical"
-        android:paddingHorizontal="16dp"
-        android:paddingVertical="12dp"
+        android:orientation="vertical"
         android:background="#1A1A2E">
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal"
+            android:gravity="center_vertical"
+            android:paddingHorizontal="16dp"
+            android:paddingVertical="12dp">
 
         <View
             android:id="@+id/statusDot"
@@ -45,6 +50,20 @@
             android:minHeight="0dp"
             android:paddingHorizontal="14dp"
             android:paddingVertical="6dp" />
+        </LinearLayout>
+
+        <!-- 版本更新提醒(App 有新小版本 / 设备固件有新版本):点一下打开 Release 页;
+             没有新版时整行隐藏,不占地方。 -->
+        <TextView
+            android:id="@+id/updateLine"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginStart="16dp"
+            android:layout_marginEnd="16dp"
+            android:layout_marginBottom="10dp"
+            android:textColor="@color/accent"
+            android:textSize="12sp"
+            android:visibility="gone" />
     </LinearLayout>
 
     <!-- Tab 导航 -->

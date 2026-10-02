@@ -117,6 +117,18 @@ class VoiceBridgeService : Service() {
          */
         const val ACTION_TTS_PREWARM = "com.shinku.aipassport.openclaw.action.TTS_PREWARM"
 
+        /** 设置页「检查更新」：立即查一次（用户手点，会绕过 CDN 缓存）。 */
+        const val ACTION_CHECK_UPDATE = "com.shinku.aipassport.openclaw.action.CHECK_UPDATE"
+
+        /** 更新检查结论广播（供顶部状态卡与设置页渲染）。 */
+        const val ACTION_UPDATE_STATE = "com.shinku.aipassport.openclaw.action.UPDATE_STATE"
+
+        /** 结论里的三段内容：App 更新提示 / 固件更新提示 / 更新页地址（空串 = 无）。 */
+        const val EXTRA_UPDATE_APP = "update_app"
+        const val EXTRA_UPDATE_FIRMWARE = "update_firmware"
+        const val EXTRA_UPDATE_URL = "update_url"
+        const val EXTRA_UPDATE_CHECKED_AT = "update_checked_at"
+
         /**
          * 回到前台时补一次前台服务（无其他副作用）。
          *
@@ -366,6 +378,8 @@ class VoiceBridgeService : Service() {
             ACTION_TTS_PREWARM -> {
                 if (::deviceTtsPush.isInitialized) scope.launch { deviceTtsPush.prewarm() }
             }
+            // 设置页「检查更新」：用户手点 → 忽略 24h 间隔、绕过 CDN 缓存
+            ACTION_CHECK_UPDATE -> runUpdateCheck(manual = true)
             // 【诊断】直接推一条文本到设备(验证屏幕排版/截断)
             ACTION_TEXT_TEST -> {
                 val t = intent.getStringExtra(EXTRA_TEXT_TEST_TEXT).orEmpty()
@@ -499,6 +513,10 @@ class VoiceBridgeService : Service() {
                     publishLinkStatus(LINK_READY, "已就绪,长按设备 OK 说话")
                     // 向设备上报本 App 版本(设备据此检查固件/App 是否配套,不一致时设备屏会提示)
                     sendDeviceHello()
+                    // 版本更新检查:设备上报的固件版本要等它的 hello 回来,所以延后三秒;
+                    // 自动检查 24h 一次(用户手点「检查更新」不受此限,见 ACTION_CHECK_UPDATE)
+                    android.os.Handler(android.os.Looper.getMainLooper())
+                        .postDelayed({ runUpdateCheck(manual = false) }, 3000L)
                     // 识别通道常驻预热:链路一就绪就先建一条小智热连接(后台静默、不影响 UI),
                     // 用户按下 OK 时就能直接 listen.start → turn_ready 毫秒级到达(修「按下后要等准备中」)。
                     if (::pipeline.isInitialized) pipeline.prewarm()
@@ -1358,7 +1376,11 @@ class VoiceBridgeService : Service() {
         val json = JsonObject().apply {
             addProperty("cmd", "hello")
             addProperty("proto", VersionCompat.PROTO_VERSION)
-            addProperty("app", appVersionName())
+            // `app` 只报【大版本 X.Y】：设备按大版本判是否配套，App 发小版本（1.11.1）时
+            // 不该被判成「版本不匹配」（见 oc_version.h）。
+            // `appFull` 给设备信息页显示完整版本；老固件忽略未知字段，协议向前兼容。
+            addProperty("app", VersionCompat.major(appVersionName()))
+            addProperty("appFull", appVersionName())
         }.toString()
         Log.i(TAG, "向设备上报 App 版本:${appVersionName()}(协议 v${VersionCompat.PROTO_VERSION})")
         ble.writeBytes(vbEncodeFrame(VbFrame.TYPE_CONTROL, 0, json.toByteArray(Charsets.UTF_8)))
@@ -1370,6 +1392,42 @@ class VoiceBridgeService : Service() {
     } catch (e: Exception) {
         Log.w(TAG, "读取 App 版本号失败:${e.message}")
         "0"
+    }
+
+    /**
+     * 版本更新检查（App 自己的新版 + 设备固件的新版）。
+     *
+     * 设备的固件版本由流水线在收到设备 hello 后记下（[VoicePipeline.deviceFirmwareVersion]）；
+     * 设备自己不上网，所以「固件有没有新版」只能由 App 代劳。
+     * 判定规则（只比大版本、只报更新、信息不足就静默）见 [UpdateCheck]；这里只管触发与广播。
+     */
+    private fun runUpdateCheck(manual: Boolean) {
+        if (!manual && !UpdateChecker.dueForCheck(this)) return
+        val app = appVersionName()
+        val fw = if (::pipeline.isInitialized) pipeline.deviceFirmwareVersion else null
+        scope.launch {
+            val fresh = withContext(Dispatchers.IO) {
+                UpdateChecker.refresh(this@VoiceBridgeService, app, fw, manual)
+            }
+            val state = fresh ?: if (manual) UpdateChecker.cached(this@VoiceBridgeService, app, fw) else null
+            if (state == null) {
+                if (manual) Log.i(TAG, "检查更新：联网失败，保留上次结论")
+                return@launch
+            }
+            Log.i(
+                TAG,
+                "检查更新：App=${state.notices.appUpdate ?: "最新"} " +
+                    "固件=${state.notices.firmwareUpdate ?: "最新"}（来源 ${state.source}）",
+            )
+            sendBroadcast(
+                Intent(ACTION_UPDATE_STATE)
+                    .setPackage(packageName)
+                    .putExtra(EXTRA_UPDATE_APP, state.notices.appUpdate.orEmpty())
+                    .putExtra(EXTRA_UPDATE_FIRMWARE, state.notices.firmwareUpdate.orEmpty())
+                    .putExtra(EXTRA_UPDATE_URL, state.notices.url)
+                    .putExtra(EXTRA_UPDATE_CHECKED_AT, state.checkedAt),
+            )
+        }
     }
 
     // ---- 息屏保活 ----

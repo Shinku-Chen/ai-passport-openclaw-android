@@ -1,0 +1,16 @@
+{
+  "schema": 1,
+  "updated": "2026-10-02T16:40:00Z",
+  "app": {
+    "version": "1.11",
+    "versionCode": 7,
+    "url": "https://github.com/Shinku-Chen/ai-passport-openclaw-android/releases/latest",
+    "notes": "设备朗读（TTS）默认开并按手机能力门控；设置页改版、设备管理并入设置；语音附加提示即时生效"
+  },
+  "firmware": {
+    "version": "1.11",
+    "tag": "v1.11-intercom",
+    "url": "https://github.com/Shinku-Chen/ai-passport/releases/latest",
+    "notes": "设备朗读不再重启、长聊天稳定、气泡去掉说话人标签、换机自动清旧配对"
+  }
+}

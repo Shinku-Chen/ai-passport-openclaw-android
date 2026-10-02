@@ -141,9 +141,18 @@ class VoicePipeline(
     private var deviceTtsCapable = false
 
     /**
+     * 设备上报的固件版本（`hello.fw`）；未上报为 null。
+     * 「固件有新版本」的提醒要用它（见 UpdateCheck）：设备自己不上网，只能由 App 代勞。
+     */
+    @Volatile
+    var deviceFirmwareVersion: String? = null
+        private set
+
+    /**
      * 处理设备的 hello:核对固件/App 版本是否配套。
      *
-     * 版本号按【同一版本号成对发布】的约定比对([VersionCompat]);不一致时向用户提示两处:
+     * 版本号按【大版本 X.Y 相同即配套】的约定比对（[VersionCompat]）：App 可以发小版本
+     * （1.11 → 1.11.1），那不是不匹配；只有大版本不同才提示。不一致时向用户提示两处：
      *  - App 侧:走 [onState] 上抛,状态卡显示可读原因;
      *  - 设备侧:回一条文字气泡(`sendText`),设备屏也能看到。
      * 信息不足(老固件不上报 fw/proto)不提示;每次连接只提示一次。
@@ -152,6 +161,7 @@ class VoicePipeline(
         if (helloChecked) return
         helloChecked = true
         val fw = obj?.get("fw")?.takeIf { it.isJsonPrimitive }?.asString
+        deviceFirmwareVersion = fw?.trim()?.takeIf { it.isNotEmpty() }
         val proto = obj?.get("proto")?.takeIf { it.isJsonPrimitive }?.asInt
         // 设备能力:hello 的 caps 里有没有 tts_opus(固件只在解码器就绪时报,见协议文档)
         val caps = obj?.get("caps")?.takeIf { it.isJsonArray }?.asJsonArray
