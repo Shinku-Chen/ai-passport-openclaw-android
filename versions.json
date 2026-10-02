@@ -1,15 +1,16 @@
 {
   "schema": 1,
-  "updated": "2026-10-02T13:13:52Z",
+  "updated": "2026-10-02T13:30:00Z",
   "app": {
     "version": "1.12",
+    "versionCode": 8,
     "url": "https://github.com/Shinku-Chen/ai-passport-openclaw-android/releases/latest",
-    "notes": ""
+    "notes": "版本更新提醒；设备卡显示固件版本；应用设置常显当前版本"
   },
   "firmware": {
-    "version": "1.11",
-    "tag": "v1.11-intercom",
+    "version": "1.12",
+    "tag": "v1.12-intercom",
     "url": "https://github.com/Shinku-Chen/ai-passport/releases/latest",
-    "notes": "设备朗读不再重启、长聊天稳定、气泡去掉说话人标签、换机自动清旧配对"
+    "notes": "设置菜单加音量/麦克风增益；长回复显示更完整并补省略号；只比大版本"
   }
 }
