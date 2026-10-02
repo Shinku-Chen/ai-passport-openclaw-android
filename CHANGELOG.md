@@ -2,6 +2,28 @@
 
 ## Unreleased
 
+- 新增：**设备朗读回复（TTS）开关 + 离线音色挑选**（真机验证：小米引擎 + Android 16）。
+  - 设置页加回「**设备朗读回复（TTS，默认关）**」：打开后网关回复**上屏之后**会被念出来 ——
+    优先由**设备**播报（手机合成 PCM → Opus 60ms 分帧 → BLE `TYPE_TTS_OPUS`），设备播不了才退回
+    **手机朗读**；关闭时两边都不出声。开关打开时**立刻预热合成引擎**，并把引擎状态与**可用音色清单**
+    写进日志（不必等第一条回复）。
+  - **能力门控**：解析设备 `hello` 的 `caps`，只有报了 `tts_opus` 才往设备推音频
+    （固件只在 Opus 解码器就绪时报；以前不看 caps 会白推一堆帧）。真机日志：
+    `设备能力: 下行朗读=支持(tts_opus) caps=["opus","pcm","text","time","status","tts_opus"]`。
+  - **离线音色自动挑选**（新增纯逻辑 `tts/TtsVoiceChoice.kt` + 9 个单测）：排除需联网音色、
+    排除语音包未下载、中文优先（兼容 Google 的 `cmn-Hans-CN`）、质量高→延迟低→名字排序，
+    全部候选进日志；选不到就保持引擎默认（绝不拿英文音色念中文）。
+  - 修一个潜在毛病：本地朗读原来**无门槛** —— 在没装 TTS 引擎的手机上静默无声，
+    换到有引擎的手机就会**突然开口**（真机实测）；现统一走 `speakReply()`（设备优先）。
+
+- 修 bug：**补 `TTS_SERVICE` 包可见性声明**（`<queries>`）—— 否则 Android 11+ 会直接拦住与引擎的绑定。
+  真机实测（小米 HyperOS / Android 16）：没有这段时 `TextToSpeech` 初始化恒为 `status=-1`，
+  系统日志里是 `I/AppsFilter: … com.shinku.aipassport.openclaw -> com.xiaomi.mibrain.speech BLOCKED`；
+  引擎明明装着（`tts_default_synth` 指向它、系统设置里能试听）却连不上。补上后立刻正常：
+  `系统 TTS 引擎就绪,default=com.xiaomi.mibrain.speech`、枚举出 **4 个离线音色**（3 中文 + 1 英文）。
+  顺带一个实用结论：小米引擎给所有音色的 `name`/`quality`/`latency` 都是同一个值，
+  **做音色下拉选择器也区分不了**，因此只保留自动挑选、不做选择器 UI。
+
 - 新增：**前台服务防降级 + 看门狗**（真机实测：系统会**静默拒绝** `startForeground`）。
   - 问题：从非用户主动路径启动（刚装完 APK / 被强停之后 / 开机广播）时，系统拒绝前台服务：
     `Service.startForeground() not allowed due to bg restriction`（`allowStartForeground=DENIED`、

@@ -1,6 +1,20 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
+    <!--
+      Android 11+ 包可见性：不声明就在系统眼里“看不到”目标包，绑定会被 AppsFilter 直接拦掉。
+      真机实测(小米 HyperOS / Android 16)：没有这段时 TextToSpeech 初始化恒为 status=-1，
+      系统日志里是
+        I/AppsFilter: interaction: com.shinku.aipassport.openclaw -> com.xiaomi.mibrain.speech BLOCKED
+      —— 引擎明明装着（tts_default_synth 指向它、系统设置里能试听），第三方 App 却连不上。
+      加上 TTS_SERVICE 查询后即可正常枚举音色并合成。
+    -->
+    <queries>
+        <intent>
+            <action android:name="android.intent.action.TTS_SERVICE" />
+        </intent>
+    </queries>
+
     <!-- BLE 扫描/连接(Android 12+ 更细粒度权限) -->
     <uses-permission android:name="android.permission.BLUETOOTH_SCAN" android:usesPermissionFlags="neverForLocation" />
     <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
