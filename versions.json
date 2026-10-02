@@ -4,12 +4,12 @@
   "app": {
     "version": "1.13",
     "url": "https://github.com/Shinku-Chen/ai-passport-openclaw-android/releases/latest",
-    "notes": ""
+    "notes": "短按唤醒不再出现「无语音」；识别零延迟；设备屏新消息停首行、滚到底末条贴底"
   },
   "firmware": {
     "version": "1.13",
     "tag": "v1.13-intercom",
     "url": "https://github.com/Shinku-Chen/ai-passport/releases/latest",
-    "notes": ""
+    "notes": "短按 OK 只唤醒；识别零延迟；新消息停首行、末条贴底"
   }
 }
