@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- 文档：新设计文档 `docs/design/xiaozhi-ai-gateway.md`（小智 AI 网关：把现有小智会话从「只做 STT」延长为 STT+LLM+TTS，TTS 音频原样转发给设备播放；纯 App 改动，固件不动）。
+
 ## 1.13
 
 - 配套固件 **v1.13-intercom**：设备端**短按 OK 只点亮屏幕**，不再发起一轮。
