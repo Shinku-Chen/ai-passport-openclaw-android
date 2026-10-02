@@ -11,7 +11,109 @@
         android:orientation="vertical"
         android:padding="16dp">
 
+        <!-- 设置二级菜单:一级只列"去哪一类设置",点进去才显示该类具体项(用户要求),小智识别默认开启故不再给选项。 -->
+        <LinearLayout
+            android:id="@+id/settingsMenu"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical">
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="设置"
+                android:textSize="18sp"
+                android:textStyle="bold"
+                android:textColor="#FFFFFF"
+                android:layout_marginBottom="4dp" />
+
+            <Button
+                android:id="@+id/btnMenuGateway"
+                style="?android:attr/borderlessButtonStyle"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:gravity="start|center_vertical"
+                android:text="网关设置"
+                android:textSize="16sp"
+                android:textColor="#FFFFFF" />
+
+            <TextView
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="网关类型、域名/端口、Token、模型，以及保存与校验"
+                android:textSize="12sp"
+                android:textColor="#9E9E9E"
+                android:paddingBottom="8dp" />
+
+            <Button
+                android:id="@+id/btnMenuChat"
+                style="?android:attr/borderlessButtonStyle"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:gravity="start|center_vertical"
+                android:text="对话设置"
+                android:textSize="16sp"
+                android:textColor="#FFFFFF" />
+
+            <TextView
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="语音附加提示、完整回传流显示、设备朗读（TTS）"
+                android:textSize="12sp"
+                android:textColor="#9E9E9E"
+                android:paddingBottom="8dp" />
+
+            <Button
+                android:id="@+id/btnMenuApp"
+                style="?android:attr/borderlessButtonStyle"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:gravity="start|center_vertical"
+                android:text="应用设置"
+                android:textSize="16sp"
+                android:textColor="#FFFFFF" />
+
+            <TextView
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="开机自动启动、后台运行许可（自启动 / 无限制）"
+                android:textSize="12sp"
+                android:textColor="#9E9E9E"
+                android:paddingBottom="8dp" />
+
+            <Button
+                android:id="@+id/btnMenuAdvanced"
+                style="?android:attr/borderlessButtonStyle"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:gravity="start|center_vertical"
+                android:text="高级"
+                android:textSize="16sp"
+                android:textColor="#FFFFFF" />
+
+            <TextView
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="小智识别状态与激活、运行日志"
+                android:textSize="12sp"
+                android:textColor="#9E9E9E"
+                android:paddingBottom="8dp" />
+
+        </LinearLayout>
+
+            <Button
+                android:id="@+id/btnBack"
+                style="?android:attr/borderlessButtonStyle"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:gravity="start|center_vertical"
+                android:text="‹ 返回设置"
+                android:visibility="gone" />
+
+
+
         <TextView
+            android:id="@+id/titleGateway"
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
             android:text="网关设置"
@@ -477,6 +579,7 @@
         <!-- 语音附加提示:只在【语音输入】时自动追加到发给网关的文本末尾(文字输入不追加)。
              与网关类型无关,所有通道共用;清空即关闭。校验通过才落盘,与其它字段一致。 -->
         <TextView
+            android:id="@+id/titleVoicePrompt"
             style="@style/FieldLabel"
             android:layout_marginTop="12dp"
             android:text="语音附加提示（仅语音输入时追加）" />
@@ -515,6 +618,7 @@
             android:textColor="#DDDDDD" />
 
         <TextView
+            android:id="@+id/hintBootAutostart"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:layout_marginTop="4dp"
@@ -575,6 +679,7 @@
             android:text="保存网关设置" />
 
         <TextView
+            android:id="@+id/titleXiaozhi"
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
             android:text="小智识别(云端流式中文)"
@@ -610,6 +715,7 @@
             android:background="@drawable/bg_input" />
 
         <TextView
+            android:id="@+id/titleLog"
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
             android:text="日志"

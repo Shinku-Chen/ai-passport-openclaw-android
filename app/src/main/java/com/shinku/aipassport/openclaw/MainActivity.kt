@@ -114,6 +114,10 @@ class MainActivity : AppCompatActivity() {
      * 正常使用不会触发；以后可以把它升级成设置页的「试听」按钮。
      */
     private fun handleDiagnosticIntent(intent: Intent?) {
+        // 「--es text_test "<文本>"」:把文本直接推到设备屏(验证排版与截断上限)。
+        intent?.getStringExtra(VoiceBridgeService.EXTRA_TEXT_TEST_TEXT)
+            ?.takeIf { it.isNotBlank() }
+            ?.let { VoiceBridgeService.textTest(this, it) }
         val text = intent?.getStringExtra(VoiceBridgeService.EXTRA_TTS_TEST_TEXT)
             ?.takeIf { it.isNotBlank() } ?: return
         val gapMs = intent.getIntExtra(VoiceBridgeService.EXTRA_TTS_TEST_GAP_MS, 0)

@@ -10,6 +10,7 @@ import android.view.ViewGroup
 import android.widget.AdapterView
 import android.widget.ArrayAdapter
 import android.widget.Toast
+import androidx.activity.OnBackPressedCallback
 import androidx.appcompat.app.AlertDialog
 import androidx.core.widget.doAfterTextChanged
 import androidx.fragment.app.Fragment
@@ -116,6 +117,84 @@ class SettingsFragment : Fragment() {
         }
         binding.btnSave.setOnClickListener { saveSettings() }
         binding.btnActivateXz.setOnClickListener { activateXiaozhi() }
+        setupSections()
+    }
+
+    // ---- 二级菜单(网关 / 对话 / 应用 / 高级)----
+
+    /** 当前展开的 section。 */
+    private enum class Section { GATEWAY, CHAT, APP, ADVANCED }
+
+    /** 默认展开的 section(null = 一级菜单)。 */
+    private var currentSection: Section? = null
+
+    /**
+     * 把原先一屏堆到底的设置项拆成二级菜单:一级只列四类入口,点进去才显示该类具体项。
+     *
+     * 为什么不用“隐藏整块容器”:原布局是平铺的(网关三套配置、对话项、应用项彼此穿插),
+     * 把容器重新包裹一遍改动很大且容易把嵌套搞错;这里改成**按视图清单切显示**,
+     * 每个 section 就是一组视图 id,切换时只拨 visibility。
+     */
+    private fun setupSections() {
+        binding.btnMenuGateway.setOnClickListener { showSection(Section.GATEWAY, "网关设置") }
+        binding.btnMenuChat.setOnClickListener { showSection(Section.CHAT, "对话设置") }
+        binding.btnMenuApp.setOnClickListener { showSection(Section.APP, "应用设置") }
+        binding.btnMenuAdvanced.setOnClickListener { showSection(Section.ADVANCED, "高级") }
+        binding.btnBack.setOnClickListener { showSection(null) }
+
+        // 系统返回键:在某个 section 里先退回菜单,再按一次才退出设置页。
+        requireActivity().onBackPressedDispatcher.addCallback(
+            viewLifecycleOwner,
+            object : OnBackPressedCallback(true) {
+                override fun handleOnBackPressed() {
+                    if (currentSection != null) {
+                        showSection(null)
+                    } else {
+                        isEnabled = false
+                        requireActivity().onBackPressedDispatcher.onBackPressed()
+                        isEnabled = true
+                    }
+                }
+            },
+        )
+        showSection(null)
+    }
+
+    private fun showSection(section: Section?, title: String? = null) {
+        currentSection = section
+        binding.settingsMenu.visibility = if (section == null) View.VISIBLE else View.GONE
+        binding.btnBack.visibility = if (section == null) View.GONE else View.VISIBLE
+        if (section != null && title != null) {
+            binding.btnBack.text = "‹ 返回设置 · $title"
+        }
+        val sections = mapOf(
+            Section.GATEWAY to listOf(
+                binding.titleGateway, binding.spinnerType, binding.textCleartextHint,
+                binding.groupOpenclaw, binding.groupHermes, binding.groupOpenai, binding.btnSave,
+            ),
+            Section.CHAT to listOf(
+                binding.titleVoicePrompt, binding.inputVoicePromptSuffix,
+                binding.checkShowRawStream, binding.checkTtsEnabled, binding.ttsHint,
+            ),
+            Section.APP to listOf(
+                binding.checkBootAutoStart, binding.hintBootAutostart,
+                binding.textForegroundWarning, binding.btnFixBackground,
+            ),
+            Section.ADVANCED to listOf(
+                binding.titleXiaozhi, binding.xzStatus, binding.btnActivateXz, binding.xzActiveStatus,
+                binding.titleLog, binding.logText,
+            ),
+        )
+        // 先全部收起来,再展开当前 section —— 避免上一次展开的项留在屏上。
+        sections.values.flatten().forEach { it.visibility = View.GONE }
+        if (section != null) {
+            val views = sections.getValue(section)
+            views.forEach { it.visibility = View.VISIBLE }
+            // 网关三套配置的内部可见性由类型决定(见 applyTypeVisibility),
+            // 这里把当前类型对应的那套放出来,其余保持隐藏。
+            if (section == Section.GATEWAY) applyTypeVisibility()
+            binding.root.scrollTo(0, 0)
+        }
     }
 
     // ---- 类型选择 ----
@@ -278,6 +357,9 @@ class SettingsFragment : Fragment() {
         binding.xzStatus.text = "识别引擎:小智云端(已启用)"
 
         refreshKeepAliveWarning()
+        // loadSettings 会把网关三套配置按类型置为可见 —— 若当前停在某个 section,
+        // 需要把“只显示本 section”的状态重新拨回去(否则那三套会漏到一级菜单上)。
+        if (currentSection != null) showSection(currentSection)
     }
 
     /**

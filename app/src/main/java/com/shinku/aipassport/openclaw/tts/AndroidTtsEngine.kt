@@ -127,7 +127,17 @@ class AndroidTtsEngine(private val context: Context) : DeviceTtsEngine {
             )
         }
         Log.i(TAG, "可选音色 ${infos.size} 个:")
-        infos.forEach { Log.i(TAG, "  · ${TtsVoiceChoice.describe(it)}") }
+        // 全字段打印(不合成、不试听):真机排查"音色能不能选"时全靠它 ——
+        // 小米 MiBrain 引擎的 name/quality/latency 对多个音色是同一个值,只有 locale 的
+        // script 变体(Hans/无/Hant)能区分,而实测 setVoice 不改变合成结果(见 CHANGELOG)。
+        voices.forEachIndexed { i, v ->
+            Log.i(
+                TAG,
+                "  · #$i ${TtsVoiceChoice.describe(infos[i])}" +
+                    " | name=${v.name} locale=${v.locale} quality=${v.quality}" +
+                    " latency=${v.latency} network=${v.isNetworkConnectionRequired} features=${v.features}",
+            )
+        }
 
         val picked = TtsVoiceChoice.pick(infos) ?: run {
             Log.w(TAG, "没有可用的离线中文音色,保持引擎默认(不拿英文音色念中文)")

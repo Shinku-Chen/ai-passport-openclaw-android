@@ -214,6 +214,23 @@ class VoiceBridgeService : Service() {
         /** 诊断试推的推送间隔（ms/帧，`--ei`）：0/缺省 = 生产节奏；>0 时按固定间隔慢推。 */
         const val EXTRA_TTS_TEST_GAP_MS = "tts_gap_ms"
 
+        /** 【诊断】直接向设备推一条 TEXT 文本（验证设备屏的排版/截断），`--es text_test "…"`。 */
+        const val ACTION_TEXT_TEST = "com.shinku.aipassport.openclaw.action.TEXT_TEST"
+        const val EXTRA_TEXT_TEST_TEXT = "text_test"
+
+        fun textTest(context: Context, text: String) {
+            if (!isRunning) return
+            try {
+                context.startService(
+                    Intent(context, VoiceBridgeService::class.java)
+                        .setAction(ACTION_TEXT_TEST)
+                        .putExtra(EXTRA_TEXT_TEST_TEXT, text),
+                )
+            } catch (e: Exception) {
+                Log.w(TAG, "诊断推送文本失败:${e.message}")
+            }
+        }
+
         fun ttsTest(context: Context, text: String, gapMs: Int = 0) {
             if (!isRunning) return
             try {
@@ -348,6 +365,14 @@ class VoiceBridgeService : Service() {
             // 设置页刚打开「设备朗读」开关:预热合成引擎(顺带把可用音色写进日志)
             ACTION_TTS_PREWARM -> {
                 if (::deviceTtsPush.isInitialized) scope.launch { deviceTtsPush.prewarm() }
+            }
+            // 【诊断】直接推一条文本到设备(验证屏幕排版/截断)
+            ACTION_TEXT_TEST -> {
+                val t = intent.getStringExtra(EXTRA_TEXT_TEST_TEXT).orEmpty()
+                if (t.isNotBlank()) {
+                    Log.i(TAG, "【诊断】推送文本到设备: ${t.length} 字")
+                    sendTextFrame('A', t)
+                }
             }
             // 【诊断】直接试推一段朗读(不看开关/网关):定位固件在下行朗读时崩溃的原因
             ACTION_TTS_TEST -> {
