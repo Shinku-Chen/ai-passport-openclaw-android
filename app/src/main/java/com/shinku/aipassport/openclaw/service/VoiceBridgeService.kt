@@ -112,6 +112,12 @@ class VoiceBridgeService : Service() {
         const val ACTION_NOTIFICATION_DISMISSED = "com.shinku.aipassport.openclaw.action.NOTIFICATION_DISMISSED"
 
         /**
+         * 预热设备朗读的合成引擎（无其他副作用）：设置页刚打开 TTS 开关时调一次，
+         * 让合成器立刻就绪并把**可用音色清单**打进日志（不必等到第一条回复）。
+         */
+        const val ACTION_TTS_PREWARM = "com.shinku.aipassport.openclaw.action.TTS_PREWARM"
+
+        /**
          * 回到前台时补一次前台服务（无其他副作用）。
          *
          * 修的是这个真机 bug：后台启动路径上 `startForeground()` 会被系统**静默拒绝**
@@ -177,6 +183,18 @@ class VoiceBridgeService : Service() {
                 )
             } catch (e: Exception) {
                 Log.w(TAG, "补前台服务失败:${e.message}")
+            }
+        }
+
+        /** 预热设备朗读引擎（设置页刚打开 TTS 开关时调一次）：引擎就绪 + 把可用音色写进日志。 */
+        fun prewarmTts(context: Context) {
+            if (!isRunning) return
+            try {
+                context.startService(
+                    Intent(context, VoiceBridgeService::class.java).setAction(ACTION_TTS_PREWARM),
+                )
+            } catch (e: Exception) {
+                Log.w(TAG, "TTS 引擎预热请求失败:${e.message}")
             }
         }
 
@@ -297,6 +315,10 @@ class VoiceBridgeService : Service() {
             ACTION_RELOAD_SETTINGS -> if (!initialized) startBridge() else reloadGatewaySettings()
             // 回到前台时的补前台请求:上面已经补过并校过(这里只记一行日志,不做其他副作用)
             ACTION_SYNC_FOREGROUND -> Log.i(TAG, "回到前台:已重新确认前台服务")
+            // 设置页刚打开「设备朗读」开关:预热合成引擎(顺带把可用音色写进日志)
+            ACTION_TTS_PREWARM -> {
+                if (::deviceTtsPush.isInitialized) scope.launch { deviceTtsPush.prewarm() }
+            }
             else -> startBridge()
         }
         return START_STICKY
@@ -346,6 +368,11 @@ class VoiceBridgeService : Service() {
         deviceTtsPush = DeviceTtsPush()
         deviceTts = DeviceTtsSession(enabled = { this.settings.ttsEnabled }, downlink = deviceTtsPush)
         Log.i(TAG, "设备朗读(TTS): enabled=${settings.ttsEnabled} engine=${settings.ttsEngine}")
+        // 开关打开时预热一次合成引擎(幂等):
+        //  ① 去掉第一条回复的合成延迟(与识别通道预热同理);
+        //  ② 让「这台机器的 TTS 引擎能不能用、有哪些可用音色」在启动日志里就能看清 ——
+        //     设备朗读需要的是**离线中文音色**,而 setLanguage 到底选中了哪个,引擎不会告诉你。
+        if (settings.ttsEnabled) scope.launch { deviceTtsPush.prewarm() }
 
         // 帧重组 → 帧回调 → 流水线
         reassembler = VbFrameReassembler { frame -> pipeline.handleFrame(frame) }
@@ -377,6 +404,9 @@ class VoiceBridgeService : Service() {
             // App 是否展示完整回传流(raw):读设置里「App 显示完整回传流(调试)」,
             // 每次回复时取値(同一份 SharedPreferences,设置页切换即时生效);关掉后只显示 body
             showRawStream = { settings.showRawStream },
+            // 「设备朗读回复（TTS）」开关(默认关):打开后回复上屏之后再念一遍 ——
+            // 设备优先(需设备 hello 报 caps:["tts_opus"]),设备播不了才退回手机自己念。
+            ttsEnabled = { settings.ttsEnabled },
         )
 
         ble = BleCentral(
@@ -974,6 +1004,17 @@ class VoiceBridgeService : Service() {
      *     不另开线程猛灌;节奏由 [TtsFlowControl] 算(领先设备 ≤2s,目标 800ms)。
      */
     private inner class DeviceTtsPush : DeviceTtsDownlink {
+
+        /**
+         * 预热合成引擎(幂等,只记日志):服务启动时调用一次 —— 去掉首条回复的合成延迟,
+         * 并把可用音色清单打进日志(见 [AndroidTtsEngine]).
+         */
+        suspend fun prewarm() {
+            val engine = ttsEngine()
+            if (!engine.prepare()) {
+                Log.w(TAG, "设备朗读(TTS)引擎预热失败: ${engine.lastError ?: "未知原因"}")
+            }
+        }
 
         /** 在途下发编号:每次 speak/abort 自增,旧编号的循环下一帧前退出(跨线程读写)。 */
         @Volatile

@@ -229,6 +229,19 @@ class SettingsFragment : Fragment() {
             log("开机自动启动：${if (checked) "开" else "关"}")
         }
 
+        // 设备朗读（下行 TTS，默认关）：与网关无关，切换即落盘。
+        // 打开后回复上屏之后再念一遍 —— 设备优先（需设备 hello 报 caps:["tts_opus"]，
+        // 固件只在 Opus 解码器就绪时报），设备播不了才退回手机朗读；关闭时两边都不出声。
+        // 服务启动时已打开则预热一次引擎，日志里会列出这台机器的可用音色与最终选用项。
+        binding.checkTtsEnabled.isChecked = settings.ttsEnabled
+        binding.checkTtsEnabled.setOnCheckedChangeListener { _, checked ->
+            settings.ttsEnabled = checked
+            log("设备朗读(TTS)：${if (checked) "开" else "关"}")
+            // 打开时立刻预热合成引擎:马上把「引擎能不能用 + 有哪些可用音色」写进日志,
+            // 不用等第一条回复(也方便在没有网关时先确认 TTS 是否可用)。
+            if (checked) context?.let { VoiceBridgeService.prewarmTts(it) }
+        }
+
         // 设备朗读(下行 TTS)的设置项已移除(项目暂不考虑文字转语音):
         // prefs 里的 tts_enabled 保持默认 false,代码作为休眠能力保留。
         // 注意:不要因为删掉开关就把 tts_enabled 改写成 true。

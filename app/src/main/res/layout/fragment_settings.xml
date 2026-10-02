@@ -542,9 +542,26 @@
             android:text="打开系统应用设置（开自启动 / 后台无限制）"
             android:visibility="gone" />
 
-        <!-- 设备朗读(下行 TTS)的设置项当前【不提供】:项目暂不考虑文字转语音。
-             代码与协议能力(0x06 下行帧 + 固件播放通路)保留为休眠能力,
-             `tts_enabled` 默认 false,需要时可把开关加回来。 -->
+        <!-- 设备朗读(下行 TTS):网关回复上屏之后**再念一遍**。
+             设备优先(需设备在 hello 里报 caps:["tts_opus"],固件只在 Opus 解码器就绪时报);
+             设备播不了(老固件/未连接)才退回手机自己念;关闭时两边都不出声。
+             默认【关】—— 打开前请确认这台手机的 TTS 引擎可用(没装引擎时会显示可读原因并跳过,不会报错)。 -->
+        <com.google.android.material.materialswitch.MaterialSwitch
+            android:id="@+id/checkTtsEnabled"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="10dp"
+            android:text="设备朗读回复（TTS，默认关）"
+            android:textColor="#DDDDDD" />
+
+        <TextView
+            android:id="@+id/ttsHint"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="4dp"
+            android:text="打开后回复会被念出来：优先由设备播报（手机合成 → Opus → BLE 下发），设备不支持时改由手机朗读。播报时设备会暂停拾音，按一下 OK 即可打断。"
+            android:textColor="#9E9E9E"
+            android:textSize="12sp" />
 
         <!-- 保存即校验:先按当前输入框的草稿值探活(OpenClaw=WS 鉴权 / Hermes=/health),
              校验通过才落盘;失败不写任何字段并在对话框里显示原因。

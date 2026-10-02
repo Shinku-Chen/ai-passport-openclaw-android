@@ -112,14 +112,33 @@ class VoicePipeline(
      * 读设置里「App 显示完整回传流(调试)」开关,每次回复时取値(不缓存,改开关即时生效)。
      */
     private val showRawStream: () -> Boolean = { true },
+    /**
+     * 「设备朗读回复（TTS）」开关(设置项 `tts_enabled`,默认**关**)。
+     *
+     * 打开后:网关回复**上屏之后**会被念出来 —— 优先让**设备**念(需要设备在 hello 里报
+     * `caps:["tts_opus"]`),设备播不了才退回**手机自己念**;关闭时两边都不出声。
+     */
+    private val ttsEnabled: () -> Boolean = { false },
     /** 本 App 的 `versionName`(服务构造时从 PackageManager 读):用于固件/App 版本比对。 */
     private val appVersion: String = "",
 ) {
     private val tag = "VoicePipeline"
     private val gson = Gson()
 
+    /** 设备 hello 的 caps 里表示「支持下行朗读」的能力名(逐字与固件一致)。 */
+    private val CAP_TTS_OPUS = "tts_opus"
+
     /** 本次连接是否已经检查过设备 hello 的版本(断开时重置,避免每次重连重复提示)。 */
     private var helloChecked = false
+
+    /**
+     * 设备是否声明支持下行朗读(设备 hello 的 `caps` 里有 `tts_opus`)。
+     *
+     * 固件**只在 Opus 解码器就绪时**才报这个能力:没报就说明这台设备播不了 —— 此时绝不能往设备推
+     * TTS 音频(白推一堆帧,设备还会回 `tts_playback_aborted`),应改为让手机自己念([speakReply])。
+     */
+    @Volatile
+    private var deviceTtsCapable = false
 
     /**
      * 处理设备的 hello:核对固件/App 版本是否配套。
@@ -134,6 +153,14 @@ class VoicePipeline(
         helloChecked = true
         val fw = obj?.get("fw")?.takeIf { it.isJsonPrimitive }?.asString
         val proto = obj?.get("proto")?.takeIf { it.isJsonPrimitive }?.asInt
+        // 设备能力:hello 的 caps 里有没有 tts_opus(固件只在解码器就绪时报,见协议文档)
+        val caps = obj?.get("caps")?.takeIf { it.isJsonArray }?.asJsonArray
+        deviceTtsCapable = caps?.any { it.isJsonPrimitive && it.asString == CAP_TTS_OPUS } == true
+        Log.i(
+            tag,
+            "设备能力: 下行朗读=${if (deviceTtsCapable) "支持(tts_opus)" else "不支持"}" +
+                " caps=${caps ?: "未上报"}",
+        )
         val notice = VersionCompat.check(appVersion, fw, proto)
         if (notice == null) {
             Log.i(tag, "版本一致:App $appVersion / 固件 ${fw ?: "未上报"}")
@@ -238,6 +265,7 @@ class VoicePipeline(
         deviceTts.onCancel()
         stt.onLinkDown()
         helloChecked = false   // 新一次连接:版本提示重新计一次
+        deviceTtsCapable = false   // 能力要重新等这台设备的 hello(可能换了一台设备)
     }
 
     /** 服务销毁:停止 TTS 并释放识别引擎。 */
@@ -514,11 +542,8 @@ class VoicePipeline(
                 0L
             }
             val spoken = reply.messages.filter { it.isNotBlank() }.joinToString("\n")
-            if (spoken.isNotEmpty()) speak(spoken)
-            // 设备朗读(M1):文本已经通过上面的 `'A'` 文本帧上屏,这里**再**触发一次下行 TTS。
-            // 异步、不阻塞上屏与回话流程,且可被 barge(下一轮 turn_start 的 tts_abort)取消;
-            // 受设置项 `tts_enabled` 控制(默认关),见 DeviceTtsSession.onReply。
-            if (spoken.isNotEmpty()) deviceTts.onReply(spoken)
+            // 回复朗读:设备优先(设备报 tts_opus 才推)、否则手机念;开关关闭时两边都不出声
+            if (spoken.isNotEmpty()) speakReply(spoken)
             publishReadyAfter(myTurn, leaveReadyDelayMs)
         }
     }
@@ -655,9 +680,9 @@ class VoicePipeline(
                     Log.i(tag, "历史补正到位,丢弃缓发的状态话术(${held.sumOf { it.length }} 字)")
                 }
                 sendText('A', action.text)
-                // 补正后的正文刚刚上屏(设备屏的真答案):设备朗读也改读它。
+                // 补正后的正文刚刚上屏(设备屏的真答案):朗读也改读它。
                 // 服务侧会先中止上一段(若流式正文已开始播),只保证「最终正文」被完整读出。
-                deviceTts.onReply(action.text)
+                speakReply(action.text)
                 replaceBodyBubbles(firstId, extraBubbles, action.text, bodySourceOf(corrected = true))
             }
 
@@ -709,6 +734,27 @@ class VoicePipeline(
         scope.launch {
             delay(delayMs)
             if (myTurn == turnId) onState(readyText)
+        }
+    }
+
+    /**
+     * 把一句回复念出来。
+     *
+     * 分派规则(「设备朗读回复」开关打开时才有声音,见构造参数 [ttsEnabled]):
+     *  - 设备在 hello 里报了 `tts_opus` → 下发**设备朗读**(手机合成 PCM → Opus → BLE → 设备放);
+     *  - 设备播不了(老固件未上报/设备未连接) → 退回**手机自己念**([speak]);
+     *  - 开关关闭(默认) → 什么都不做。
+     *
+     * 为什么不再“两边都念”:手机外放与设备外放同时出声重复且吵闹;而且原来的本地朗读是**无门槛**的,
+     * 在没装 TTS 引擎的手机上默默无声,一旦换了有引擎的手机就会**突然开口** ✗(真机实测)。
+     */
+    private fun speakReply(text: String) {
+        if (text.isBlank() || !ttsEnabled()) return
+        if (deviceTtsCapable) {
+            deviceTts.onReply(text)
+        } else {
+            Log.i(tag, "设备不支持下行朗读(未报 tts_opus),改用手机朗读")
+            speak(text)
         }
     }
 

@@ -94,9 +94,52 @@ class AndroidTtsEngine(private val context: Context) : DeviceTtsEngine {
             }
             prewarmed = true
             Log.i(TAG, "系统 TTS 引擎就绪,default=$defaultSynth engines=$installed")
+            applyPreferredVoice(engine)
         }
         lastError = null
         return true
+    }
+
+    /**
+     * 从引擎枚举出的音色里挑一个用于**设备朗读**:优先中文 + **离线** + 语音包已下载 + 质量高、延迟低
+     * (策略见 [TtsVoiceChoice])。挑不到就保持 `setLanguage(zh)` 的结果(引擎默认),绝不硬塞英文音色。
+     *
+     * 全部候选都会打进日志 —— “这台机器到底有几个可用音色、能不能离线”只能这样看清楚
+     * (系统设置里那页只给试听,不给清单;而且 `setLanguage` 到底选到了哪个也不告诉你)。
+     */
+    private fun applyPreferredVoice(engine: TextToSpeech) {
+        val voices = runCatching { engine.voices }.getOrNull().orEmpty()
+        if (voices.isEmpty()) {
+            Log.w(TAG, "引擎未枚举出任何音色(getVoices 为空),保持引擎默认")
+            return
+        }
+        val infos = voices.map { voice ->
+            TtsVoiceChoice.VoiceInfo(
+                name = voice.name,
+                language = voice.locale?.language.orEmpty(),
+                country = voice.locale?.country.orEmpty(),
+                quality = runCatching { voice.quality }.getOrDefault(0),
+                latency = runCatching { voice.latency }.getOrDefault(0),
+                requiresNetwork = runCatching { voice.isNetworkConnectionRequired }.getOrDefault(false),
+                notInstalled = runCatching {
+                    voice.features?.contains(TextToSpeech.Engine.KEY_FEATURE_NOT_INSTALLED) == true
+                }.getOrDefault(false),
+            )
+        }
+        Log.i(TAG, "可选音色 ${infos.size} 个:")
+        infos.forEach { Log.i(TAG, "  · ${TtsVoiceChoice.describe(it)}") }
+
+        val picked = TtsVoiceChoice.pick(infos) ?: run {
+            Log.w(TAG, "没有可用的离线中文音色,保持引擎默认(不拿英文音色念中文)")
+            return
+        }
+        val voice = voices.firstOrNull { it.name == picked.name } ?: return
+        val result = runCatching { engine.setVoice(voice) }.getOrDefault(TextToSpeech.ERROR)
+        if (result == TextToSpeech.SUCCESS) {
+            Log.i(TAG, "已选用音色: ${TtsVoiceChoice.describe(picked)}")
+        } else {
+            Log.w(TAG, "选用音色失败(result=$result),保持引擎默认音色")
+        }
     }
 
     override suspend fun synthesize(text: String, sampleRateHz: Int): ByteArray? {
