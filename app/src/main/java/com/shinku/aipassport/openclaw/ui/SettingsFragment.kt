@@ -78,6 +78,9 @@ class SettingsFragment : Fragment() {
     /** 最近一次落盘的语音附加提示(判断是否真的变了)。 */
     private var lastPromptSuffix: String = ""
 
+    /** 「前台服务被系统拒绝」状态:决定警告与修复按钮是否可见(见 applyKeepAliveVisibility)。 */
+    private var keepAliveDenied = false
+
     /**
      * 当前语音桥服务实际使用的网关类型(页面加载时的落盘值)。
      * 保存成功且类型变化时才重启服务。
@@ -153,6 +156,11 @@ class SettingsFragment : Fragment() {
         binding.btnMenuAdvanced.setOnClickListener { showSection(Section.ADVANCED, "高级") }
         binding.btnBack.setOnClickListener { showSection(null) }
 
+        // 「打开系统应用设置」必须**无条件**挂监听:旧实现只在检测到“前台服务被拒”时才挂,
+        // 而按钮可见性会被 section 切换无条件打开 —— 于是出现「按钮亮着、点了没反应」
+        // (用户真机反馈的「应用设置里面的打开系统应用无响应」就是这个原因)。
+        binding.btnFixBackground.setOnClickListener { openSystemAppSettings() }
+
         // 系统返回键:在某个 section 里先退回菜单,再按一次才退出设置页。
         requireActivity().onBackPressedDispatcher.addCallback(
             viewLifecycleOwner,
@@ -206,6 +214,8 @@ class SettingsFragment : Fragment() {
             // 网关三套配置的内部可见性由类型决定(见 applyTypeVisibility),
             // 这里把当前类型对应的那套放出来,其余保持隐藏。
             if (section == Section.GATEWAY) applyTypeVisibility()
+            // 「前台服务被拒」的警告/修复按钮是**状态驱动**可见性,不能跟着 section 无条件露出来。
+            applyKeepAliveVisibility()
             binding.root.scrollTo(0, 0)
         }
     }
@@ -414,27 +424,58 @@ class SettingsFragment : Fragment() {
         }
     }
 
+    /**
+     * 刷新「前台服务是否被系统拒绝」的状态,并按状态摆好警告与修复按钮。
+     *
+     * 真机 bug(用户反馈「打开系统应用无响应」):旧实现把点击监听放在 `if (!denied) return`
+     * **之后**,状态正常时按钮根本没挂监听;而 section 切换又会无条件把它拨成可见 ——
+     * 结果就是一个亮着却点不动的按钮。
+     */
     private fun refreshKeepAliveWarning() {
-        val keepAlive = KeepAliveState(requireContext())
-        val denied = keepAlive.foregroundDenied
-        binding.textForegroundWarning.visibility = if (denied) View.VISIBLE else View.GONE
-        binding.btnFixBackground.visibility = if (denied) View.VISIBLE else View.GONE
-        if (!denied) return
-        binding.textForegroundWarning.text =
-            "⚠️ 系统拒绝了本应用的前台服务(App 收不到异常)：锁屏/息屏约 1 分钟后服务会被系统停掉。" +
-                "请把本应用设为「自启动」并允许「后台无限制 / 无限制省电」。"
-        binding.btnFixBackground.setOnClickListener {
+        keepAliveDenied = KeepAliveState(requireContext()).foregroundDenied
+        if (keepAliveDenied) {
+            binding.textForegroundWarning.text =
+                "\u26a0\ufe0f 系统拒绝了本应用的前台服务(App 收不到异常)：" +
+                    "锁屏/息屏约 1 分钟后服务会被系统停掉。" +
+                    "请把本应用设为「自启动」并允许「后台无限制 / 无限制省电」。"
+        }
+        applyKeepAliveVisibility()
+    }
+
+    /**
+     * 警告与修复按钮的可见性:只由「前台服务是否被系统拒绝」决定。
+     * 单独抽出来是因为 section 切换也会拨可见性,不能让它俩被无条件拨亮。
+     */
+    private fun applyKeepAliveVisibility() {
+        val v = if (keepAliveDenied) View.VISIBLE else View.GONE
+        binding.textForegroundWarning.visibility = v
+        binding.btnFixBackground.visibility = v
+    }
+
+    /**
+     * 打开本应用在系统设置里的详情页(去开「自启动」「后台无限制」)。
+     *
+     * 逐级回退:真机上只发 ACTION_APPLICATION_DETAILS_SETTINGS 有跳不过去的情况,
+     * 因此依次尝试 应用详情页 → 应用列表 → 设置首页,全部失败才退化成 Toast 指路
+     * (任何时候都不要「点了没反应」)。
+     */
+    private fun openSystemAppSettings() {
+        val pkg = requireContext().packageName
+        val candidates = listOf(
+            Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:$pkg")),
+            Intent(Settings.ACTION_APPLICATION_SETTINGS),
+            Intent(Settings.ACTION_SETTINGS),
+        )
+        for (intent in candidates) {
             try {
-                startActivity(
-                    Intent(
-                        Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
-                        Uri.parse("package:${requireContext().packageName}"),
-                    )
-                )
+                startActivity(intent)
+                log("已打开系统设置(${intent.action})")
+                return
             } catch (e: Exception) {
-                Toast.makeText(requireContext(), "打不开系统应用设置:${e.message}", Toast.LENGTH_LONG).show()
+                log("打开系统设置失败(${intent.action}):${e.message}")
             }
         }
+        toast("打不开系统设置,请手动到:设置 → 应用管理 → 本应用 → 自启动 / 省电策略")
     }
 
     /**
