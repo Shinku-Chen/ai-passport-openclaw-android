@@ -1,11 +1,10 @@
 {
   "schema": 1,
-  "updated": "2026-10-02T16:40:00Z",
+  "updated": "2026-10-02T13:13:52Z",
   "app": {
-    "version": "1.11",
-    "versionCode": 7,
+    "version": "1.12",
     "url": "https://github.com/Shinku-Chen/ai-passport-openclaw-android/releases/latest",
-    "notes": "设备朗读（TTS）默认开并按手机能力门控；设置页改版、设备管理并入设置；语音附加提示即时生效"
+    "notes": ""
   },
   "firmware": {
     "version": "1.11",
