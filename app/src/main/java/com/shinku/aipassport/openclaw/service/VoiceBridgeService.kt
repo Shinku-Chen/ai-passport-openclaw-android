@@ -135,24 +135,24 @@ class VoiceBridgeService : Service() {
         /**
          * 小智 TTS 直通的待发队列上限(帧)。
          *
-         * 为什么是 400(24s):小智直通下**正文上屏时开播**,一次性把已缓冲的帧灌进队列
-         * (见 `XiaozhiTtsRelay`),所以「队列一次攒进一大段音频」是正常形态而不是异常 ——
-         * 上限必须**大于** `XiaozhiTtsRelay.MAX_BUFFER_FRAMES`(300),否则开播时的 flush 会把队列灌满,
-         * 收尾的 `tts_stop` 排不进去(要走「清队列直接 stop」的降级路径而丢掉尾部音频)。
+         * 为什么是 400(24s):一段开播时会把**该段**已缓冲/已收的帧一次性灌进队列(见 `XiaozhiTtsRelay`
+         * 的按段模型),所以「队列一次攒进一段音频」是正常形态而不是异常 —— 上限必须**大于**
+         * `XiaozhiTtsRelay.MAX_BUFFER_FRAMES`(300,单段缓冲上限),否则开段时的 flush 会把队列灌满,
+         * 本段收口的 `tts_stop` 排不进去(要走「清队列直接 stop」的降级路径而丢掉尾部音频)。
          * 内存:每帧 ≤ 515B,400 帧 ≤ 约 206KB,链路异常时也涨不上去。
          */
         const val MAX_XIAOZHI_TTS_QUEUE_FRAMES = 400
 
-        /** 小智 TTS 直通 drain 协程在空队列时的轮询间隔(句间间隙)。 */
+        /** 小智 TTS 直通 drain 协程在空队列时的轮询间隔(段尾 / 等设备回报的停顿)。 */
         const val XIAOZHI_TTS_IDLE_POLL_MS = 10L
 
         /**
          * 小智 TTS 直通空队列多久后降频轮询(ms)。
          *
-         * 播放窗口在 `tts.state=stop` 之后仍开着(服务端会继续推本段的迟到帧,见 `XiaozhiTtsRelay`),
-         * 所以队列空一会儿也不代表本段完了。这里**不**主动发 `tts_stop`:提前收尾会把还没到的尾音
-         * 关在门外(听感上“后半段没声音”)。改为降频等待,由直通侧的窗口收尾(新一轮 / barge /
-         * 设备 `turn_cancel` / 设备回报本段播放结束)+ `tts_abort` 终止。
+         * 段尾不会立即开下一段(要等设备回报这一段播完,或按本段长度兜底超时),所以队列空一会儿是
+         * **正常形态**而不是异常。这里**不**主动发 `tts_stop`:段的收口由 relay 决定(下一句文本 /
+         * 推空且静默)。降频只是为了不把协程卡在 10ms 轮询上,同时轮询本身还要负责
+         * 「等设备回报超时」的兜底推进([XiaozhiTtsRelay.pumpSegments])与让路补上。
          */
         const val XIAOZHI_TTS_SLOW_POLL_AFTER_MS = 5_000L
 
@@ -373,16 +373,17 @@ class VoiceBridgeService : Service() {
      *
      * 它是识别通道那条 [com.shinku.aipassport.openclaw.stt.XiaozhiSession] 的 TTS 观察者:
      * 会话/音频**共用同一条 WS**(与「小智 AI 网关」、STT 一样),不另建连接。
+     * 它自己负责**按段播放**的状态机(一轮多段、每段 `tts_start`/`tts_stop` 各一次、段间等设备回报)。
      * null = 服务还没 startBridge(或已释放)。
      */
     @Volatile
     private var xiaozhiTtsRelay: XiaozhiTtsRelay? = null
 
     /**
-     * **正文补正让路**的纯逻辑(见 [XiaozhiCorrectionPacer]):只拦「小智本轮正文的**补正**上屏」。
+     * **正文上屏让路**的纯逻辑(见 [XiaozhiCorrectionPacer]):只拦小智直通里「下一段的字幕」。
      *
-     * 首句上屏**不**经过它(那是播放开始前的信号,必须立刻上屏并开播);非小智网关也不经过它
-     * (没有直通音频在播,让路没有意义)。
+     * 首句上屏**不**经过它(那是本段(第 1 段)开播前的信号,必须立刻上屏);非小智网关也不经过它
+     * (没有直通音频在推,让路没有意义)。
      */
     private val correctionPacer = XiaozhiCorrectionPacer()
 
@@ -555,11 +556,11 @@ class VoiceBridgeService : Service() {
         deviceTts = DeviceTtsSession(enabled = { this.settings.ttsEnabled }, downlink = deviceTtsPush)
         // 小智 TTS 直通(增量 3):只挂观察者,不建连接 —— 音频在小智会话里已经下来,
         // 直接按 [SEQ][rate_khz][frame_ms]+opus 组 TTS_OPUS 帧转发给设备(不本地合成/不重编码)。
-        // 时序(2026-10 作者定稿「第一句就好」):音频先只在 relay 侧缓冲,**本轮第一条正文
-        // (渐进交付下 = 首句)上屏之后**才下发 `tts_start` + 按到达顺序连续推帧;`tts.state=stop`
-        // 只做文本侧的最后一次补正,之后到达的迟到帧照常下发(一边播一边缓冲),窗口在收尾条件
-        // (新一轮 / barge / 设备 `turn_cancel` / 设备回报本段播完)才 `tts_stop`。
-        // 「正文先于首帧」由构造保证:relay 的开播要等 [notifyXiaozhiReplyOnScreen] 这个信号
+        // 时序(2026-10 作者定稿:**按段(句)播放**——小智能区分段落,按段落播放对应语音,
+        // 不是「整轮一串音频一直连续着」):一段 = 小智的一旬。段的字幕先写进 BLE 串行写队列,
+        // 紧接着该段 `tts_start` + 按到达顺序推这一段的帧,段尾 `tts_stop`;设备回报「这一段播完」
+        // 之后才进下一段(段间是自然停顿;设备不回报时按本段时长兜底超时)。
+        // 「字幕先于同段音频」由构造保证:段的开播要等 [notifyXiaozhiReplyOnScreen] 这个信号
         // (在 `TEXT('A')` 分片已写入 BLE 串行写队列之后发出)—— 详见 `XiaozhiTtsRelay`。
         //
         // 直通门的三项逐项进日志(见 [XiaozhiTtsGate]):
@@ -997,21 +998,22 @@ class VoiceBridgeService : Service() {
     }
 
     /**
-     * **补正上屏的两道门**:① **句级对齐**(本轮的主时机,作者 2026-10 定)—— 第 N(≥2)句的字幕
-     * 不上屏太早,而是在它自己那句音频**即将开播**时上屏(「先上字幕 → 紧接着该句声音」;
-     * 声音仍是连续流,句间不停、不切段、不重发 `tts_start`);② **补正让路**—— 音频紧时不插队。
+     * **按段播放**下「下一段的字幕」不要在音频正紧时插队([XiaozhiCorrectionPacer])。
      *
-     * 为什么要拦:正文帧与音频帧**共用一条 BLE 串行写队列**(见 [XiaozhiTtsRelay]),而且
+     * 为什么要拦:字幕帧与音频帧**共用一条 BLE 串行写队列**(见 [XiaozhiTtsRelay]),而且
      * 正文帧到达设备那一刻会触发一次**多行文本渲染** —— 设备的 BLE RX drain 与 LVGL 渲染在同一个
      * 应用任务里,那几十毫秒里 RX 排不空,解码队列就见底(真机 `欠载=23`)。设备侧那一半不改固件,
-     * 手机侧能做的是:**在正确的时候(该句音频到点前)才去动文字,且不在音频紧时插队**。
+     * 手机侧能做的是:**别在一段音频正紧的时候去动文字**。
      *
-     * 只拦小智直通的补正(判定复用 [XiaozhiTtsRelay.replyScreenOrdinal],与日志里的「首次/补正」
-     * 是**同一套规则**,不会分叉):
-     *  - 首句(序号 1)是「正文先于声音」的开播信号,必须立刻上屏(**不受句级对齐与让路任何影响**);
+     * 与 relay 的**段闸门**的关系(2026-10 按段播放改动):「第 N 段字幕必须早于第 N 段音频」由 relay
+     * 保证(段的 `tts_start` 只在它的字幕已写进 BLE 写队列后才发);本函数只管「现在写还是攒一攒」——
+     * 真被攒住了也只是让那一段等一会儿:一段推完(快照 `active` 变假)或兜底时限到就放行。
+     *
+     * 只拦小智直通的正文(判定复用 [XiaozhiTtsRelay.replyScreenOrdinal],与日志里的
+     * 「首句/补正」是**同一套规则**,不会分叉):
+     *  - 首句(序号 1)是「文字先于声音」的开播信号,必须立刻上屏；
      *  - 非本轮正文(序号 0)与本轮还没交付正文(null)不进这个通道;
-     *  - 其它四种网关没有直通音频在播,让路无意义 —— 一行也不改(句级对齐也自然不生效:
-     *    [XiaozhiTtsRelay.sentenceStartMs] 对非小智 / 开关关闭 / 服务端只给文本一律返回 null)。
+     *  - 其它四种网关没有直通音频在推,让路无意义 —— 一行也不改。
      *
      * @return true = 已暂缓(调用方**不要**再写这条 TEXT);false = 照旧立刻上屏
      */
@@ -1021,24 +1023,15 @@ class VoiceBridgeService : Service() {
         val ordinal = relay.replyScreenOrdinal(role, text) ?: return false
         if (ordinal <= 1) return false
         val pacing = if (::deviceTtsPush.isInitialized) deviceTtsPush.audioPacing() else null
-        // 【句级对齐】这条补正对应的**它自己那一句的音频起点**(ms);null = 没有可对齐的音频
-        // (非小智 / 开关关闭 / 服务端只给文本),这时照旧立即上屏。
-        val sentenceStartMs = relay.sentenceStartMs(text)
-        return when (correctionPacer.offer(text, System.currentTimeMillis(), pacing, sentenceStartMs)) {
+        return when (correctionPacer.offer(text, System.currentTimeMillis(), pacing)) {
             XiaozhiCorrectionPacer.Decision.SEND_NOW -> false
             XiaozhiCorrectionPacer.Decision.HOLD -> {
                 val pending = correctionPacer.pendingBody ?: text
-                // 两种“攒着”的原因分开说(真机一眼看出是「等该句音频到点」还是「音频紧不插队」)。
-                val reason = if (correctionPacer.waitingForSentenceStart(pacing)) {
-                    "等这一句字幕的音频到点,不提前上屏"
-                } else {
-                    "音频紧,不插队"
-                }
                 Log.i(
                     TAG,
-                    "补正让路:暂缓第 $ordinal 次正文上屏($reason) | " +
-                        XiaozhiPacingLog.line(ordinal, pacing, sentenceStartMs) +
-                        " | 攒起来(最新全文 ${pending.length} 字),等该句音频到点、垫底恢复或本段推完再补全文",
+                    "正文上屏让路:暂缓第 $ordinal 次上屏(本段音频正紧,不插队) | " +
+                        XiaozhiPacingLog.line(ordinal, pacing, relay.sentenceStartMs(text)) +
+                        " | 攒起来(最新全文 ${pending.length} 字),等本段推完/垫底恢复/时限到再上屏",
                 )
                 true
             }
@@ -1046,31 +1039,32 @@ class VoiceBridgeService : Service() {
     }
 
     /**
-     * 把「让路」攒下的**最终完整正文**补上屏(音频垫底恢复 / 本段音频推完收尾 / 兜底时限到)。
+     * 把「让路」攒下的正文补上屏(本段音频推完 / 垫底恢复 / 兜底时限到)。
      *
      * 这一跳是**无条件**的([XiaozhiCorrectionPacer.flush] / [XiaozhiCorrectionPacer.tick] 已判定):
-     * 让路只能让文字变晚,**不能**让文字最终不完整。
+     * 让路只能让文字变晚,**不能**让文字最终不完整 —— 而在按段播放里它还额外决定了「下一段能不能开播」
+     * (段的开播要等它的字幕上屏),所以更不允许把它长期攒着。
      *
-     * @param reason 触发原因(只进日志;真机靠它分辨「垫底恢复」还是「本段收尾」)
+     * @param reason 触发原因(只进日志;真机靠它分辨「垫底恢复」还是「本段推完」)
      */
     private fun flushDeferredCorrection(reason: String) {
         val text = correctionPacer.flush(System.currentTimeMillis()) ?: return
         // 具体「垫底/在途/队列」由 [notifyXiaozhiReplyOnScreen] 的取证行在同一点打出来,这里只说原因。
-        Log.i(TAG, "补正让路:补上最终完整正文($reason,全文 ${text.length} 字)")
+        Log.i(TAG, "正文上屏让路:补上正文($reason,全文 ${text.length} 字)")
         writeTextFrame(XiaozhiScreenSignal.REPLY_ROLE, text)
     }
 
     /**
-     * 音频推送循环里的一次例行推进:垫底恢复 / 兜底时限到就把攒着的正文补上屏(没有待补时是空操作)。
+     * 音频推送循环里的一次例行推进:垫底恢复 / 兜底时限到就把攒着的正文上屏(没有待补时是空操作)。
      *
      * 为什么由推送循环驱动:只有它知道自己什么时候「不紧」了([XiaozhiAudioPacing]);
-     * 推空等新帧的轮询循环(每 10ms/200ms 一次)同样会调到它,所以句子间隙里也有机会补上。
+     * 推空等新帧的轮询循环(每 10ms/200ms 一次)同样会调到它,所以段与段之间的停顿里也有机会补上。
      */
     private fun pumpDeferredCorrection() {
         if (correctionPacer.pendingBody == null) return
         val text = correctionPacer.tick(System.currentTimeMillis(), pacingOrNull()) ?: return
         // 具体「垫底/在途/队列」由 [notifyXiaozhiReplyOnScreen] 的取证行在同一点打出来,这里只说原因。
-        Log.i(TAG, "补正让路:该句音频已到点(或垫底恢复/时限到),补上正文(全文 ${text.length} 字)")
+        Log.i(TAG, "正文上屏让路:本段推完/垫底恢复,补上正文(全文 ${text.length} 字)")
         writeTextFrame(XiaozhiScreenSignal.REPLY_ROLE, text)
     }
 
@@ -1150,11 +1144,14 @@ class VoiceBridgeService : Service() {
     }
 
     /**
-     * **「本轮正文已上屏」信号**:整段回复的 `TEXT('A')` 分片**已全部写进 BLE 串行写队列**之后调用,
-     * 告诉小智 TTS 直通([xiaozhiTtsRelay])可以开播了。
+     * **「本轮正文已上屏」信号**:本条回复的 `TEXT('A')` 分片**已全部写进 BLE 串行写队列**之后调用,
+     * 告诉小智 TTS 直通([xiaozhiTtsRelay])「这条字幕已落位」—— 按段播放里它是一个**段的开播条件**
+     * (第 N 段的 `tts_start` 只可能在它的字幕入队之后发出)。
      *
-     * 渐进交付下本函数**同一轮会被调多次**(首次 = 首句,之后 = 补正),但只有**第一次**能真正开播:
-     * 后续信号只让已开始的音频继续下发(不会重启/打断它);开始时的时刻也只记第一次[deviceTtsPush.noteReplyTextOnScreen]。
+     * 渐进交付下本函数**同一轮会被调多次**(首句 = 第 1 段,之后每次补正各一条),每条字幕都归到它
+     * 对应的那一段:首句(第 1 段)因此**立即开播**(延迟优先),后续各段则在本段字幕落位 + 上一段播完之后
+     * 才开始(段间是**自然停顿**,见 [XiaozhiTtsRelay])。开播时刻只记第一次
+     * [deviceTtsPush.noteReplyTextOnScreen](作者要看的是「首句上屏 → 首帧」那段延迟)。
      *
      * 为什么要到这一层才发(而不是会话层收到 `tts.state=stop` 就开播):设备屏上的气泡与音频帧走的是
      * **同一个** BLE 串行写队列,而正文与音频分别在两个线程/协程里就绪 —— 只要不等这个信号,用户就会
@@ -1530,12 +1527,13 @@ class VoiceBridgeService : Service() {
         //  - 对账:同一份 lastFrames 与设备 tts_playback_* 回报日志。
         // 唯一区别:**不合成、不编码** —— 小智给的 opus 包直接进 [VbFrame.TYPE_TTS_OPUS]。
         //
-        // 时序(见 [XiaozhiTtsRelay]):正文上屏后 relay 才发 [start],并一次性把已缓冲的帧经
-        // [pushFrame] 递过来 —— 即 `start()` 一被调用,队列里很快就会攒进一大段帧(不再是逐句慢慢滴
-        // 进来),因此待发队列上限([MAX_XIAOZHI_TTS_QUEUE_FRAMES])必须容得下这一段;之后 `stop` 之后
-        // 到达的迟到帧继续以实时节奏递过来,直到窗口收尾才 [stop]。
+        // 时序(见 [XiaozhiTtsRelay],2026-10 作者的按段播放):relay 把一轮分成多段(小智自己的一句),
+        // **每段一对括号** —— 段的字幕已写进 BLE 写队列后才 [start](`tts_start`),该段的帧按到达顺序
+        // 经 [pushFrame] 递过来,段尾由 relay 调 [stop](`tts_stop`);**设备回报这一段播完之后**才开下一段。
+        // 一段开播时会把该段已收的帧一次性灌进队列,所以待发队列上限
+        // ([MAX_XIAOZHI_TTS_QUEUE_FRAMES])必须容得下**一段**音频。
 
-        /** 待发队列:一帧音频,或「一段结束」标记(见 [XiaozhiTtsItem],定义在文件级 —— inner class 内不允许嵌套接口)。 */
+        /** 待发队列:一帧音频,或「本段结束」标记(见 [XiaozhiTtsItem],定义在文件级 —— inner class 内不允许嵌套接口)。 */
         private val xzFrames = ArrayDeque<XiaozhiTtsItem>()
 
         /** [xzFrames] 的锁(WS 回调线程 / drain 协程 / abort 三处)。 */
@@ -1588,11 +1586,11 @@ class VoiceBridgeService : Service() {
             val started = xzSentAtMs > 0L
             val elapsed = if (started) System.currentTimeMillis() - xzSentAtMs else 0L
             val leadMs = TtsFlowControl.leadMs(lastFrames, elapsed)
-            // 【句级字幕对齐的两个时钟】
-            //  · 推送时钟 = 已交给 BLE 写队列的帧数 × 帧长;
-            //  · 播放进度估计 = 推送时钟 − 垫底 = 自 `tts_start` 起的实时时长。
-            // 字幕的句级对齐用**播放进度**(见 [XiaozhiCorrectionPacer.SENTENCE_PRELOAD_MS]):
-            // 拿推送时钟比会硬生生早出一个垫底量(目标 1200ms、硬上限 2000ms)。
+            // 【音频侧的两个量】
+            //  · 推送时钟 = **本段**已交给 BLE 写队列的帧数 × 帧长(lastFrames 每段 [start] 归零);
+            //  · 垫底 = 推送时钟 − 自本段 `tts_start` 起的实时时长。
+            // 段间那段「等设备播完」的停顿不在任何一段的时钟里 —— 所以字幕的落位时刻不再需要按
+            // 「播放进度」估（段的开播闸门在 relay 里，见 [XiaozhiTtsRelay]）。
             val pushedAudioMs = lastFrames.toLong() * TtsFlowControl.FRAME_MS
             val delivered = if (::ble.isInitialized) {
                 (ble.deliveredFrameCount() - xzDeliveredBase).toInt().coerceAtLeast(0)
@@ -1612,7 +1610,6 @@ class VoiceBridgeService : Service() {
                 },
                 queueFrames = synchronized(xzLock) { xzFrames.size },
                 pushedAudioMs = pushedAudioMs,
-                playedAudioMs = (pushedAudioMs - leadMs).coerceAtLeast(0L),
             )
         }
 
@@ -1624,10 +1621,28 @@ class VoiceBridgeService : Service() {
         private var xzSentAtMs = 0L
 
         override fun start() {
+            // 开段之前:上一段的 `tts_stop` 若还没排到队头(极端:队列积压),先把队列清掉并补发一条 stop
+            // —— 顺序必须是 `stop → start`,否则设备会把两段音频接成一段;清掉的未发帧记日志。
+            val queuedFrames: Int
+            val pendingStop: Boolean
+            synchronized(xzLock) {
+                queuedFrames = xzFrames.count { it is XiaozhiTtsItem.Frame }
+                pendingStop = xzFrames.any { it is XiaozhiTtsItem.Stop }
+                xzFrames.clear()
+            }
+            if (pendingStop) {
+                Log.w(
+                    TAG,
+                    "小智 TTS 直通:上一段的 tts_stop 还没发出就要开新段:先补一条 tts_stop" +
+                        "(顺序 stop → start;丢弃未发帧 $queuedFrames)",
+                )
+                sendControlJson(TtsControl.STOP_JSON)
+            } else if (queuedFrames > 0) {
+                Log.w(TAG, "小智 TTS 直通:开新段时丢弃上一段未发帧 $queuedFrames(队列被新段取代)")
+            }
             if (!sendControlJson(TtsControl.START_JSON)) {
-                // 设备没连/没初始化:整段放弃(帧没有 bracket 会被当错位处理,不如不发)。
+                // 设备没连/没初始化:本段放弃(帧没有 bracket 会被当错位处理,不如不发)。
                 xzStarted = false
-                synchronized(xzLock) { xzFrames.clear() }
                 return
             }
             // 【抢跑护栏】走到这里说明直通 relay 已经过了「正文已上屏」那道唯一闸门(见 [XiaozhiTtsRelay]);
@@ -1635,14 +1650,18 @@ class VoiceBridgeService : Service() {
             if (xzTurnTextOnScreenAtMs == 0L) {
                 Log.e(TAG, "小智 TTS 直通:本轮没有「正文已上屏」记录就开段(护栏:检查是否有路径绕过了 relay 的闸门)")
             }
-            xzPushId++                 // 旧 drain 立即失效(不会把上一段尚未推完的帧接着推)
-            xzJob?.cancel()
-            xzJob = null
-            synchronized(xzLock) { xzFrames.clear() }
-            xzNotStartedDropped = 0    // 新一段:重置「没开段就来的帧」计数
+            // 【每段流控独立】归零本段的推送记账:推送计数、实时节奏基准、在途量基准、上一帧写出时刻。
+            // 同一段音频不被上一段的时间线/领先量影响 —— 段间的停顿既不计入实时耗时,也不计入已推送。
+            lastFrames = 0
+            lastDropped = 0
+            xzNotStartedDropped = 0
             xzSentAtMs = System.currentTimeMillis()
+            xzLastFrameWriteAtMs = 0L
+            xzDeliveredBase = if (::ble.isInitialized) ble.deliveredFrameCount() else 0L
             xzStarted = true
-            Log.i(TAG, "小智 TTS 直通:下发 tts_start(采样率/帧长由帧头携带)")
+            Log.i(TAG, "小智 TTS 直通:本段开始 → 下发 tts_start(采样率/帧长由帧头携带)")
+            // 已有 drain 就沿用它(**不**取消/重启):它现在是跨段的循环,重启它会把在途状态打乱。
+            ensureXzDrain()
         }
 
         override fun pushFrame(rateKhz: Int, frameMs: Int, payload: ByteArray) {
@@ -1708,16 +1727,20 @@ class VoiceBridgeService : Service() {
         /**
          * 逐项出队下发(流控与本地合成那条路同一套规则)。
          *
-         * 正文上屏时队列会被 relay **一次性**灌满(已缓冲的那一段),所以这里的循环通常一上来
-         * 就有几十到几百帧要推;流控([TtsFlowControl.pushWaitMs])负责把它们按「预充几帧 + 之后每帧不
-         * 快于实时下限、且不领先设备超过目标领先量」的节奏**连续**送出去。队列空时等
-         * [XIAOZHI_TTS_IDLE_POLL_MS] 再查(`stop` 之后迟到帧是正常形态);
-         * 超过 [XIAOZHI_TTS_SLOW_POLL_AFTER_MS] 仍无新项则降频等待。
+         * **一段一对括号**(按段播放,见 [XiaozhiTtsRelay] 与设计文档 §5):[start] 下发 `tts_start` →
+         * 本段帧按 [TtsFlowControl.pushWaitMs] 的节奏连续推出 → 队尾的 [XiaozhiTtsItem.Stop] 出队时
+         * 下发 `tts_stop`。Stop **不再结束本协程**:同一轮还有下一段(`start()` 会再置位并塞帧),
+         * 而且「等设备回报超时」的兜底推进([XiaozhiTtsRelay.pumpSegments])与「补正让路」的补上
+         * ([pumpDeferredCorrection])都要靠这个循环的轮询来推。真正的结束是打断([abort] 取消本协程)。
          *
-         * **确定的收尾([XiaozhiTailStop])**:本段已真推出过帧、且「推空 + 静默达上限」→ 主动叫 relay
-         * 收尾(`tts_stop`,设备从播放态(“接收中”)回到空闲)。这是**不依赖设备回报**的兜底路径 ——
-         * 旧实现只有「设备回报本段播完 / 新一轮 turn_start / barge」三条收尾,三条都不发生时设备就一直
-         * 停在播放态。此处的收尾**不关 relay 的窗口**,迟到帧仍会续一段(不会把尾音切掉)。
+         * **每段的流控独立**:[start] 把本段的推送计数([lastFrames])、实时基准([xzSentAtMs])与
+         * 在途基准([xzDeliveredBase])归零,所以每段都有自己的开播预充([TtsFlowControl.PRECHARGE_FRAMES])
+         * 与领先量预算 —— 段间「等设备播完」的停顿不会被算成「已领先设备」。
+         *
+         * 队列空时的轮询既是节奏也是看门狗:超过 [XIAOZHI_TTS_SLOW_POLL_AFTER_MS] 仍无新项就降频;
+         * 本段已真推出过帧且「推空 + 静默达 [XiaozhiTailStop.TAIL_IDLE_MS]」→ 叫 relay 收本段
+         * (`tts_stop`,设备从播放态「接收中」回到空闲)—— 这是**不依赖设备回报**的兜底路径,
+         * 也是【最后一段】唯一的收口点(它没有「下一句文本」这个天然边界)。
          */
         private suspend fun drainXiaozhiTts(id: Int) {
             if (!::ble.isInitialized || !ble.isConnected()) {
@@ -1737,19 +1760,18 @@ class VoiceBridgeService : Service() {
             // `deliveredFrameCount()`(流控的在途量)才是真的。
             // 写模式本身由 [TtsWriteMode.XIAOZHI_DIRECT] 一处定义、单测钉住,这里只取它的值。
             ble.setBulkWrite(TtsWriteMode.XIAOZHI_DIRECT.bulkWrite)
-            // 在途量的基准:本段 `tts_start` 时刻的 GATT 写回调计数(见 [audioPacing])。
-            xzDeliveredBase = ble.deliveredFrameCount()
-            val deliveredBase = xzDeliveredBase
-            var sent = 0
+            // 本段的推送计数(lastFrames)由 [start] 归零;这里只在还没开段时兜底归零一次。
             var idleMs = 0L
             var slow = false
             // 本段是否已经因「推空且静默」而主动收尾(幂等:[XiaozhiTtsRelay.onIdleTailStop] 自身也幂等)
             var tailStopped = false
-            // 首帧之前的每一次等待都记下来(真机用它量化「上屏 → 首帧」到底花在哪)。
+            // 首帧之前的每一次等待都记下来(真机用它量化「**本轮首句**上屏 → 首帧」到底花在哪)。
+            // 注意:**整轮只记一次**(补正/后续段不重置它)——「距上屏 Xms」这个数只在第一段有意义。
             var firstFrameWritten = false
             val headWaits = StringBuilder()
             try {
                 while (true) {
+                    val sent = lastFrames
                     if (id != xzPushId) {
                         Log.i(TAG, "小智 TTS 直通被打断:已发 $sent 帧")
                         return
@@ -1759,18 +1781,20 @@ class VoiceBridgeService : Service() {
                         // 【补正让路】推空(含句子之间的间隙):推一下攒着的补正 —— 垫底恢复或兜底时限到
                         // 就把它补上屏。每 10ms/200ms 必到这里一次,所以句子间隙里也有机会补上。
                         pumpDeferredCorrection()
+                        // 【段机推进】「等设备回报本段播完」的兜底超时、以及「下一段可以开播了吗」都在
+                        // relay 里判定(它不持线程/定时器,由这里按轮询推)。
+                        xiaozhiTtsRelay?.pumpSegments()
                         if (!slow && idleMs >= XIAOZHI_TTS_SLOW_POLL_AFTER_MS) {
                             slow = true
-                            Log.w(TAG, "小智 TTS 直通:${idleMs}ms 无新帧也无 tts_stop,降频等待下一轮/迟到的 stop")
+                            Log.w(TAG, "小智 TTS 直通:${idleMs}ms 无新帧也无 tts_stop,降频等待下一段/设备回报")
                         }
-                        // 【确定收尾】推空 + 静默达上限 → 主动 tts_stop,把设备从播放态放回空闲。
-                        // 与上一轮/下一段的界线靠 relay 的窗口:它只关设备播放态,不丢迟到帧。
+                        // 【段尾收口】本段推空 + 静默达上限 → 叫 relay 收本段(它再 `tts_stop`)。
+                        // 之后来的迟到帧会由 relay 续一段(自动再 `tts_start`),所以尾音不会被切。
                         if (XiaozhiTailStop.shouldStop(sent, idleMs, tailStopped)) {
                             tailStopped = true
                             Log.i(
                                 TAG,
-                                "小智 TTS 直通:已推空 $sent 帧且 ${idleMs}ms 无新帧 → 主动收尾" +
-                                    "(tts_stop;窗口保持打开,迟到帧会续一段)",
+                                "小智 TTS 直通:已推空 $sent 帧且 ${idleMs}ms 无新帧 → 收本段(tts_stop)",
                             )
                             xiaozhiTtsRelay?.onIdleTailStop(sent)
                         }
@@ -1784,8 +1808,12 @@ class VoiceBridgeService : Service() {
                     tailStopped = false   // 又有新帧:本段的收尾作废(新一段重新计数)
                     when (item) {
                         is XiaozhiTtsItem.Stop -> {
-                            finishXiaozhiTts(sent)
-                            return
+                            // 本段推完:下发 tts_stop,然后**留在循环里**等下一段 / 等 relay 的兜底推进。
+                            finishXiaozhiSegment(sent)
+                            lastFrames = 0
+                            xzSentAtMs = 0L
+                            xzLastFrameWriteAtMs = 0L
+                            continue
                         }
 
                         is XiaozhiTtsItem.Frame -> {
@@ -1813,7 +1841,7 @@ class VoiceBridgeService : Service() {
                                 if (id != xzPushId || !ble.isConnected()) break
                                 val backlog = TtsFlowControl.backlogWaitMs(
                                     sent,
-                                    (ble.deliveredFrameCount() - deliveredBase).toInt().coerceAtLeast(0),
+                                    (ble.deliveredFrameCount() - xzDeliveredBase).toInt().coerceAtLeast(0),
                                     backlogWaitedMs,
                                 )
                                 if (backlog <= 0L) break
@@ -1844,8 +1872,8 @@ class VoiceBridgeService : Service() {
                             // 这里只包 6B 帧头 —— 不解析、不重编码。
                             val frame = vbEncodeFrame(VbFrame.TYPE_TTS_OPUS, 0, item.payload)
                             ble.writeBytes(frame)
-                            sent++
-                            lastFrames = sent
+                            // lastFrames = **本段**已推送帧数(每段在 [start] 归零;流控/音频侧快照/日志共用)。
+                            lastFrames = sent + 1
                             // 记录「刚写出音频帧」的时刻 + 推一下攒着的补正:
                             // 一是日志里的「距上一音频帧写入 Tms」要靠它,
                             // 二是持续推送的段落里也得有机会把补正放出去(不然只能等推空)。
@@ -1870,11 +1898,11 @@ class VoiceBridgeService : Service() {
                             }
                             // 逐帧取证(节流):这是「真的写进 BLE 写队列」的那一跳,
                             // 设备侧 TTS 计数为 0 时靠它与「已组帧」日志分层定位。
-                            if (XiaozhiFrameLog.shouldLog(sent)) {
+                            if (XiaozhiFrameLog.shouldLog(lastFrames)) {
                                 Log.i(
                                     TAG,
                                     "小智 TTS 直通:实际写入 BLE 帧 seq=${item.payload[0].toInt() and 0xFF}" +
-                                        " ${item.payload.size}B(第 $sent 帧)",
+                                        " ${item.payload.size}B(本段第 $lastFrames 帧)",
                                 )
                             }
                         }
@@ -1886,19 +1914,17 @@ class VoiceBridgeService : Service() {
             }
         }
 
-        /** 一段小智直通收尾:发 `tts_stop` 并复位记账(幂等)。 */
-        private fun finishXiaozhiTts(sent: Int) {
+        /** **本段**小智直通收尾:发 `tts_stop`(下一段的 `tts_start` 由 relay 决定后另发)。 */
+        private fun finishXiaozhiSegment(sent: Int) {
             xzStarted = false
-            synchronized(xzLock) { xzFrames.clear() }
-            // 收尾用带响应写:整段音频本来就固定走带响应写(无响应写在本机/本固件上会静默丢帧,
+            xzNotStartedDropped = 0            // 收尾用带响应写:本段音频本来就固定走带响应写(无响应写在本机/本固件上会静默丢帧,
             // 见 [drainXiaozhiTts] 的结论注释),这里再确认一次,保证控制帧写类型与本段一致。
             ble.setBulkWrite(TtsWriteMode.XIAOZHI_DIRECT.bulkWrite)
             sendControlJson(TtsControl.STOP_JSON)
-            Log.i(TAG, "小智 TTS 直通下发完成: frames=$sent")
-            // 【补正让路】本段音频推完/收尾 = 「无条件补上最终完整正文」的时机。
-            // 为什么就写在这里:`tts_stop` 只可能来自 relay 的收尾(推空且设备侧静默达 3s / 设备回报播完 /
-            // 新一轮打断),而帧已全部在它前面入队 —— 所以走到这里时“声音已经（快）结束”,此时补文字
-            // 既不会打断播放,又能保证屏幕最终是完整的(作者已接受“极端下文字晚于声音”)。
+            Log.i(TAG, "小智 TTS 直通:本段推完 → tts_stop(本段 frames=$sent):等设备回报或超时后进下一段")
+            // 【补正让路】本段音频推完 = 「把攒着的正文无条件补上屏」的时机(下一段的字幕常被让路
+            // 攒在这里;让路只能让文字变晚,不能让文字最终不完整)。此处帧已全部在本段 `tts_stop` 前入队,
+            // 所以“声音已经(快)结束”,补文字既不会打断播放,又能保证屏幕最终是完整的。
             flushDeferredCorrection("本段音频推完收尾")
         }
 
@@ -1908,9 +1934,8 @@ class VoiceBridgeService : Service() {
                 TAG,
                 "${ttsPlaybackLogLine(report)} — 本地已发送 frames=$lastFrames dropped=$lastDropped",
             )
-            // 小智直通的播放窗口以「设备回报本段结束」为正常收尾点:窗口在 tts.state=stop 之后是开着的
-            // (迟到帧照常下发),而服务端不会再给「音频发完没有」的信号 —— 只有设备知道自己把队列播完了。
-            // 直通侧会丢弃剩余缓冲并 tts_stop(幂等;未开段时的迟到回报会被它忽略)。
+            // 小智直通:设备回报「这一段播完」是**进入下一段**的推进信号(段间因此是自然停顿),
+            // relay 只在「本段已推完、正等回报」时才接受它(迟到/早到的回报一律忽略)。
             xiaozhiTtsRelay?.onDevicePlaybackFinished()
             if (report.ev == TtsPlaybackReport.ABORTED) {
                 lastFrames = 0
@@ -2463,9 +2488,9 @@ class VoiceBridgeService : Service() {
 /**
  * 小智 TTS 直通的待发项(`DeviceTtsPush` 内部队列的元素)。
  *
- * 为什么需要 [Stop] 标记而不是「收尾时直接发 `tts_stop`」:音频帧按流控实时下发,`stop` 到达时
- * 队列里可能还剩几百 ms 未发完 —— 只有把「结束」排在同一队列的末尾,才能保证设备一定是在
- * **最后一帧之后**才收到 `tts_stop`。
+ * 为什么需要 [Stop] 标记而不是「收尾时直接发 `tts_stop`」:音频帧按流控实时下发,本段收口时
+ * 队列里可能还剩几百 ms 未发完 —— 只有把「本段结束」排在同一队列的末尾,才能保证设备一定是在
+ * **本段最后一帧之后**才收到 `tts_stop`(按段播放里每段各一对括号)。
  *
  * 定义在文件级的原因:Kotlin 不允许在 inner class 内嵌套接口。
  */
@@ -2473,6 +2498,6 @@ private sealed interface XiaozhiTtsItem {
     /** 一帧已组好 `[SEQ][rate_khz][frame_ms] + opus` 的下行音频([frameMs] 用于流控节奏)。 */
     data class Frame(val frameMs: Int, val payload: ByteArray) : XiaozhiTtsItem
 
-    /** 一段朗读结束:出队时发 `{"ev":"tts_stop"}`。 */
+    /** **本段**朗读结束:出队时发 `{"ev":"tts_stop"}`(下一段的 `tts_start` 由 relay 另发)。 */
     data object Stop : XiaozhiTtsItem
 }
