@@ -10,21 +10,23 @@ import kotlinx.coroutines.withTimeoutOrNull
  *
  * 它与其他四种网关的关键区别:**自己不发任何 HTTP/WS 请求**。一轮的流程是 ——
  * 设备音频经 [com.shinku.aipassport.openclaw.stt.XiaozhiStt] 上送小智(既有 STT 路径),
- * 小智在同一会话里回 `{"type":"stt"}`(识别)与 `{"type":"llm","text":…}`(回复正文);
- * 本类只等会话层推来的 `llm` 正文,把它当作**单条回复**交给流水线,
- * 于是「上屏 / 对话历史 / TTS」全部复用流水线原有逻辑(见 `docs/design/xiaozhi-ai-gateway.md` §4.2、§6)。
+ * 小智在同一会话里回 `{"type":"stt"}`(识别)与回复(正文 + TTS 音频);
+ * 本类只等会话层装配好的**本轮正文**(见 `XiaozhiReplyText`:`tts` 句级文本拼接优先,`llm.text` 兜底),
+ * 把它当作**单条回复**交给流水线,于是「上屏 / 对话历史 / TTS」全部复用流水线原有逻辑
+ * (见 `docs/design/xiaozhi-ai-gateway.md` §4.2、§6 修订)。
  *
  * 几条实现约束:
  *  - **会话必须共用**:`chatMulti` 不携带、也不转发任何东西给服务端 —— 问答配对由服务端的这一轮会话决定,
- *    另建一条会话不可能收到这次问答的 `llm`(所以构造函数要求注入 [XiaozhiLlmSource]);
+ *    另建一条会话不可能收到这次问答的正文(所以构造函数要求注入 [XiaozhiLlmSource]);
  *  - **必须有超时**:等不到正文时按现有网关的失败语义返回可读原因 + 写 [lastError],绝不无限挂着;
+ *    会话层明确说「本轮没有可上屏正文」时([NO_BODY])则**立刻**给原因,不白等一个超时;
  *  - **打断必须作废本轮等待**:流水线每轮 `turn_start` 都会调 [interrupt],不能留下悬挂的 deferred;
  *  - **[close] 不关会话**:会话归 STT 所有(关掉等于每轮重新握手),这里只摘观察者并作废等待。
  *
  * @param source 共用的小智会话(`XiaozhiStt.session`);null = 没接线(App 内文本输入页没有语音会话),
  *   此时一律返回「小智 AI 只在设备语音链路里工作」的可读原因,不做任何空等。
- * @param replyTimeoutMs 等待 `llm` 正文的上限。小智的 LLM 通常 1–3s 出正文,默认 30s 足够宽裕,
- *   又不会让设备屏干等;单测可缩短。
+ * @param replyTimeoutMs 等待正文的上限。小智的 LLM 通常 1–3s 出正文(正文由 `tts` 收尾时交出),
+ *   默认 30s 足够宽裕,又不会让设备屏干等;单测可缩短。
  */
 class XiaozhiGateway(
     private val source: XiaozhiLlmSource?,
@@ -97,7 +99,7 @@ class XiaozhiGateway(
     override suspend fun chat(text: String): String? = chatMulti(text).messages.firstOrNull()
 
     /**
-     * 等本轮的小智回复正文(即会话层的 `{"type":"llm","text":…}`)。
+     * 等本轮的**小智回复正文**(由会话层按 `XiaozhiReplyText` 的规则装配好)。
      *
      * 注意 [text] 只是本地识别原文(与小智服务端听到的同一段音频对应),**不发给任何服务端** ——
      * 正文由服务端在这一轮会话上主动推来,所以这里只登记「本轮在等」并交给 [onLlm] 完成。
@@ -141,6 +143,8 @@ class XiaozhiGateway(
                 Log.i(tag, "小智回复已就绪(${outcome.text.length} 字): ${outcome.text.take(40)}")
                 ChatReply(listOf(outcome.text))
             }
+            // 会话层确认本轮没有可上屏正文(只有表情/空文本):按失败语义给可读原因,不上屏表情/空串。
+            is Outcome.Failed -> fail(outcome.reason)
         }
     }
 
@@ -178,12 +182,18 @@ class XiaozhiGateway(
     }
 
     /**
-     * 会话层推来的 `llm` 正文(可能运行在 OkHttp 的 WS 回调线程):
+     * 会话层推来的**本轮正文**(可能运行在 OkHttp 的 WS 回调线程):
      * 有人等 → 完成它;没人等 → 暂存,给稍后几百毫秒内到达的 [chatMulti] 用。
+     *
+     * 空串不是「没到」而是**明确语义**:会话层已经确认本轮没有可上屏正文(只有表情/空文本) ——
+     * 此时立刻给可读原因收尾,既不要把空串/表情当正文,也不要空等一个超时(见 [XiaozhiLlmSource])。
      */
     private fun onLlm(text: String) {
         val body = text.trim()
-        if (body.isEmpty()) return
+        if (body.isEmpty()) {
+            onNoBody()
+            return
+        }
         val waiter: CompletableDeferred<Outcome>?
         synchronized(lock) {
             waiter = pending
@@ -191,11 +201,29 @@ class XiaozhiGateway(
             if (waiter == null) buffered = Buffered(System.currentTimeMillis(), body)
         }
         if (waiter != null) {
-            Log.i(tag, "收到小智 llm 正文(${body.length} 字),完成本轮等待")
+            Log.i(tag, "收到小智正文(${body.length} 字),完成本轮等待")
             waiter.complete(Outcome.Text(body))
         } else {
-            Log.d(tag, "收到小智 llm 正文(${body.length} 字),暂存等 chatMulti")
+            Log.d(tag, "收到小智正文(${body.length} 字),暂存等 chatMulti")
         }
+    }
+
+    /**
+     * 本轮**没有可上屏正文**:立刻以可读原因收尾(不写暂存 —— 空串没有内容可供下一轮使用)。
+     *
+     * 为什么不空等到 [DEFAULT_REPLY_TIMEOUT_MS]:会话层是在「整轮已结束且 `llm`/`tts` 都没有文本」时
+     * 才这么说的,再等下去只会让设备屏白等 —— 用户该看到的是原因,而不是一个方块/空气泡。
+     */
+    private fun onNoBody() {
+        val waiter: CompletableDeferred<Outcome>?
+        synchronized(lock) {
+            waiter = pending
+            pending = null
+            buffered = null
+        }
+        _lastError = NO_BODY
+        Log.w(tag, NO_BODY)
+        waiter?.complete(Outcome.Failed(NO_BODY))
     }
 
     /** 记录可读原因并返回空结果(不抛异常,与 [GatewayAdapter] 的约定一致)。 */
@@ -216,6 +244,9 @@ class XiaozhiGateway(
     private sealed interface Outcome {
         data class Text(val text: String) : Outcome
         data object Aborted : Outcome
+
+        /** 会话层已确认本轮没有可上屏正文(只有表情/空文本);[reason] 是可读原因。 */
+        data class Failed(val reason: String) : Outcome
     }
 
     /** `llm` 早到时暂存的正文与到达时刻(新鲜度见 [BUFFER_FRESH_MS])。 */
@@ -241,5 +272,13 @@ class XiaozhiGateway(
 
         /** 打断本轮:只作为结果上抛,不写 [lastError]。 */
         const val ABORTED = "本轮已打断"
+
+        /**
+         * 会话层确认本轮**没有可上屏正文**(整轮的 `llm`/`tts` 都没有文本,只有表情一类非正文字段)。
+         *
+         * 为什么不静默丢弃:设备屏需要一个**可读原因**(否则用户只看到一个空气泡或方块),
+         * 而原因要走既有失败语义(状态卡 + 一条 `TEXT('A')`)才与其它网关一致。
+         */
+        const val NO_BODY = "小智这一轮没有返回可上屏的正文(只有表情/空文本)"
     }
 }

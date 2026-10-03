@@ -1,6 +1,7 @@
 package com.shinku.aipassport.openclaw.gateway
 
 import com.shinku.aipassport.openclaw.stt.XiaozhiLlmSource
+import com.shinku.aipassport.openclaw.stt.XiaozhiReplyText
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.test.advanceTimeBy
@@ -20,6 +21,7 @@ import org.junit.Test
  * [com.shinku.aipassport.openclaw.stt.XiaozhiSession] 的分流同形),断言的都是**用户可见的结果**:
  *  1. 正常拿到 `llm.text` → 作为**单条**回复返回(流水线据此一次整段上屏);
  *  2. 一直等不到 → 超时 + 可读原因(不是无限挂着);
+ *  2b. 会话层明确说「本轮没有可上屏正文」(空串 = 只有表情/空文本)→ **立刻**给可读原因,不空等超时;
  *  3. barge/打断后旧轮不再产出结果:在途等待立刻以「本轮已打断」收尾(不悬挂)、
  *     旧轮暂存的正文也不交给下一轮,且**不误报网关故障**(lastError 保持空,
  *     否则状态卡/连接监控会把一次正常打断当成网关故障并触发重连)。
@@ -88,6 +90,33 @@ class XiaozhiGatewayTest {
         assertEquals("好的", one)
     }
 
+    /**
+     * 两个**真实件**接起来(假传输):`XiaozhiReplyText` 装配 → 网关等待 → 流水线拿到的正文。
+     *
+     * 验收点 1 的「上屏的是两句拼接的 tts 文本(不是 😊)」在这一层可见:会话层(此处用真装配器模拟
+     * 它的分流)喂进 `llm` 的表情 + 两句 `tts` 文本,网关交出的回复就是那两句拼接。
+     */
+    @Test
+    fun tts_concat_body_reaches_the_gateway_verbatim() = runTest {
+        val session = FakeSession()
+        // 与会话层同构:装配器的 emit 就是推给本会话正文观察者的那个回调。
+        val replyText = XiaozhiReplyText(emit = session::pushLlm)
+        val gw = XiaozhiGateway(session)
+        var reply: ChatReply? = null
+        val job = launch { reply = gw.chatMulti("明天天气怎么样") }
+        runCurrent()
+        replyText.onTurnStart()
+        replyText.onLlm("😊")
+        replyText.onTtsState("sentence_start", "气温大概十八到二十三度，")
+        replyText.onTtsState("sentence_end", "出门记得带把伞喔。")
+        replyText.onTtsState("stop", "")
+        advanceUntilIdle()
+        job.join()
+
+        assertEquals(listOf("气温大概十八到二十三度，出门记得带把伞喔。"), reply!!.messages)
+        assertNull(reply!!.error)
+    }
+
     /** 超时路径:等不到 `llm` 时给出可读原因,并写进 lastError(与其它网关的失败语义一致)。 */
     @Test
     fun timeout_returns_readable_error() = runTest {
@@ -102,6 +131,29 @@ class XiaozhiGatewayTest {
         assertTrue("超时不应产出气泡", reply!!.messages.isEmpty())
         assertTrue("原因必须可读", reply!!.error!!.contains("小智没有返回回复"))
         assertEquals("超时原因要能被状态卡读到", reply!!.error, gw.lastError)
+    }
+
+    /**
+     * 会话层确认「本轮没有可上屏正文」(整轮只有表情/空文本) → **立刻**给可读原因。
+     *
+     * 真机问题:上屏的回复只一个 emoji(设备屏是方块)。修法是把正文来源改成「tts 句级文本拼接」,
+     * 而两者都没有时必须给可读原因 —— 绝不把表情/空串当正文,也不白等一个 30s 超时
+     * (虚拟时间下,若空串被当成「没到」,这里会推进到超时并给出另一条文案 → 断言失败)。
+     */
+    @Test
+    fun no_body_from_session_fails_fast_with_readable_reason() = runTest {
+        val session = FakeSession()
+        val gw = XiaozhiGateway(session, replyTimeoutMs = 60_000)
+        var reply: ChatReply? = null
+        val job = launch { reply = gw.chatMulti("明天天气怎么样") }
+        runCurrent()
+        session.pushLlm("")            // 会话层的「本轮没有可上屏正文」信号(空串)
+        advanceUntilIdle()
+        job.join()
+
+        assertTrue("没有正文就不该产出气泡", reply!!.messages.isEmpty())
+        assertTrue("原因必须可读", reply!!.error!!.contains("没有返回可上屏的正文"))
+        assertEquals("原因要能被状态卡读到", reply!!.error, gw.lastError)
     }
 
     /** 打断在途等待(barge):新一轮 `turn_start` 先调 interrupt,旧轮立刻收尾、不悬挂。 */

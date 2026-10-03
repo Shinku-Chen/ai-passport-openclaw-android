@@ -9,6 +9,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import okhttp3.OkHttpClient
@@ -42,9 +43,14 @@ interface XiaozhiLlmSource {
     fun isWarmReady(): Boolean
 
     /**
-     * 挂上/替换 `llm` 正文观察者(会话层唯一的一条下行正文出口)。
+     * 挂上/替换本轮**正文**观察者(会话层唯一的一条下行正文出口)。
      *
      * 与会话构造参数里的 `onLlm` 各自独立、互不覆盖:那一条留给直接构造会话的调用方。
+     *
+     * **通知语义**(见 [XiaozhiReplyText] 与 `docs/design/xiaozhi-ai-gateway.md` §6 修订):
+     *  - 非空 = 本轮正文 —— **首选** `tts` 句级文本拼接(用户听到的那句),`llm.text` 只做兜底;
+     *  - 空串 = 会话层已经确认**本轮没有可上屏正文**(只有表情/空文本):实现要给可读原因收尾,
+     *    不要空等超时,更不要把 `emotion` 之类的非正文字段或空串当正文上屏。
      */
     fun setLlmObserver(observer: ((String) -> Unit)?)
 
@@ -99,7 +105,7 @@ interface XiaozhiTtsObserver {
  * 而 [XiaozhiStt] 以前只用了第一件,导致其余三件无处安放 —— 抽出来供「小智 AI 网关」共用同一会话:
  *  1. **上行**:设备音频 → App → 小智(opus 16 kHz/60 ms;见 [feedOpus]/[feedPcm]);
  *  2. **识别**:`{"type":"stt","text":…}` → [onStt](现有 STT 只用这一条,[XiaozhiStt] 因此退化为薄适配器);
- *  3. **回复**:`{"type":"llm","text":…}` → [onLlm];
+ *  3. **回复**:`{"type":"llm","text":…}` 与 `{"type":"tts","text":…}` → 装配成**本轮正文** → [onLlm];
  *  4. **语音**:`{"type":"tts","state":…}`(JSON)→ [onTtsState],以及**二进制 opus 帧** → [onTtsAudio]。
  *
  * 后三组回调是**接入面**:STT 路径的行为、日志文案与级别、超时数值、线程语义与抽离前逐字一致。
@@ -149,7 +155,9 @@ interface XiaozhiTtsObserver {
  * 刷新后仍被拒就放弃并把可读原因写进 [unavailableReason](绝不无限重连)。
  *
  * @param onStt 识别文本分流(每条 `stt` 回调一次;小智边识边发,可能是部分结果)。
- * @param onLlm 回复正文分流(`{"type":"llm"}`)。
+ * @param onLlm 本轮**正文**分流(非空 = 正文;空串 = 本轮没有可上屏正文)。正文按 [XiaozhiReplyText]
+ *   的规则装配:`tts` 的句级文本拼接**优先**(用户听到的就是它),整轮没有任何 tts 文本时才用
+ *   `llm.text` 兜底;`emotion` 一类非正文字段**永不**参与。
  *   共用本会话的网关不靠它,而是用 [setLlmObserver] 挂观察者(两条出口互不覆盖)。
  * @param onTtsState TTS 状态分流(`state`, `text`);共用本会话的 TTS 直通用 [setTtsObserver]。
  * @param onTtsAudio 下行 TTS 音频分流(`opus`, `rateKhz`, `frameMs`)。
@@ -233,6 +241,26 @@ class XiaozhiSession(
     /** TTS 直通观察者(下行 `tts` 状态与 opus 音频;见 [XiaozhiTtsObserver])。 */
     @Volatile
     private var ttsObserver: XiaozhiTtsObserver? = null
+
+    /**
+     * 本轮正文装配器:`llm`/`tts` 两条下行按设计文档 §6 修订的规则拼成**一条整段正文**,
+     * 在 `tts.state=stop`(或最后一句后短时间内无新增)时经 [emitReply] 一次性交出。
+     */
+    private val replyText = XiaozhiReplyText(emit = { body -> emitReply(body) })
+
+    /** [replyText] 与空闲结算定时器的锁(WS 回调线程 / 定时器协程都会动它们)。 */
+    private val replyLock = Any()
+
+    /** 空闲结算定时器代次:每次喂事件都递增,旧定时器醒来发现代次变了就自行放弃。 */
+    private var replyIdleToken = 0L
+
+    /**
+     * 空闲结算定时器所在的作用域。
+     *
+     * 为什么单独一个而不是复用 [refreshScope]:那个作用域是「凭据刷新」的语义,这里只是延迟结算的
+     * 定时器 —— 分开后 [release] 能各自取消,读代码时也不会把两件事混起来。
+     */
+    private val replyScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
 
     /** [setTtsObserver]/[clearTtsObserver] 的锁(同 [llmObserverLock] 的理由)。 */
     private val ttsObserverLock = Any()
@@ -453,6 +481,8 @@ class XiaozhiSession(
         // 新一轮开始:先把上一轮的 TTS 直通记账作废(打断时服务端不一定回 `tts.stop`,
         // 否则下一段音频会缺一个 `tts_start` 而直接甩给设备)。设备侧 `tts_abort` 由流水线另发。
         ttsObserver?.onTurnStart()
+        // 正文记账同理作废:上一轮迟到的句级文本/兜底正文绝不能进这一轮。
+        resetReply()
         // 立即允许 feedPcm/feedOpus 累积编码上送(不等握手,避免开头 PCM 丢失)
         listening = false
         turnRunning = true          // 先置 true:闲置超时定时器据此不动热连接
@@ -740,6 +770,7 @@ class XiaozhiSession(
         turnRunning = false
         turnSeq++             // 本轮作废:在途的重连重放立即放弃,不插队到新一轮
         clearTurnFrames()     // 本轮音频不再需要(重放只服务于本轮的识别结果)
+        resetReply()          // 本轮正文记账同理作废(打断后上一轮的文本不再上屏)
         if (wasListening) stopListening()
         pcmLen = 0   // 丢掉不满一帧的余量,不跨轮拼接
     }
@@ -765,6 +796,7 @@ class XiaozhiSession(
         turnSeq++
         clearTurnFrames()
         pcmLen = 0
+        resetReply()
         dropWarmLink()
     }
 
@@ -779,6 +811,8 @@ class XiaozhiSession(
         warmIdleScheduler.shutdownNow()
         // 在途的凭据刷新一并取消(服务已停,刷完也没人用;OTA 请求本身有硬超时兜底)。
         refreshScope.cancel()
+        // 在途的空闲结算一并取消(服务已停,结算也没人用)。
+        replyScope.cancel()
         releaseOpus()
     }
 
@@ -1277,13 +1311,18 @@ class XiaozhiSession(
                         onStt?.invoke(textVal)
                     }
                 }
-                // 小智的回复/TTS:分流给两条出口 —— 构造参数的 onLlm/onTtsState(直连会话的调用方),
-                // 以及观察者([llmObserver],共用本会话的「小智 AI 网关」)。TTS 音频转发仍是下一增量。
+                // 小智的回复/TTS:先喂给**正文装配器**([replyText]),由它在「整段结束」时经
+                // [emitReply] 一次性交出本轮正文(构造参数的 onLlm + [llmObserver] 两条出口);
+                // TTS 状态另外分流给直通观察者([XiaozhiTtsObserver],音频那一路)。
                 "llm" -> {
+                    // 取证:小智的回复报文**全字段**(键名 + 值)进日志(与既有脱敏同一套规则,
+                    // `emotion` 这类非密钥字段**照打**)。为什么必须打全:真机上出现「上屏的回复只有一个
+                    // emoji(设备屏是方块)」时,只有看到报文里到底哪个字段是表情才能定论 —— 本仓库任何
+                    // 地方都不读 `emotion`,所以正文只可能来自 `text`,但服务端是否把表情也写进 `text`
+                    // (或把表情当成首片 `text` 推)必须靠这行日志确证。
+                    Log.i(tag, "收到小智 llm 报文(全字段): ${XiaozhiOtaRequest.describeOutgoing(obj)}")
                     val reply = obj.stringOrNull("text").orEmpty()
-                    Log.d(tag, "收到小智 llm: ${reply.take(200)}")
-                    onLlm?.invoke(reply)
-                    llmObserver?.invoke(reply)
+                    feedReply { replyText.onLlm(reply) }
                 }
                 "tts" -> {
                     val state = obj.stringOrNull("state").orEmpty()
@@ -1291,6 +1330,8 @@ class XiaozhiSession(
                     Log.d(tag, "收到小智 tts[$state]: ${sentence.take(200)}")
                     onTtsState?.invoke(state, sentence)
                     ttsObserver?.onTtsState(state, sentence)
+                    // 正文装配:句级文本是本轮正文的**首选来源**(用户听到的就是它)。
+                    feedReply { replyText.onTtsState(state, sentence) }
                 }
                 "error" -> Log.w(tag, "小智端错误: ${obj.toString()}")
                 else -> Unit
@@ -1298,6 +1339,62 @@ class XiaozhiSession(
         } catch (e: Exception) {
             Log.e(tag, "解析小智消息失败", e)
         }
+    }
+
+    /**
+     * 喂一条**正文来源**事件(`llm` / `tts`)给 [replyText],并按它给出的时长安排一次空闲结算。
+     *
+     * 为什么事件与定时器要放在同一个锁里:两者必须是一个原子动作 —— 否则「A 算完时长、B 先挂了新定时器」
+     * 会让旧时长把新一轮提前结算(把回复截断)。代次([replyIdleToken])则保证已经挂上的旧定时器醒来后
+     * 一律放弃:新的 tts 报文一到达,「纯 llm 兜底」的长窗口立刻作废。
+     */
+    private fun feedReply(event: () -> Unit) {
+        val grace: Long?
+        val token: Long
+        synchronized(replyLock) {
+            event()
+            grace = replyText.pendingIdleGraceMs()
+            token = ++replyIdleToken
+        }
+        if (grace == null) return
+        replyScope.launch {
+            delay(grace)
+            synchronized(replyLock) {
+                if (token != replyIdleToken) return@synchronized
+                replyText.onIdle()
+            }
+        }
+    }
+
+    /**
+     * 作废本轮正文记账与在途的空闲结算([startTurn] / 打断 / 链路断开时调用,幂等)。
+     *
+     * 为什么必须连定时器一起作废:迟到的结算绝不能被上一轮的文本带进新一轮(那会让设备屏上出现
+     * 一个与当前问题无关的气泡)。
+     */
+    private fun resetReply() {
+        synchronized(replyLock) {
+            replyIdleToken++
+            replyText.onTurnStart()
+        }
+    }
+
+    /**
+     * 本轮正文的唯一出口:非空 = 正文,空串 = 本轮没有可上屏正文(调用方据此给可读原因)。
+     *
+     * 两条出口与改动前一致:
+     *  - 构造参数的 [onLlm](直连会话的调用方);
+     *  - [llmObserver](共用本会话的「小智 AI 网关」)。
+     * **非正文字段(`emotion` 等)永不参与** —— 它根本不会进 [replyText]。
+     */
+    private fun emitReply(body: String) {
+        if (body.isBlank()) {
+            Log.w(tag, "小智本轮没有可上屏正文(llm/tts 都没有文本):按失败语义给可读原因")
+        } else {
+            Log.i(tag, "小智本轮正文已就绪(${body.length} 字): ${body.take(40)}")
+        }
+        onLlm?.invoke(body)
+        llmObserver?.invoke(body)
     }
 
     /** 取 JSON 字符串字段(非字符串原语/缺失 → null)。 */
