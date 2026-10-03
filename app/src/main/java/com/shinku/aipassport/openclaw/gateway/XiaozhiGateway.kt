@@ -10,21 +10,21 @@ import kotlinx.coroutines.withTimeoutOrNull
  *
  * 它与其他四种网关的关键区别:**自己不发任何 HTTP/WS 请求**。一轮的流程是 ——
  * 设备音频经 [com.shinku.aipassport.openclaw.stt.XiaozhiStt] 上送小智(既有 STT 路径),
- * 小智在同一会话里回 `{"type":"stt"}`(识别)与回复(正文 + TTS 音频);
- * 本类只等会话层装配好的**本轮正文**(见 `XiaozhiReplyText`:`tts` 句级文本拼接优先,`llm.text` 兜底),
- * 把它当作**单条回复**交给流水线,于是「上屏 / 对话历史 / TTS」全部复用流水线原有逻辑
- * (见 `docs/design/xiaozhi-ai-gateway.md` §4.2、§6 修订)。
+ * 小智在同一会话里回 `{"type":"stt"}`(识别)与回复(逐段正文 + TTS 音频);
+ * 本类只等会话层装配好的**逐段正文**(见 `XiaozhiReplyText`:`tts` 句级文本**按段**交付、不累计,
+ * `llm.text` 只兜底),把它交给流水线,于是「上屏 / 对话历史 / TTS」全部复用流水线原有逻辑
+ * (见 `docs/design/xiaozhi-ai-gateway.md` §4.2、§5、§6 修订)。
  *
  * 几条实现约束:
  *  - **会话必须共用**:`chatMulti` 不携带、也不转发任何东西给服务端 —— 问答配对由服务端的这一轮会话决定,
  *    另建一条会话不可能收到这次问答的正文(所以构造函数要求注入 [XiaozhiLlmSource]);
  *  - **必须有超时**:等不到正文时按现有网关的失败语义返回可读原因 + 写 [lastError],绝不无限挂着;
  *    会话层明确说「本轮没有可上屏正文」时([NO_BODY])则**立刻**给原因,不白等一个超时;
- *  - **一轮可以有多条正文,后面的是补正**:会话层按 `XiaozhiReplyText` 的规则装配,同一轮里正文
- *    **可以变好**(多段 `tts[start…stop]` 的第二段、迟到的句级文本、以及「先用了 `llm.text` 兜底、
- *    随后 tts 句级文本才到」)。第一条经 [chatMulti] 的返回值交付,之后的**每一条变化**都经
- *    [chatMulti] 登记的[onBodyCorrection] 交付 —— 否则设备屏会永远停在那个更短的兜底正文上
- *    (真机现象「从小智获取的文本不是完整的」);
+ *  - **一轮可以有多条正文,每一条都是它那一段**:会话层按 `XiaozhiReplyText` 的规则**逐段**交付
+ *    (**不累计**),所以屏幕上只有 A、B、C 三条(不会多出 AB、ABC)。第一条经 [chatMulti] 的返回值
+ *    交付,之后的**每一条**(下一段 / 本段变完整 / 结算时补的那一段)都经 [chatMulti] 登记的
+ *    [onBodyCorrection] 交付 —— 否则多出来的那几段就上不了屏(真机现象「屏幕上多出重复气泡」
+ *    与「文本不完整」是同一处两个方向);
  *  - **打断必须作废本轮等待**:流水线每轮 `turn_start` 都会调 [interrupt],不能留下悬挂的 deferred;
  *    同一轮的补正出口也一并作废(旧轮的补正不得改写新一轮);
  *  - **[close] 不关会话**:会话归 STT 所有(关掉等于每轮重新握手),这里只摘观察者并作废等待。
@@ -125,11 +125,12 @@ class XiaozhiGateway(
     override suspend fun chat(text: String): String? = chatMulti(text).messages.firstOrNull()
 
     /**
-     * 等本轮的**小智回复正文**(由会话层按 `XiaozhiReplyText` 的规则装配好)。
+     * 等小智本轮的**逐段正文**(由会话层按 `XiaozhiReplyText` 的规则装配好,一段一条)。
      *
      * 注意 [text] 只是本地识别原文(与小智服务端听到的同一段音频对应),**不发给任何服务端** ——
      * 正文由服务端在这一轮会话上主动推来,所以这里只登记「本轮在等」并交给 [onLlm] 完成。
-     * 返回单元素列表,流水线据此走原有的「上屏一次整段 / 写历史 / 朗读」流程(设计 §6 方案 A)。
+     * 返回单元素列表(首段/整轮兜底那一条),流水线据此走原有的「上屏一段 / 写历史 / 朗读」流程;
+     * 同一轮后续的每一段经 [onBodyCorrection] 补交付(见设计 §5/§6)。
      */
     override suspend fun chatMulti(
         text: String,
@@ -224,10 +225,10 @@ class XiaozhiGateway(
     }
 
     /**
-     * 会话层推来的**本轮正文**(可能运行在 OkHttp 的 WS 回调线程),按四种情形分派:
-     *  1. 有人在等 → 作为本轮**首条**正文完成 [chatMulti] 的等待;
-     *  2. 本轮已交过结论、而这条正文**不同** → 作为**补正**交给 [chatMulti] 登记的出口(流水线补发一帧
-     *     `TEXT('A')` 并就地替换 App 气泡)—— 这是「兜底正文先上屏、完整正文随后到达」的修法;
+     * 会话层推来的**逐段正文**(可能运行在 OkHttp 的 WS 回调线程),按四种情形分派:
+     *  1. 有人在等 → 作为本轮**首段**正文完成 [chatMulti] 的等待;
+     *  2. 本轮已交过结论、而这条正文**不同** → 作为**下一段/本段更新/结算补的那段**交给 [chatMulti] 登记的
+     *     出口(流水线补发一帧 `TEXT('A')` 并就地替换 App 气泡);
      *  3. 还没人等也没交过结论(`llm` 早于 `chatMulti` 的几百毫秒竞态)→ 暂存,等他来取;
      *  4. 与已交付正文相同 / 已无补正出口(旧轮)→ 丢弃,不重复上屏。
      *
@@ -254,12 +255,12 @@ class XiaozhiGateway(
                     null
                 }
                 // 本轮已经交过结论(正文 / 「没有可上屏正文」),而现在来的正文不同
-                // → **补正**:再发一帧给设备屏并就地替换 App 的正文气泡。
+                // → 这是**下一段**(或本段变完整/结算补的那一段):再发一帧给设备屏并就地替换 App 的正文气泡。
                 deliveredSomething && body != deliveredBody && corrector != null -> {
                     Log.i(
                         tag,
-                        "收到更完整的本轮正文(${body.length} 字;上一条 ${deliveredBody?.length ?: 0} 字)"
-                            + ",作为补正交给流水线",
+                        "收到小智的下一段正文(${body.length} 字;上一段 ${deliveredBody?.length ?: 0} 字)"
+                            + ",作为后续段交给流水线",
                     )
                     deliveredBody = body
                     corrector
@@ -269,7 +270,7 @@ class XiaozhiGateway(
                     buffered = Buffered(System.currentTimeMillis(), body)
                     null
                 }
-                // 与已交付的正文相同,或本轮已经没有补正出口(旧轮/未登记):丢掉,不重复上屏。
+                // 与已交付的正文相同,或本轮已经没有后续段出口(旧轮/未登记):丢掉,不重复上屏。
                 else -> {
                     Log.d(tag, "忽略与已交付正文相同/无处交付的小智正文(${body.length} 字)")
                     null

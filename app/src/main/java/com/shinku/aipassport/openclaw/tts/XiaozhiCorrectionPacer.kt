@@ -238,18 +238,20 @@ class XiaozhiCorrectionPacer(
 /**
  * 上屏/补正的**取证日志行**(纯函数,单测钉住格式):真机上一眼看出「文字动的那一刻垫底是否见底」。
  *
- * 形如:`第 2 句字幕上屏(第 2 次上屏/补正) | 已推送音频≈10ms | 该句起点≈600ms | 音频垫底≈10 帧(≈600ms) | 在途=1 | 距上一音频帧写入 54ms | 队列=37`
+ * 形如:`第 2 段字幕上屏(本段 14 字) | 已推送音频≈10ms | 本段起点≈600ms | 音频垫底≈10 帧(≈600ms) | 在途=1 | 距上一音频帧写入 54ms | 队列=37`
  */
 object XiaozhiPacingLog {
 
     /**
-     * @param ordinal 本轮第几次**正文上屏**(1 = 首句;≥2 = 补正)
+     * @param ordinal 本轮第几次**上屏**(= 段号:1 = 首段;≥2 = 后面各段/本段更新) ——
+     *   与直通侧日志里的「第 N 段已声明」同一套编号
      * @param pacing 音频侧快照;null = 直通未接线(非小智路径)
-     * @param sentenceStartMs 这条字幕**对应那一句的音频起点估计**(ms;null = 未知/没有音频) ——
+     * @param sentenceStartMs 这条字幕**对应那一段的音频起点估计**(ms;null = 未知/没有音频) ——
      *   按段播放之后它只是**证据**(段的开播闸门才是字幕时机的保证,见 [XiaozhiTtsRelay])。
+     * @param bodyLength 本段字幕的字符数(与「第 N 段字幕上屏(本段 L 字)」逐字对得上)
      */
-    fun line(ordinal: Int, pacing: XiaozhiAudioPacing?, sentenceStartMs: Long? = null): String {
-        if (pacing == null) return "第 $ordinal 句字幕上屏(第 $ordinal 次上屏/补正) | 音频侧无状态(小智直通未接线)"
+    fun line(ordinal: Int, pacing: XiaozhiAudioPacing?, sentenceStartMs: Long? = null, bodyLength: Int = 0): String {
+        if (pacing == null) return "第 $ordinal 段字幕上屏(本段 $bodyLength 字) | 音频侧无状态(小智直通未接线)"
         val frames = pacing.leadFrames.roundToInt()
         val since = if (pacing.msSinceLastFrameWrite < 0L) {
             "无(本段还没写出过音频帧)"
@@ -257,8 +259,8 @@ object XiaozhiPacingLog {
             "${pacing.msSinceLastFrameWrite}ms"
         }
         val start = if (sentenceStartMs == null) "未知" else "≈${sentenceStartMs}ms"
-        return "第 $ordinal 句字幕上屏(第 $ordinal 次上屏/补正) | 已推送音频≈${pacing.pushedAudioMs}ms | " +
-            "该句起点$start | 音频垫底≈$frames 帧(≈${pacing.leadMs}ms) | " +
+        return "第 $ordinal 段字幕上屏(本段 $bodyLength 字) | 已推送音频≈${pacing.pushedAudioMs}ms | " +
+            "本段起点$start | 音频垫底≈$frames 帧(≈${pacing.leadMs}ms) | " +
             "在途=${pacing.inflightFrames} | 距上一音频帧写入 $since | 队列=${pacing.queueFrames}"
     }
 }

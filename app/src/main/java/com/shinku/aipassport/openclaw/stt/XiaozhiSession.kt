@@ -49,12 +49,13 @@ interface XiaozhiLlmSource {
      * 与会话构造参数里的 `onLlm` 各自独立、互不覆盖:那一条留给直接构造会话的调用方。
      *
      * **通知语义**(见 [XiaozhiReplyText] 与 `docs/design/xiaozhi-ai-gateway.md` §6 修订):
-     *  - 非空 = 本轮正文 —— **首选** `tts` 句级文本拼接(用户听到的那句),`llm.text` 只做兜底;
+     *  - 非空 = **这一段**(小智的这一句)的正文 —— **首选** `tts` 句级文本,**不累计**前面的段
+     *    (屏幕上因此只有 A → B → C 三条,不会多出 AB/ABC),`llm.text` 只做兜底;
      *  - 空串 = 会话层已经确认**本轮没有可上屏正文**(只有表情/空文本):实现要给可读原因收尾,
      *    不要空等超时,更不要把 `emotion` 之类的非正文字段或空串当正文上屏;
-     *  - **同一轮可以通知多次**(详见 `docs/design/xiaozhi-ai-gateway.md` §6.4):首条之后每次都是
-     *    「本轮正文变完整了」——实现应当把它当成**补正**(再发一帧给设备并就地替换 App 气泡),
-     *    否则设备屏会永远停在那个更短的兜底正文上(真机现象「从小智获取的文本不是完整的」)。
+     *  - **同一轮会通知多次**(详见 `docs/design/xiaozhi-ai-gateway.md` §6.4):首条之后每次都是
+     *    「**下一段**的正文」或「**本段**的正文变完整了」——实现应当把它当成**下一段/本段更新**
+     *    (再发一帧给设备并就地替换 App 气泡),否则那一段就永远上不了屏。
      */
     fun setLlmObserver(observer: ((String) -> Unit)?)
 
@@ -103,16 +104,16 @@ interface XiaozhiTtsObserver {
     fun onTurnStart()
 
     /**
-     * 会话层已装配好**本轮正文**(清洗后的整段;空串 = 本轮确实没有可上屏正文)。
+     * 会话层已装配好**这一段**的正文(清洗后的这一段自己的文本;空串 = 本轮确实没有可上屏正文)。
      *
      * 为什么需要它:直通侧的音频下发闸门是「正文已上屏」信号,而**不是**任何一个 `TEXT('A')` ——
      * 服务侧还有版本提示、「无语音」、超时与失败原因等同样以 `'A'` 上屏的文本。直通侧用这里给出的
-     * 正文做**唯一**依据:只有随后上屏的那条 `'A'` 与本轮正文一致,才允许开播(见
+     * 正文做**唯一**依据:只有随后上屏的那条 `'A'` 与本段正文一致,才允许开播(见
      * [com.shinku.aipassport.openclaw.tts.XiaozhiTtsRelay.onReplyTextDisplayed])。
      *
-     * 调用时机:在本轮正文交出**之前**(`llm` 观察者之前),保证信号到时正文已经对得上号。
-     * **同一轮可能调多次**(渐进交付:首句一条、之后每次补正各一条),直通侧会把这几次都记为
-     * 「本轮正文」,因此首句那条上屏信号也能开播(见
+     * 调用时机:在本段正文交出**之前**(`llm` 观察者之前),保证信号到时正文已经对得上号。
+     * **同一轮会调多次**(**按段交付**:第 1 段一条、之后每一句各一条;同一句变完整时再一条),直通侧
+     * 把这些都记为「本轮已交付的正文」,因此任一段的首条上屏信号都能开播(见
      * [com.shinku.aipassport.openclaw.tts.XiaozhiTtsRelay.replyScreenOrdinal])。
      */
     fun onReplyBody(body: String)
@@ -141,9 +142,9 @@ interface XiaozhiTtsObserver {
  * 而 [XiaozhiStt] 以前只用了第一件,导致其余三件无处安放 —— 抽出来供「小智 AI 网关」共用同一会话:
  *  1. **上行**:设备音频 → App → 小智(opus 16 kHz/60 ms;见 [feedOpus]/[feedPcm]);
  *  2. **识别**:`{"type":"stt","text":…}` → [onStt](现有 STT 只用这一条,[XiaozhiStt] 因此退化为薄适配器);
- *  3. **回复**:`{"type":"llm","text":…}` 与 `{"type":"tts","text":…}` → 装配成**本轮正文** → [onLlm]
- *     (句级文本**渐进交付**:首句一清洗出来就交一次、之后每次变完整再交一次,`tts.state=stop` 是
- *     **最终结算点**;见 [XiaozhiReplyText]);
+ *  3. **回复**:`{"type":"llm","text":…}` 与 `{"type":"tts","text":…}` → 装配成**逐段正文** → [onLlm]
+ *     (**按段交付**:一段一段上屏 A → B → C、不累计;首段一清洗出来就交一次,`sentence_end` 的同一句
+ *     更新只更新本段,`tts.state=stop` 是**最终结算点**且只补缺;见 [XiaozhiReplyText]);
  *  4. **语音**:`{"type":"tts","state":…}`(JSON)→ [onTtsState],以及**二进制 opus 帧** → [onTtsAudio]
  *     (小智模式:正文上屏之前先缓冲,之后开播并边播边缓冲,见 [XiaozhiTtsObserver])。
  *
@@ -194,15 +195,16 @@ interface XiaozhiTtsObserver {
  * 刷新后仍被拒就放弃并把可读原因写进 [unavailableReason](绝不无限重连)。
  *
  * @param onStt 识别文本分流(每条 `stt` 回调一次;小智边识边发,可能是部分结果)。
- * @param onLlm 本轮**正文**分流(非空 = 正文;空串 = 本轮没有可上屏正文)。正文按 [XiaozhiReplyText]
- *   的规则装配:`tts` 的句级文本拼接**优先**(用户听到的就是它),整轮没有任何 tts 文本时才用
- *   `llm.text` 兜底;`emotion` 一类非正文字段**永不**参与。**同一轮会多次回调**:首句一清洗出来就
- *   第一次交付(直通侧据此在首句上屏时开播,不再等 `tts.state=stop`),之后的每一条都是「正文变
- *   完整了」的补正;实现要把它当作替换而不是忽略(见 `docs/design/xiaozhi-ai-gateway.md` §6.4)。
+ * @param onLlm 本轮**逐段正文**分流(非空 = 这一段自己的文本;空串 = 本轮没有可上屏正文)。正文按
+ *   [XiaozhiReplyText] 的规则装配:`tts` 的句级文本**按段**交付(**不累计**前后段,屏幕上只有 A/B/C),
+ *   整轮没有任何 tts 文本时才用 `llm.text` 兜底;`emotion` 一类非正文字段**永不**参与。
+ *   **同一轮会多次回调**:每来一句就交一次(首段一清洗出来就第一次交付,直通侧据此在首段上屏时开播,
+ *   不再等 `tts.state=stop`);`sentence_end` 的同一句更新只更新**本段**;`stop` 只补没上屏的那一段。
+ *   实现要把它当作新的一段/本段更新而不是忽略(见 `docs/design/xiaozhi-ai-gateway.md` §6.4)。
  *   共用本会话的网关不靠它,而是用 [setLlmObserver] 挂观察者(两条出口互不覆盖)。
  * @param onTtsState TTS 状态分流(`state`, `text`);共用本会话的 TTS 直通用 [setTtsObserver]。
- *   `tts.state=stop` = 「整段正文齐了、最终结算」:正文在这里做最后一次补正（与上次相同则不重复交付）,
- *   音频直通侧把它当作开播时机的确认,窗口仍保持打开直到本轮收尾(见 [XiaozhiTtsObserver] 与
+ *   `tts.state=stop` = 「整轮文本结算」:正文在这里**只补还没上屏的那一段**(各段都已上屏则不重复交付),
+ *   音频直通侧把它当作段机的结算点,窗口仍保持打开直到本轮收尾(见 [XiaozhiTtsObserver] 与
  *   `docs/design/xiaozhi-ai-gateway.md` §4.4)。
  * @param onTtsAudio 下行 TTS 音频分流(`opus`, `rateKhz`, `frameMs`)。
  *   `rateKhz`/`frameMs` 取自服务器 hello 的 `audio_params`(小智为 24 kHz/60 ms),**0 = 尚未上报**。
@@ -287,11 +289,17 @@ class XiaozhiSession(
     private var ttsObserver: XiaozhiTtsObserver? = null
 
     /**
-     * 本轮正文装配器:`llm`/`tts` 两条下行按设计文档 §6 修订的规则拼成**本轮正文**,
-     * **渐进交付**(首句一清洗出来就交一次、之后每次变完整再交一次;见 [XiaozhiReplyText])
-     * 经 [emitReply] 交出(`stop` 是最终结算点)。
+     * 本轮正文装配器:`llm`/`tts` 两条下行按设计文档 §4.8/§5/§6 修订的规则拼成**逐段正文**,
+     * **按段交付**(一段一段上屏:A → B → C,不累计;首段一清洗出来就交一次,`sentence_end` 的
+     * 同一句更新只更新本段,`stop` 是最终结算点且只补缺)经 [emitReply] 交出。
+     *
+     * `log` 出口把段级日志(`第 N 段字幕上屏/更新/补上/跳过/不重复`)接到本类的 `Log.i` ——
+     * 本类保持**纯逻辑**(不引 Android 日志),日志文案由装配器给出、只在这一处落地。
      */
-    private val replyText = XiaozhiReplyText(emit = { outcome -> emitReply(outcome) })
+    private val replyText = XiaozhiReplyText(
+        emit = { outcome -> emitReply(outcome) },
+        log = { line -> Log.i(tag, line) },
+    )
 
     /** [replyText] 与空闲结算定时器的锁(WS 回调线程 / 定时器协程都会动它们)。 */
     private val replyLock = Any()
@@ -1392,10 +1400,11 @@ class XiaozhiSession(
                         onStt?.invoke(textVal)
                     }
                 }
-                // 小智的回复/TTS:先喂给**正文装配器**([replyText]),由它在「整段结束」时经
-                // [emitReply] 交出本轮正文(构造参数的 onLlm + [llmObserver] 两条出口);
-                // 句级文本是**渐进交付**的:首句一清洗出来就交一次(直通侧据此在首句上屏时开播),
-                // 之后每次变完整再交一次(补正),`stop` 是最终结算点。
+                // 小智的回复/TTS:先喂给**正文装配器**([replyText]),由它按**逐段**规则经
+                // [emitReply] 交出正文(构造参数的 onLlm + [llmObserver] 两条出口);
+                // **按段交付**:每来一句就把**这一句自己的文本**交一次(不累计 → 屏幕上只有 A/B/C,
+                // 不会多出 AB/ABC),首段交付即上屏(直通侧据此在首段上屏时开播),同一句在
+                // `sentence_end` 变完整只更新本段,`stop` 是最终结算点且只补缺。
                 // TTS 状态另外分流给直通观察者([XiaozhiTtsObserver],音频那一路)。
                 "llm" -> {
                     // 取证:小智的回复报文**全字段**(键名 + 值)进日志(与既有脱敏同一套规则,
@@ -1415,8 +1424,8 @@ class XiaozhiSession(
                     // 什么顺序、有没有 stop」与结算日志逐条对照才能定案(截断/节流会正好把要看的证据吃掉)。
                     Log.i(tag, "收到小智 tts[$state] 文本(${sentence.length} 字): $sentence")
                     onTtsState?.invoke(state, sentence)
-                    // 正文装配优先喂:`tts.state=stop` 同时意味着「整段正文齐了(最终结算)」与
-                    // 「可以开播了」—— 先走正文(最后一次补正),再让 TTS 直通记账。
+                    // 正文装配优先喂:`tts.state=stop` 是文本侧的**最终结算点**(只补还没上屏的那一段;
+                    // 各段都已上屏则不重复交付);直通侧的段机也在这里推进。
                     // 两阶段的**顺序保证**不靠这里的先后:直通侧要等一个明确的「正文已上屏」信号
                     // (`XiaozhiTtsRelay.onReplyTextDisplayed`,由服务侧在 `TEXT('A')` 已写进 BLE
                     // 串行写队列之后发出),所以首帧一定晚于正文帧(见 `docs/design/xiaozhi-ai-gateway.md` §4.4)。
@@ -1470,12 +1479,12 @@ class XiaozhiSession(
     }
 
     /**
-     * 本轮正文的唯一出口:非空 = 正文,空串 = 本轮没有可上屏正文(调用方据此给可读原因)。
+     * 本轮**逐段正文**的唯一出口:非空 = 这一段自己的文本,空串 = 本轮没有可上屏正文(调用方据此给可读原因)。
      *
      * 三条出口与改动前一致(顺序有语义):
-     *  0. **先**把本轮正文告诉 TTS 直通观察者([XiaozhiTtsObserver.onReplyBody])—— 直通侧只认
-     *     「上屏文本 == 本轮正文」的信号,所以必须在正文交给网关/流水线之前对好号,
-     *     否则那一条 `TEXT('A')` 发出来时直通侧还不知道本轮正文是什么;
+     *  0. **先**把这一段正文告诉 TTS 直通观察者([XiaozhiTtsObserver.onReplyBody])—— 直通侧只认
+     *     「上屏文本 == 已交付的某段正文」的信号,所以必须在正文交给网关/流水线之前对好号,
+     *     否则那一条 `TEXT('A')` 发出来时直通侧还不知道本段正文是什么;
      *  1. 构造参数的 [onLlm](直连会话的调用方);
      *  2. [llmObserver](共用本会话的「小智 AI 网关」)。
      * **非正文字段(`emotion` 等)永不参与** —— 它根本不会进 [replyText]。
@@ -1483,8 +1492,8 @@ class XiaozhiSession(
     private fun emitReply(outcome: XiaozhiReplyOutcome) {
         val body = outcome.body
         lastReplyDetail = outcome.detail
-        // 本次结算没产生新正文(重复结算 / 重复交付 / 工具调用静默期挂起):只记日志,绝不上屏、也不通知
-        // 观察者 —— 否则设备屏上会出现重复气泡,甚至把已经上屏的完整正文退回成一个更短的兜底文本。
+        // 本次结算没产生新正文(重复结算 / 各段都已上屏 / 工具调用静默期挂起):只记日志,绝不上屏、也不
+        // 通知观察者 —— 否则设备屏上会出现重复气泡(旧实现发累计全文就是这样多出 AB、ABC 的)。
         if (!outcome.changed) {
             Log.i(
                 tag,
@@ -1501,11 +1510,13 @@ class XiaozhiSession(
             )
         } else {
             // 真机对照用:这一行就是「设备屏上应该出现什么」,与 sendTextFrame 的「全文=…」逐字对得上。
-            // 「第几次交付」与触发者（首句 / 补正(第N句) / stop 最终结算）一起打:作者据此核对首句→首帧的延迟。
+            // 「第 N 段字幕上屏(本段 L 字)」与直通侧的「第 N 段已声明」同一套编号(**按段交付**:
+            // 每次上屏只发这一句自己的文本,不累计 → 屏幕上只有 A/B/C 三条,不会多出 AB/ABC)。
             Log.i(
                 tag,
-                "小智本轮正文已交付(第 ${outcome.deliveryIndex} 次,触发者=${outcome.triggerLabel}): " +
-                    "${outcome.detail} | ${body.length} 字/${bytes} 字节 | 全文=«$body»",
+                "第 ${outcome.deliveryIndex} 段字幕上屏(本段 ${body.length} 字," +
+                    "触发者=${outcome.triggerLabel}): ${outcome.detail} | " +
+                    "${body.length} 字/${bytes} 字节 | 全文=«$body»",
             )
         }
         ttsObserver?.onReplyBody(body)

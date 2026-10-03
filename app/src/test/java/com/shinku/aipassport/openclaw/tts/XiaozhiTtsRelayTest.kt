@@ -113,7 +113,7 @@ class XiaozhiTtsRelayTest {
      * 小智发来「新的一句」:同一条报文里装配器**先**交付正文、直通侧**再**收到 `sentence_start`
      * (见 `XiaozhiSession.handleServerMessage`)。**段的边界就在这里落定**:收上一段 + 用这条正文开新段。
      *
-     * @param body 本轮**累积**正文(蒸馏器交给流水线的那串文本;第 N 句时含前 N 句)
+     * @param body 本段正文(装配器**按段**交付的那串文本:**只含这一句自己**,不累计前几句)
      * @param sentenceText 这条报文里的句级文本(只是服务端侧的形状,直通侧按段不使用它)
      */
     private fun sentence(r: XiaozhiTtsRelay, body: String, sentenceText: String = body) {

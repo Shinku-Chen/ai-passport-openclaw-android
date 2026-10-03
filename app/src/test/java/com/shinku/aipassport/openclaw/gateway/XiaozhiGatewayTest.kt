@@ -97,12 +97,12 @@ class XiaozhiGatewayTest {
     /**
      * 两个**真实件**接起来(假传输):`XiaozhiReplyText` 装配 → 网关等待 → 流水线拿到的正文。
      *
-     * 验收点 1 的「上屏的是 tts 拼接的正文(不是 😊)」在这一层可见:会话层(此处用真装配器模拟
-     * 它的分流)喂进 `llm` 的表情 + 两句 `tts` 文本,网关交出的**首条**回复就是渐进交付出的首句;
-     * 之后更完整的正文经 `onBodyCorrection` 补正交付(小智网关「首条 + 补正」的完整契约)。
+     * 验收点 1 的「上屏的是 tts 句级文本(不是 😊)、而且**一段一段来**」在这一层可见:会话层(此处用真
+     * 装配器模拟它的分流)喂进 `llm` 的表情 + 每句一条 `tts` 文本,网关交出的**首条**回复就是首段
+     * (**它自己的文本**),之后每一段经 `onBodyCorrection` 交付(小智网关「首段 + 后续段」的完整契约)。
      */
     @Test
-    fun tts_concat_body_reaches_the_gateway_verbatim() = runTest {
+    fun tts_per_segment_bodies_reach_the_gateway_verbatim() = runTest {
         val session = FakeSession()
         // 与会话层同构:装配器的 emit 就是推给本会话正文观察者的那个回调(未变化的诊断不上屏)。
         val replyText = XiaozhiReplyText(emit = { outcome ->
@@ -120,11 +120,14 @@ class XiaozhiGatewayTest {
         replyText.onTtsState("sentence_start", "气温大概十八到二十三度，")
         advanceUntilIdle()
         assertEquals(
-            "首句先到:首条交付就是它(渐进交付,直接开播的那条)",
+            "首段先到:首条交付就是它**自己的文本**(按段交付,直接开播的那条)",
             listOf("气温大概十八到二十三度，"),
             reply!!.messages,
         )
 
+        // 第二句:`sentence_start` 已带该句完整文本 → 作为**下一段**交付(不是累计的后缀)
+        replyText.onTtsState("sentence_end", "气温大概十八到二十三度，")
+        replyText.onTtsState("sentence_start", "出门记得带把伞喔。")
         replyText.onTtsState("sentence_end", "出门记得带把伞喔。")
         replyText.onTtsState("stop", "")
         advanceUntilIdle()
@@ -132,9 +135,13 @@ class XiaozhiGatewayTest {
 
         assertEquals(listOf("气温大概十八到二十三度，"), reply!!.messages)
         assertEquals(
-            "更完整的正文(tts 两句拼接)经补正交付",
-            listOf("气温大概十八到二十三度，出门记得带把伞喔。"),
+            "第二段经后续段通道交付,而且只是它自己(不累计第一句)",
+            listOf("出门记得带把伞喔。"),
             corrections.toList(),
+        )
+        assertTrue(
+            "绝不能出现累计正文(那是屏幕上多出 AB/ABC 的根因)",
+            corrections.none { it.contains("气温大概十八到二十三度，出门") },
         )
         assertNull(reply!!.error)
     }
@@ -336,11 +343,11 @@ class XiaozhiGatewayTest {
     }
 
     /**
-     * 同一轮的**多次**补正(多段 `tts[start…stop]`)都要交付 —— 不能只认第一条补正,
+     * 同一轮的**多段**正文(按段交付:A、B、C 各一条)都要交付 —— 不能只认第一条后续段,
      * 否则第三段之后的文本又会丢掉。
      */
     @Test
-    fun every_growing_body_is_delivered_to_the_pipeline() = runTest {
+    fun every_following_segment_is_delivered_to_the_pipeline() = runTest {
         val session = FakeSession()
         val gw = XiaozhiGateway(session, replyTimeoutMs = 60_000)
         val corrections = CopyOnWriteArrayList<String>()
@@ -348,12 +355,12 @@ class XiaozhiGatewayTest {
         runCurrent()
         session.pushLlm("第一段。")
         advanceUntilIdle()
-        session.pushLlm("第一段。第二段。")
+        session.pushLlm("第二段。")
         advanceUntilIdle()
-        session.pushLlm("第一段。第二段。第三段。")
+        session.pushLlm("第三段。")
         advanceUntilIdle()
         job.join()
-        assertEquals(listOf("第一段。第二段。", "第一段。第二段。第三段。"), corrections.toList())
+        assertEquals(listOf("第二段。", "第三段。"), corrections.toList())
     }
 
     /** 与已交付正文相同的那条不再重复交付(否则设备屏会多一个重复气泡)。 */

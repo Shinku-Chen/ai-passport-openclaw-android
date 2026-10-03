@@ -359,18 +359,18 @@ class XiaozhiTtsRelay(
     private var droppedFrames = 0
 
     /**
-     * **本轮交付过的所有正文**(会话层渐进交付:首句一条、之后每次补正各一条;见
+     * **本轮交付过的所有正文**(会话层**按段交付**:第 1 段一条、之后每一段各一条;同一句变完整时再一条;见
      * `com.shinku.aipassport.openclaw.stt.XiaozhiReplyText`);空 = 本轮还没交付过可上屏正文。
      *
-     * 为什么是**列表**而不是「最后一条」:渐进交付下,首句的 `TEXT('A')` 可能仍在流水线/写队列里
-     * 排队时,下一次补正的正文就已经通过 [onReplyBody] 到来了(会话层与流水线是两个线程)。
+     * 为什么是**列表**而不是「最后一条」:**按段交付**下,第 1 段的 `TEXT('A')` 可能仍在流水线/写队列里
+     * 排队时,下一段的正文就已经通过 [onReplyBody] 到来了(会话层与流水线是两个线程)。
      * 只认「最后一条」会把先发出的首句上屏信号误判成「不是本轮正文」而**拒绝开播** ——
      * 正好破坏「首句即开播」。列表里的每一条都是**本轮**的正文(逐字由会话层装配),
      * 因此仍然满足「只有本轮正文才算信号」这条不变量。
      */
     private val expectedReplyBodies = ArrayList<String>()
 
-    /** 本轮已接受的「正文上屏」信号次数(1 = 首句;≥2 = 补正)。[onTurnStart] 归零。 */
+    /** 本轮已接受的「正文上屏」信号次数(1 = 第 1 段;≥2 = 后面各段)。[onTurnStart] 归零。 */
     private var screenSignals = 0
 
     /**
@@ -378,7 +378,7 @@ class XiaozhiTtsRelay(
      *
      * 按段播放之后,「字幕落在它自己那句音频之前」由**段的开播闸门**保证(段必须等字幕入队),
      * 不再需要靠这个估计去卡时刻(见 [sentenceStartMs]);保留它是因为真机排查要看
-     * 「第 N 句的音频起点 ≈ 第 N−1 句的音频总量」这一列([XiaozhiPacingLog.line] 的 `该句起点`)。
+     * 「第 N 段的音频起点 ≈ 第 1..N−1 段的音频总量」这一列([XiaozhiPacingLog.line] 的 `本段起点`)。
      */
     private val sentenceStartFrames = LinkedHashMap<String, Int>()
 
@@ -461,7 +461,7 @@ class XiaozhiTtsRelay(
     /**
      * 会话层告知**本轮正文**(见 [XiaozhiTtsObserver.onReplyBody])。
      *
-     * 渐进交付下同一轮会调多次(首句 + 每次补正)。这里**只记账**(不下发任何东西),并把这条正文
+     * **按段交付**下同一轮会调多次(第 1 段 + 之后每一段 + 同一句变完整)。这里**只记账**(不下发任何东西),并把这条正文
      * 挂到 [pendingBody] 上等紧接着的 `tts` 句界报文决定它归哪一段:
      *  - 紧接着是 `sentence_start`(新的一句开始)→ 收上一段、用这条正文开新段;
      *  - 紧接着是 `sentence_end`(同一句的文本还能更长,`start` 给半句 / `end` 给整句那种)→
@@ -665,13 +665,13 @@ class XiaozhiTtsRelay(
     }
 
     /**
-     * 这条 `TEXT` 若被接受,将是**本轮第几次**「正文上屏」(1 = 首句,≥2 = 补正)。
+     * 这条 `TEXT` 若被接受,将是**本轮第几次**「正文上屏」(= 段号:1 = 第 1 段,≥2 = 后面各段)。
      *
      * null = 本通道/本轮不适用(还没交付过任何本轮正文 —— 例如非小智网关,或本轮正文还没到);
      * 0 = 本轮已有正文,但这条不是本轮正文(不该开播)。
      *
      * 只读、**不打日志**([acceptsScreenSignal] 才负责拒绝时的警告):服务侧在写 `TEXT`
-     * 之前用它标出「首句上屏 / 补正上屏」。
+     * 之前用它标出「首次上屏 / 第 N 段字幕上屏」。
      */
     @Synchronized
     fun replyScreenOrdinal(role: Char, text: String): Int? {
@@ -709,7 +709,7 @@ class XiaozhiTtsRelay(
             seg.screenPassed = true
             Log.i(
                 tag,
-                "第 ${seg.ordinal} 段字幕已上屏(本轮第 $screenSignals 次上屏/补正):本段音频可在其后开播",
+                "第 ${seg.ordinal} 段字幕已上屏(本轮第 $screenSignals 次上屏):本段音频可在其后开播",
             )
         }
         advance()

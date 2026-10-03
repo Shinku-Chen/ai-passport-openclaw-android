@@ -213,18 +213,19 @@ class XiaozhiCorrectionPacerTest {
         assertNull(pacer.pendingBody)
     }
 
-    /** 取证日志行:格式钉死(真机就是按这一行核对「字幕落位时刻 / 该句起点 / 垫底」)。 */
+    /** 取证日志行:格式钉死(真机就是按这一行核对「第 N 段字幕落位时刻 / 本段起点 / 垫底」)。 */
     @Test
     fun pacing_log_line_has_the_agreed_shape() {
         val line = XiaozhiPacingLog.line(
             ordinal = 2,
             pacing = pacing(leadMs = 600L, inflight = 1, sinceWrite = 54L, queue = 37, pushedAudioMs = 1_800L),
             sentenceStartMs = 2_400L,
+            bodyLength = 14,
         )
-        assertTrue("要有第几句字幕上屏:$line", line.contains("第 2 句字幕上屏"))
-        assertTrue("要保留第几次上屏/补正:$line", line.contains("第 2 次上屏/补正"))
+        assertTrue("要有第 N 段字幕上屏:$line", line.contains("第 2 段字幕上屏"))
+        assertTrue("要有本段字数(与「第 N 段字幕上屏(本段 L 字)」逐字对得上):$line", line.contains("本段 14 字"))
         assertTrue("要有已推送音频:$line", line.contains("已推送音频≈1800ms"))
-        assertTrue("要有该句起点:$line", line.contains("该句起点≈2400ms"))
+        assertTrue("要有本段起点:$line", line.contains("本段起点≈2400ms"))
         assertTrue("要有垫底帧数与毫秒数:$line", line.contains("音频垫底≈10 帧(≈600ms)"))
         assertTrue("要有在途:$line", line.contains("在途=1"))
         assertTrue("要有距上一音频帧写入:$line", line.contains("距上一音频帧写入 54ms"))
@@ -233,8 +234,8 @@ class XiaozhiCorrectionPacerTest {
         // 本段还没写出过帧 → 明确写「无」,不要伪装成 0ms(那会看起来像「刚刚写过」)
         val head = XiaozhiPacingLog.line(1, pacing(sinceWrite = -1L))
         assertTrue(head.contains("距上一音频帧写入 无"))
-        // 没有句起点估计 → 写「未知」,不编造一个 0
-        assertTrue(XiaozhiPacingLog.line(3, pacing()).contains("该句起点未知"))
+        // 没有段起点估计 → 写「未知」,不编造一个 0
+        assertTrue(XiaozhiPacingLog.line(3, pacing()).contains("本段起点未知"))
         // 直通未接线(非小智路径)→ 不能编造一个 0
         assertFalse(XiaozhiPacingLog.line(1, null).contains("垫底≈0"))
         assertTrue(XiaozhiPacingLog.line(1, null).contains("未接线"))
