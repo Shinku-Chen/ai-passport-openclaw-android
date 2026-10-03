@@ -163,6 +163,18 @@ class XiaozhiSession(
     private val onLlm: ((String) -> Unit)? = null,
     private val onTtsState: ((String, String) -> Unit)? = null,
     private val onTtsAudio: ((ByteArray, Int, Int) -> Unit)? = null,
+    /**
+     * **非小智网关模式**:一轮识别真的结束后,是否向小智补发一次中止([abortSttAfterTurn])。
+     *
+     * 为什么需要:非小智网关下小智通道只做**识别**,回复由 App 自己的网关产出;而小智云端拿到
+     * 识别文本后会接着跑走它自己的 LLM + TTS —— 这段回复没人用,纯属白耗额度,所以要中止掉。
+     * 小智 AI 模式下必须是 false:那一轮的 `llm` 正文与 TTS 正是我们要的。
+     *
+     * 为什么是注入的 provider 而不是会话层自己比较网关类型:「当前是不是小智网关」只有一个判定来源
+     * ([XiaozhiIdentity.isXiaozhi],调用方在 [SttFactory] 里注入),会话层不持有设置、也不重复写一份比较。
+     * 默认 false = 不发(未接线的调用方/单测保持原行为)。
+     */
+    private val sttAbortAfterEndTurn: () -> Boolean = { false },
 ) : XiaozhiLlmSource {
 
     private val tag = "XiaozhiStt"
@@ -273,6 +285,13 @@ class XiaozhiSession(
     @Volatile
     private var turnRetried = false
 
+    /**
+     * 本轮是否已经补发过中止([abortSttAfterTurn]):每轮最多一次,重复收尾不得重复发。
+     * 每轮 [startTurn] 复位。
+     */
+    @Volatile
+    private var sttAbortSentThisTurn = false
+
     // ---- 会话状态 ----
 
     /** 本 turn 最新一条 stt 文本(小智边识边发,取最后一次作结果)。 */
@@ -355,6 +374,7 @@ class XiaozhiSession(
         turnSeq++                   // 新一轮:在途的重连重放(上一轮)据此自行放弃
         turnRetried = false
         sttSeenThisTurn = false
+        sttAbortSentThisTurn = false
         clearTurnFrames()
         lastStt = ""
         pcmLen = 0
@@ -527,9 +547,33 @@ class XiaozhiSession(
             result = reconnectAndReplay(mySeq, frames)
         }
         clearTurnFrames()
+        // 非小智网关:识别真的结束、最终文本已定时,补发一次中止,掐掉小智云端接着跑的 LLM + TTS
+        // (那一段回复没人用,白耗额度)。顺序不能提前到「拿到最终文本」之前:那时云端还在出 stt,
+        // 多一条收尾消息可能把自己的识别结果一起掐掉,也会影响本方法的返回值。
+        // 只在「仍是本轮」时发:迟到的收尾绝不能把已经开始的新一轮停掉。
+        if (turnSeq == mySeq) abortSttAfterTurn()
         // 不再关 socket:保持热连接(hello 结果仍在),下一轮按下可直接 listen.start(毫秒级就绪)。
         keepWarm()
         result
+    }
+
+    /**
+     * 向小智补发一次**中止**([sttAbortAfterEndTurn] 命中时的实际动作)。
+     *
+     * 消息格式**完全复用既有打断路径**:与 [barge] / [endTurn] 一样走 [stopListening](`listen.stop`,
+     * 同一 `session_id` 与字段),不新增第二种消息格式,也**不关 socket**(热连接保留给下一轮)。
+     *
+     * 三条不变量:
+     *  - 模式门是注入的 [sttAbortAfterEndTurn](唯一来源见 [XiaozhiIdentity])—— 小智 AI 模式下一个字节都不多发;
+     *  - 每轮最多一次([sttAbortSentThisTurn]):重复收尾(如连调两次 [endTurn])不重复发;
+     *  - 幂等且不抛:没有连接([stopListening] 自带判空)、或调用方判定为小智模式,都只是安静返回。
+     */
+    private fun abortSttAfterTurn() {
+        if (!sttAbortAfterEndTurn()) return
+        if (sttAbortSentThisTurn) return
+        sttAbortSentThisTurn = true
+        Log.i(tag, "本轮识别结束(非小智网关):补发 listen.stop 中止云端 LLM/TTS")
+        stopListening()
     }
 
     /** 轮询等待 `stt` 文本(小智识别通常几百 ms);超时返回 null。 */

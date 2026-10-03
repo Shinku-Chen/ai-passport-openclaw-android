@@ -28,6 +28,14 @@ class XiaozhiStt(
     deviceIdProvider: () -> String,
     onPartial: ((String) -> Unit)? = null,
     recovery: TurnRecovery.Budget = TurnRecovery.Budget(),
+    /**
+     * **非小智网关模式**下,一轮识别结束后是否向小智补发一次中止(会话层的
+     * [XiaozhiSession.sttAbortAfterEndTurn])。
+     *
+     * 由调用方按**唯一**的网关类型判定注入(见 [SttFactory] / [XiaozhiIdentity]);
+     * 默认 false = 不发(未接线的调用方/单测保持原行为)。
+     */
+    sttAbortAfterEndTurn: () -> Boolean = { false },
 ) : SttEngine {
 
     /**
@@ -40,7 +48,8 @@ class XiaozhiStt(
         deviceId: String,
         onPartial: ((String) -> Unit)? = null,
         recovery: TurnRecovery.Budget = TurnRecovery.Budget(),
-    ) : this(serverUrl, token, { deviceId }, onPartial, recovery)
+        sttAbortAfterEndTurn: () -> Boolean = { false },
+    ) : this(serverUrl, token, { deviceId }, onPartial, recovery, sttAbortAfterEndTurn)
 
     /** 流式中间结果回调(构造参数原样保留):会话层的 `onStt` 与对外 [onPartial] 共用同一个实例。 */
     private val partialCallback: ((String) -> Unit)? = onPartial
@@ -57,6 +66,7 @@ class XiaozhiStt(
         token = token,
         deviceIdProvider = deviceIdProvider,
         recovery = recovery,
+        sttAbortAfterEndTurn = sttAbortAfterEndTurn,
         // 唯一保留的一条路:stt → 文本(其余 llm/tts/音频分流本适配器不接;
         // llm 正文由共用本会话的「小智 AI 网关」用观察者取走,见 XiaozhiGateway)。
         onStt = { text -> partialCallback?.invoke(text) },

@@ -34,7 +34,16 @@ object SttFactory {
         val serverUrl = xz.serverUrl
         val wsToken = xz.token
         val gateway = GatewaySettings(context)
-        Log.i(TAG, "使用小智云端识别 wsUrl=$serverUrl deviceId=按网关类型解析(${gateway.type})")
+        // 「非小智网关模式」= 小智通道只做识别:云端拿到识别文本后会接着跑走它自己的 LLM + TTS,
+        // 那段回复没人用(回复来自 App 自己的网关) → 识别结束后要补发一次中止。
+        // 判定来源只有一处:复用 [XiaozhiIdentity.isXiaozhi] 的既有判定,不在这里再写一份字符串比较;
+        // 实时读设置(provider 每次调用取值),设置页切成「小智 AI」后立即不再发。
+        val abortAfterEndTurn = { !XiaozhiIdentity.isXiaozhi(gateway.type) }
+        Log.i(
+            TAG,
+            "使用小智云端识别 wsUrl=$serverUrl deviceId=按网关类型解析(${gateway.type})" +
+                " 识别结束后补发中止=${abortAfterEndTurn()}",
+        )
         return XiaozhiStt(
             serverUrl = serverUrl,
             token = wsToken,
@@ -42,6 +51,7 @@ object SttFactory {
                 XiaozhiIdentity.resolve(gateway.type, BleCentral.lastConnectedAddr(context)).deviceId
             },
             onPartial = onPartial,
+            sttAbortAfterEndTurn = abortAfterEndTurn,
         )
     }
 }
