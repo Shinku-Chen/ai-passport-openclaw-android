@@ -14,11 +14,13 @@ import org.junit.Test
 import java.util.concurrent.TimeUnit
 
 /**
- * 小智 OTA(绑定)请求的字段必须来自**一个来源**、且上报的是**当前版本号**:
+ * 小智 OTA(绑定)请求的字段必须来自**一个来源**、且上报的是**当前版本号**，并与官方固件同形:
  *  - `name` = `ai-passport`(作者要求,之前写死 `Passport`);
  *  - `version` = 设备固件版本(`hello.fw`,如 `1.13`)→ App `versionName` → 显式回退(之前写死 `0.1.0`);
- *  - `User-Agent` 里的版本与 `version` 同源(之前写死 `lancelot/passport-0.1.0`);
- *  - 响应结构取证不把 token 明文写进日志。
+ *  - `User-Agent` = `<板型>/<版本>`(官方 `SystemInfo::GetUserAgent()` 的形状);
+ *  - 顶层 `version: 2` / `language` / `mac_address` / `uuid`(官方 `Board::GetSystemInfoJson()`);
+ *  - `uuid` 与 `Client-Id` 头**必须是同一个值**(官方两处都用 `Board::GetUuid()`);
+ *  - 响应结构取证不把 token 明文写进日志;上行报文原文进日志时也只脱敏密钥字段。
  */
 class XiaozhiOtaRequestTest {
 
@@ -56,16 +58,16 @@ class XiaozhiOtaRequestTest {
     }
 
     @Test
-    fun `User-Agent 与版本号同源`() {
-        assertEquals("lancelot/ai-passport-1.13", XiaozhiOtaRequest.userAgent("1.13"))
+    fun `User-Agent 与版本号同源_且与官方固件同形`() {
+        assertEquals("lancelot/1.13", XiaozhiOtaRequest.userAgent("1.13"))
         assertTrue(
-            "UA 里的版本就是上报的版本",
-            XiaozhiOtaRequest.userAgent("1.13").endsWith("-1.13"),
+            "官方 SystemInfo::GetUserAgent() = BOARD_NAME \"/\" 固件版本:不能把工程名塞进版本位",
+            XiaozhiOtaRequest.userAgent("1.13") == "${XiaozhiOtaRequest.BOARD_TYPE}/1.13",
         )
     }
 
     @Test
-    fun `请求体与请求头字段(name=ai-passport、version=当前版本、UA 同步)`() {
+    fun `请求体与请求头字段(name=ai-passport、version=当前版本、UA 同步、uuid 与 Client-Id 同值)`() {
         val version = XiaozhiOtaRequest.version("1.13", null)
         server.enqueue(MockResponse().setBody("{}"))
         OkHttpClient().newCall(
@@ -84,13 +86,19 @@ class XiaozhiOtaRequestTest {
         assertEquals(mac, board.get("mac").asString)
         assertEquals("设备身份头与 body 里的 MAC 一致", mac, recorded.getHeader("Device-Id"))
         assertEquals(clientId, recorded.getHeader("Client-Id"))
-        assertEquals("lancelot/ai-passport-1.13", recorded.getHeader("User-Agent"))
+        assertEquals("lancelot/1.13", recorded.getHeader("User-Agent"))
         assertTrue(
             "Content-Type 是 JSON",
             recorded.getHeader("Content-Type")!!.startsWith("application/json"),
         )
         assertEquals("无 SN 走 v1 激活", "1", recorded.getHeader("Activation-Version"))
         assertEquals("/xiaozhi/ota/", recorded.path)
+
+        // 官方 GetSystemInfoJson():顶层系统信息格式版本 + 语言 + 设备 MAC + 客户端 uuid
+        assertEquals("顶层系统信息格式版本(固件恒发 2)", 2, body.get("version").asInt)
+        assertEquals("zh-CN", body.get("language").asString)
+        assertEquals("与 Device-Id 头同值", mac, body.get("mac_address").asString)
+        assertEquals("uuid 与 Client-Id 头必须是同一个值(官方两处都用 GetUuid())", clientId, body.get("uuid").asString)
     }
 
     @Test
@@ -128,5 +136,28 @@ class XiaozhiOtaRequestTest {
         assertTrue(described.contains("len=8"))
         assertTrue(described.contains("前4位=abcd"))
         assertFalse(described.contains("efgh"))
+    }
+
+    @Test
+    fun `上行报文原文进日志_但密钥字段必颓脱敏`() {
+        // 与 true sendHello 同形的客户端 hello:必须原样可读(真机取证靠它判断「发了什么」)
+        val hello = JsonParser.parseString(
+            """{"type":"hello","version":1,"transport":"websocket",
+                "audio_params":{"format":"opus","sample_rate":16000,"channels":1,"frame_duration":60}}"""
+        ).asJsonObject
+        val dump = XiaozhiOtaRequest.describeOutgoing(hello)
+        for (key in listOf("hello", "version", "transport", "websocket", "audio_params", "opus", "16000", "60")) {
+            assertTrue("hello 原文应照打(含 $key):$dump", dump.contains(key))
+        }
+        assertEquals("不修改传入对象", 1, hello.get("version").asInt)
+
+        // 将来若在报文里加凭据字段,值不能明文出去(逐层递归)
+        val withSecret = JsonParser.parseString(
+            """{"type":"x","token":"super-secret-token","nested":{"Authorization":"Bearer abcdef"}}"""
+        ).asJsonObject
+        val redacted = XiaozhiOtaRequest.describeOutgoing(withSecret)
+        assertFalse("token 明文不得进日志:$redacted", redacted.contains("super-secret-token"))
+        assertFalse("嵌套的 Authorization 也要脱敏:$redacted", redacted.contains("abcdef"))
+        assertTrue("只留长度与前 4 位:$redacted", redacted.contains("len=18"))
     }
 }

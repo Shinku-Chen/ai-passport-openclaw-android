@@ -16,7 +16,6 @@ import okhttp3.Request
 import okhttp3.Response
 import okhttp3.WebSocket
 import okhttp3.WebSocketListener
-import java.util.UUID
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
 import java.util.concurrent.ScheduledFuture
@@ -202,6 +201,15 @@ class XiaozhiSession(
      */
     private val linkAuthProvider: ((String) -> XiaozhiLinkAuth)? = null,
     /**
+     * 本次建链的 **Client-Id** 来源(入参 = 本次的 Device-Id);**唯一**来源见 [XiaozhiClientId]。
+     *
+     * 为什么必须注入持久化实现:[SttFactory] 注入按 Device-Id 落盘的那一份(独立 prefs
+     * `xiaozhi_client_id`),于是 App 重启 / 重连 / 重新绑定都用同一个值,且与 OTA 请求用的是**同一个**
+     * —— 服务端按 (client_id, device_id) 校验凭据,两处不一致就是「升级 101 通过后立刻被切断」。
+     * `null` = 不注入(单测/直连会话),退回 [XiaozhiClientId] 的进程内兜底(仍只生成一份、进程内复用)。
+     */
+    private val clientIdProvider: ((String) -> String)? = null,
+    /**
      * 凭据刷新能力面(重查 OTA → 落盘 → 用新凭据重连一次);见 [XiaozhiCredentialRefreshSource]。
      *
      * 为什么是注入的:刷新需要网络(OTA)+ 存储(SharedPreferences),会话层不该自己 new 一套请求;
@@ -229,8 +237,15 @@ class XiaozhiSession(
     /** [setTtsObserver]/[clearTtsObserver] 的锁(同 [llmObserverLock] 的理由)。 */
     private val ttsObserverLock = Any()
 
-    /** 小智 Client-Id:每次 App 启动随机生成(同一进程内稳定,重启换新),避免旧会话占位被拒。 */
-    private val clientId: String = UUID.randomUUID().toString()
+    /**
+     * 本会话的 Client-Id(按 Device-Id 取,**与 OTA 同一份**;见 [XiaozhiClientId])。
+     *
+     * 为什么每次建链现取而不是构造时定死:Device-Id 本身是**建链时**解析的(小智 AI 用设备真 MAC、
+     * 其余网关用全零匿名),而 Client-Id 是「跟着身份走」的 —— 身份变了就要换一份新的,
+     * 否则拿旧身份的 client_id 去握手又会与云端记录对不上。
+     */
+    private fun clientIdFor(deviceId: String): String =
+        clientIdProvider?.invoke(deviceId) ?: XiaozhiClientId.forDevice(deviceId)
 
     private val client = OkHttpClient.Builder()
         .connectTimeout(8, TimeUnit.SECONDS)
@@ -889,11 +904,7 @@ class XiaozhiSession(
             return
         }
         linkAuthRefreshable = ok.refreshable
-        Log.i(
-            tag,
-            "识别通道建链:url=${ok.url} deviceId=$deviceId" +
-                " Authorization=${if (ok.authorization.isNullOrEmpty()) "无" else "len=${ok.authorization.length}"}",
-        )
+        logLinkHeaders("识别通道建链", deviceId, ok)
         val alreadyWarm: Boolean
         synchronized(linkLock) {
             if (connecting) {
@@ -1016,11 +1027,7 @@ class XiaozhiSession(
         val ok = auth as XiaozhiLinkAuth.Ok
         unavailableReason = null
         linkAuthRefreshable = ok.refreshable
-        Log.i(
-            tag,
-            "识别通道建链(凭据刷新后):url=${ok.url} deviceId=$deviceId" +
-                " Authorization=${if (ok.authorization.isNullOrEmpty()) "无" else "len=${ok.authorization.length}"}",
-        )
+        logLinkHeaders("识别通道建链(凭据刷新后)", deviceId, ok)
         val created = synchronized(linkLock) {
             if (!connecting || ws != null) {
                 false
@@ -1045,11 +1052,13 @@ class XiaozhiSession(
      * @param auth 本次建链的鉴权([XiaozhiCredentialGate] 解析结果:绑定凭据或匿名占位)
      */
     private fun buildRequest(deviceId: String, auth: XiaozhiLinkAuth.Ok): Request {
+        // Client-Id:**唯一**来源 [XiaozhiClientId](按 Device-Id 持久化),必须与 OTA 请求用的那个相同
+        // —— 服务端按 (client_id, device_id) 签发/校验凭据(见 XiaozhiClientId 的类注释)。
+        val clientId = clientIdFor(deviceId)
         val builder = Request.Builder()
             .url(auth.url)
             // 小智:必须先带 Device-Id/Client-Id/Protocol-Version 握手头 + 发 hello,否则立即 close
             // Device-Id 按当前网关类型解析(小智 AI=已连接设备真 MAC,与 OTA/绑定同一个值;其余网关=全零匿名)。
-            // Client-Id 每次 App 启动随机生成(进程内稳定,重启换新)。
             // Authorization:小智 AI = OTA 下发的凭据(Bearer token,与官方固件同一规则);
             // 匿名通道 = 原有占位 token 原样(行为不变)。
             .addHeader("Protocol-Version", "1")
@@ -1058,6 +1067,23 @@ class XiaozhiSession(
         auth.authorization?.takeIf { it.isNotEmpty() }
             ?.let { builder.addHeader("Authorization", it) }
         return builder.build()
+    }
+
+    /**
+     * 把**本次建链实际用到的握手头**打一行(值脱敏):`Device-Id`/`Client-Id`/`Authorization` 长度。
+     *
+     * 为什么要单成一行:真机上「OTA 与 WS 的 Client-Id 是不是同一个」只能靠日志比对 —— 所以这一行
+     * 与 OTA 那一行([XiaozhiActivator.postOta])用**同一套**脱敏描述([XiaozhiClientId.describe]),
+     * 前缀(前 8 位)+ 长度一致就说明是同一份;`Authorization` 只打长度(明文绝不进日志,
+     * 且 `len = 7 + token长度`,可与 OTA 下发 token 的描述对得上)。
+     */
+    private fun logLinkHeaders(phase: String, deviceId: String, auth: XiaozhiLinkAuth.Ok) {
+        Log.i(
+            tag,
+            "$phase:url=${auth.url} Device-Id=$deviceId" +
+                " Client-Id=${XiaozhiClientId.describe(clientIdFor(deviceId))}" +
+                " Authorization=${if (auth.authorization.isNullOrEmpty()) "无" else "len=${auth.authorization.length}"}",
+        )
     }
 
     private fun listener(): WebSocketListener = object : WebSocketListener() {
@@ -1084,9 +1110,13 @@ class XiaozhiSession(
         }
 
         override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
-            Log.e(tag, "小智 WS 失败 code=${response?.code} ${response?.message}: ${t.message}")
-            // 升级响应非 101(如 401/403)也走这里:OkHttp 把非 101 的响应在 response 里给出来。
-            handleSocketDown(webSocket, response?.code, null, "建链被拒 HTTP ${response?.code}")
+            // 升级失败(非 101)也走这里:HTTP 状态码只在 response 里,异常信息在 t 里。
+            Log.e(
+                tag,
+                "小智 WS 失败 HTTP=${response?.code ?: "无"} ${response?.message ?: ""}" +
+                    " 异常=${t.javaClass.simpleName}: ${t.message ?: "(无异常信息)"}",
+            )
+            handleSocketDown(webSocket, response?.code, null, "建链被拒 HTTP=${response?.code ?: "无"}")
         }
 
         /**
@@ -1097,16 +1127,25 @@ class XiaozhiSession(
          * 否则「凭据过期 → 自动换新」就永远不会触发。
          */
         override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
-            Log.w(tag, "小智 WS 收到对端关闭 $code $reason")
-            handleSocketDown(webSocket, null, code, "对端关闭 code=$code")
+            Log.w(tag, "小智 WS 收到对端关闭 code=$code reason=${describeReason(reason)}")
+            handleSocketDown(webSocket, null, code, "对端关闭 code=$code reason=${describeReason(reason)}")
         }
 
         override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
-            Log.w(tag, "小智 WS 关闭 $code $reason")
+            Log.w(tag, "小智 WS 关闭 code=$code reason=${describeReason(reason)}")
             // 与 [onClosing] 同一套收尾;幂等(严格按 socket 身份判定,已处理过的不再重复)。
-            handleSocketDown(webSocket, null, code, "连接被关闭 code=$code")
+            handleSocketDown(webSocket, null, code, "连接被关闭 code=$code reason=${describeReason(reason)}")
         }
     }
+
+    /**
+     * 关闭 reason 的日志形态:空 reason **明确写成 `(空)`**。
+     *
+     * 为什么不能直接拼 `$reason`:真机上「1005 无 reason」正是关键证据(1005 = 对端没给关闭码,
+     * 服务端多半是被动断开/未按协议关闭);直接拼会让日志看起来像是忘了打这个字段。
+     */
+    private fun describeReason(reason: String): String =
+        if (reason.isBlank()) "(空)" else "\"$reason\""
 
     /**
      * 当前 socket 失败/被关闭时的**统一收尾**([onFailure]/[onClosing]/[onClosed] 共用)。
@@ -1171,6 +1210,9 @@ class XiaozhiSession(
                 addProperty("frame_duration", 60)
             })
         }
+        // 取证:**发出的报文原文**进日志(便于事后判断「是不是 hello 的内容被拒」),
+        // 只把密钥类字段脱敏 —— hello 本身没有凭据字段,这条规则是为以后加字段兜底。
+        Log.i(tag, "发送客户端 hello: ${XiaozhiOtaRequest.describeOutgoing(hello)}")
         webSocket.send(hello.toString())
     }
 

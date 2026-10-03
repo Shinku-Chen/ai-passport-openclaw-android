@@ -57,6 +57,7 @@ object SttFactory {
         Log.i(
             TAG,
             "使用小智云端识别 wsUrl=$serverUrl deviceId=按网关类型解析(${gateway.type})" +
+                " Client-Id=按 Device-Id 持久化(${XiaozhiClientId.PREFS})" +
                 " 识别结束后补发中止=${abortAfterEndTurn()}",
         )
         return XiaozhiStt(
@@ -78,6 +79,10 @@ object SttFactory {
                 )
             },
             credentialRefresh = credentialRefresh,
+            // Client-Id 与 OTA 请求（[XiaozhiActivator]）共用**同一份持久化值**：按 Device-Id 存在
+            // 独立 prefs（[XiaozhiClientId.PREFS]）。服务端按 (client_id, device_id) 签发/校验凭据，
+            // 两处不一致就是「升级 101 通过后立刻被切断」（详见 [XiaozhiClientId] 的类注释）。
+            clientIdProvider = { deviceId -> XiaozhiClientId.forDevice(context, deviceId) },
         )
     }
 }

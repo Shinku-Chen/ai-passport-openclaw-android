@@ -13,7 +13,6 @@ import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
-import java.util.UUID
 import java.util.concurrent.TimeUnit
 import javax.crypto.Mac
 import javax.crypto.spec.SecretKeySpec
@@ -26,8 +25,9 @@ import javax.crypto.spec.SecretKeySpec
  * (带 challenge 的签名) 轮询,服务器在用户绑定完成后返回 200 = 激活成功。激活成功才允许
  * 连 websocket 发 hello 做识别。
  *
- * 关键:设备 MAC(Device-Id) + 标准 UUID(Client-Id) 是 OTA 握手必需;无 serial_number 时
- * 走 v1 激活(body={}),有 SN 走 v2(body= {algorithm,serial_number,challenge,hmac})。
+ * 关键:设备 MAC(Device-Id) + **持久化且唯一**的 Client-Id(见 [XiaozhiClientId])是 OTA 握手必需;
+ * 无 serial_number 时走 v1 激活(body={}),有 SN 走 v2(body= {algorithm,serial_number,challenge,hmac})。
+ * Client-Id 绝不能每次启动随机 —— 服务端按 (client_id, device_id) 签发/校验,OTA 与识别 WS 必须是同一个值。
  *
  * 这是查/绑的**唯一实现**:[queryCloud] 查云端激活状态,[pollActivate] 在需要绑定时轮询授权。
  * 保存「小智 AI」与手动「激活小智设备」都只调这两个方法(见 `SettingsFragment`),不另写一套请求。
@@ -59,8 +59,13 @@ class XiaozhiActivator(
     private val tag = "XiaozhiActivator"
     private val gson = Gson()
 
-    /** 小智 Client-Id:每次 App 启动随机生成(进程内稳定,重启换新)。 */
-    private val clientId: String = UUID.randomUUID().toString()
+    /**
+     * 本次要用的 Client-Id(与识别 WS 握手**同一个值**,见 [XiaozhiClientId])。
+     *
+     * 为什么每次现取而不是构造时定死:Client-Id 按 Device-Id 存(一台设备一份),而 Device-Id 是
+     * 调用时才解析的;现取还保证「OTA 与 WS 拿到的是同一个持久化值」而不是两份随机 UUID。
+     */
+    private fun clientIdFor(mac: String): String = XiaozhiClientId.forDevice(context, mac)
 
     private val client = OkHttpClient.Builder()
         .connectTimeout(10, TimeUnit.SECONDS)
@@ -137,8 +142,8 @@ class XiaozhiActivator(
                 detail = identity.reason,
             )
         }
-        // Client-Id 每次 App 启动随机生成(进程内稳定,重启换新)。
-        val clientId = this@XiaozhiActivator.clientId
+        // Client-Id:/**唯一**来源 [XiaozhiClientId](按 Device-Id 持久化)—— 与识别 WS 握手同一个值。
+        val clientId = clientIdFor(mac)
         val ota = postOta(otaUrl, mac, clientId) ?: return@withContext CloudQuery(
             XiaozhiBindGate.CloudState.QueryFailed,
             mac = mac,
@@ -194,7 +199,8 @@ class XiaozhiActivator(
      * 已激活的设备不该被再按一遍。返回值 = 用户是否真的完成了绑定。
      */
     suspend fun pollActivate(mac: String, challenge: String): Boolean = withContext(Dispatchers.IO) {
-        pollActivateLoop(otaUrl, mac, clientId, challenge)
+        // 轮询用的是与这次 OTA **同一个** Client-Id(同一个来源 [XiaozhiClientId] 现取)。
+        pollActivateLoop(otaUrl, mac, clientIdFor(mac), challenge)
     }
 
     /** 轮询 ota/activate,直到服务器 200(用户已在网页绑定)或超时。 */
@@ -207,10 +213,14 @@ class XiaozhiActivator(
 
         val maxMillis = ACTIVATE_WAIT_MS   // 最多等 60s(用户绑定时间)
         val interval = ACTIVATE_POLL_INTERVAL_MS     // 每 3s 轮询一次
+        // 官方固件的激活轮询走的是**同一个** `Ota::SetupHttp()`,所以这里也带全套同样的头
+        // (User-Agent / Accept-Language 之前漏了;Device-Id + Client-Id 与 OTA 请求同值)。
         val headers = mapOf(
             "Activation-Version" to "1",   // 无 SN v1
             "Device-Id" to mac,
             "Client-Id" to clientId,
+            "User-Agent" to XiaozhiOtaRequest.userAgent(clientVersion()),
+            "Accept-Language" to XiaozhiOtaRequest.LANGUAGE,
             "Content-Type" to "application/json",
         )
         // 用**真实墙钟**做 60s 预算(旧实现只把 interval 相加,单次请求阻塞多久都不计入,
@@ -263,7 +273,8 @@ class XiaozhiActivator(
         val req = XiaozhiOtaRequest.request(baseUrl, mac, clientId, version)
         Log.i(
             tag,
-            "OTA 请求 device=$mac name=${XiaozhiOtaRequest.APP_NAME} version=$version" +
+            "OTA 请求 device=$mac Client-Id=${XiaozhiClientId.describe(clientId)}" +
+                " name=${XiaozhiOtaRequest.APP_NAME} version=$version" +
                 " User-Agent=${XiaozhiOtaRequest.userAgent(version)}",
         )
         return try {

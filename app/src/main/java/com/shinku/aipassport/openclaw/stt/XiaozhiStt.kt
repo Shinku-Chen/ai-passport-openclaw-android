@@ -50,6 +50,14 @@ class XiaozhiStt(
      * 匿名通道不受影响:它用的是占位 token([XiaozhiLinkAuth.Ok.refreshable] = false)。
      */
     credentialRefresh: XiaozhiCredentialRefreshSource? = null,
+    /**
+     * **Client-Id** 的来源(入参 = 本次建链的 Device-Id);**唯一**来源见 [XiaozhiClientId]。
+     *
+     * [SttFactory] 注入按 Device-Id 落盘的生产实现(独立 prefs `xiaozhi_client_id`),保证
+     * App 重启 / 重连 / 重新绑定复用同一个值,且与 OTA 请求用的是同一个值;
+     * `null` = 不注入(单测/直连会话),退回 [XiaozhiClientId] 的进程内兜底(仍只生成一份)。
+     */
+    clientIdProvider: ((String) -> String)? = null,
 ) : SttEngine {
 
     /**
@@ -65,9 +73,10 @@ class XiaozhiStt(
         sttAbortAfterEndTurn: () -> Boolean = { false },
         linkAuthProvider: ((String) -> XiaozhiLinkAuth)? = null,
         credentialRefresh: XiaozhiCredentialRefreshSource? = null,
+        clientIdProvider: ((String) -> String)? = null,
     ) : this(
         serverUrl, token, { deviceId }, onPartial, recovery, sttAbortAfterEndTurn,
-        linkAuthProvider, credentialRefresh,
+        linkAuthProvider, credentialRefresh, clientIdProvider,
     )
 
     /** 流式中间结果回调(构造参数原样保留):会话层的 `onStt` 与对外 [onPartial] 共用同一个实例。 */
@@ -88,6 +97,7 @@ class XiaozhiStt(
         sttAbortAfterEndTurn = sttAbortAfterEndTurn,
         linkAuthProvider = linkAuthProvider,
         credentialRefresh = credentialRefresh,
+        clientIdProvider = clientIdProvider,
         // 唯一保留的一条路:stt → 文本(其余 llm/tts/音频分流本适配器不接;
         // llm 正文由共用本会话的「小智 AI 网关」用观察者取走,见 XiaozhiGateway)。
         onStt = { text -> partialCallback?.invoke(text) },
