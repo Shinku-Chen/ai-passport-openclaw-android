@@ -26,7 +26,7 @@ class XiaozhiOtaRequestTest {
 
     private lateinit var server: MockWebServer
 
-    private val mac = "4C:11:AE:30:B9:7A"
+    private val mac = "4c:11:ae:30:b9:7a"
     private val clientId = "11111111-2222-3333-4444-555555555555"
 
     @Before

@@ -20,7 +20,14 @@ object XiaozhiDeviceId {
     private val BARE_MAC = Regex("^[0-9A-Fa-f]{12}$")
 
     /**
-     * 归一化成小智 Device-Id(`XX:XX:XX:XX:XX:XX`,大写)。
+     * 归一化成小智 Device-Id(`xx:xx:xx:xx:xx:xx`,**小写**)。
+     *
+     * 为什么是小写:官方固件 `xiaozhi-esp32` 的 `SystemInfo::GetMacAddress()` 就是小写
+     * (`esp_read_mac` + `%02x`),OTA 头/WS 头/系统信息 body 三处都用它 —— 云端很可能按
+     * **字符串**把设备登记在册,大小写不一致就认不出这台已注册设备(真机:大写时升级成功
+     * 但一发 hello 就被 code=1005 切断)。
+     *
+     * 本地各处(凭据/绑定/client-id)的查找都是**大小写不敏感**的,所以换大小写不会丢记录。
      *
      * @param raw 原始地址,如 `4C:11:AE:30:B9:7A` / `4c11ae30b97a`
      * @return 归一化后的地址;不是完整的 6 字节 MAC(2 种合法写法之外的一律视为非法)时返回 **null**
@@ -28,6 +35,6 @@ object XiaozhiDeviceId {
     fun formatAddress(raw: String?): String? {
         val s = raw?.trim().orEmpty()
         if (!COLON_MAC.matches(s) && !BARE_MAC.matches(s)) return null
-        return s.filter { it != ':' }.uppercase().chunked(2).joinToString(":")
+        return s.filter { it != ':' }.lowercase().chunked(2).joinToString(":")
     }
 }

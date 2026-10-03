@@ -40,7 +40,7 @@ class XiaozhiTokenRefreshTest {
 
     private lateinit var server: MockWebServer
 
-    private val mac = "4C:11:AE:30:B9:7A"
+    private val mac = "4c:11:ae:30:b9:7a"
     private val oldToken = "old.token.aaa"
     private val newToken = "new.token.bbb"
     private val nowMs = 1_700_000_000_000L

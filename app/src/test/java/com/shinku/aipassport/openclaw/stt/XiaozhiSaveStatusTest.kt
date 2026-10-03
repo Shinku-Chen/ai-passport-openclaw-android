@@ -19,7 +19,7 @@ import org.junit.Test
 class XiaozhiSaveStatusTest {
 
     private val xiaozhi = XiaozhiIdentity.GATEWAY_XIAOZHI
-    private val mac = "4C:11:AE:30:B9:7A"
+    private val mac = "4c:11:ae:30:b9:7a"
 
     /** 终局与期望的（阶段、按钮是否可点）—— 三处测试共用同一张表。 */
     private val terminalCases = listOf(

@@ -12,7 +12,7 @@ import org.junit.Test
  */
 class ScanPickTest {
 
-    private val mine = "4C:11:AE:30:B9:7A"
+    private val mine = "4c:11:ae:30:b9:7a"
 
     @Test
     fun connects_only_to_the_remembered_device() {

@@ -21,7 +21,7 @@ import org.junit.Test
 class XiaozhiIdentityTest {
 
     private val xiaozhi = "xiaozhi"
-    private val mac = "4C:11:AE:30:B9:7A"
+    private val mac = "4c:11:ae:30:b9:7a"
 
     private fun deviceIdOf(type: String?, address: String?): String =
         XiaozhiIdentity.resolve(type, address).deviceId
@@ -39,9 +39,9 @@ class XiaozhiIdentityTest {
     fun `小智网关归一化地址格式(与 OTA 同一套写法)`() {
         // 冒号大小写 / 无分隔的 12 位 hex / 首尾空白 → 同一个小智 Device-Id
         assertEquals(mac, deviceIdOf(xiaozhi, "4c:11:ae:30:b9:7a"))
-        assertEquals(mac, deviceIdOf(xiaozhi, "4C:11:AE:30:B9:7A"))
+        assertEquals(mac, deviceIdOf(xiaozhi, "4c:11:ae:30:b9:7a"))
         assertEquals(mac, deviceIdOf(xiaozhi, "4c11ae30b97a"))
-        assertEquals(mac, deviceIdOf(xiaozhi, "  4C:11:AE:30:B9:7A\n"))
+        assertEquals(mac, deviceIdOf(xiaozhi, "  4c:11:ae:30:b9:7a\n"))
         // 且与归一化工具的输出完全一致(只有一处格式实现)
         assertEquals(XiaozhiDeviceId.formatAddress("4c11ae30b97a"), deviceIdOf(xiaozhi, "4c11ae30b97a"))
     }

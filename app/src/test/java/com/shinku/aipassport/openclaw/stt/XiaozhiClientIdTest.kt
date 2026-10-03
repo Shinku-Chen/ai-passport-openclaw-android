@@ -35,7 +35,7 @@ import java.util.concurrent.TimeUnit
  */
 class XiaozhiClientIdTest {
 
-    private val mac = "4C:11:AE:30:B9:7A"
+    private val mac = "4c:11:ae:30:b9:7a"
     private val otherMac = "AA:BB:CC:DD:EE:FF"
     private val url = "wss://api.tenclass.net/xiaozhi/v1/"
     private val token = "eyJhbGciOiJIUzI1NiJ9.payload.sig"

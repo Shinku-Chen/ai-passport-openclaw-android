@@ -79,7 +79,7 @@ class XiaozhiIdentityPerLinkTest {
     @Test
     fun `每次建链按当时的网关类型解析 Device-Id`() {
         var gatewayType = "openclaw"
-        var address: String? = "4C:11:AE:30:B9:7A"   // 设备已连接
+        var address: String? = "4c:11:ae:30:b9:7a"   // 设备已连接
         val stt = XiaozhiStt(
             serverUrl = wsUrl(),
             token = "test-token",
@@ -102,7 +102,7 @@ class XiaozhiIdentityPerLinkTest {
         assertEquals("你好", runTurn(stt))
         assertEquals(
             "小智 AI 网关:用已连接设备的真实 MAC(归一化后)",
-            "4C:11:AE:30:B9:7A",
+            "4c:11:ae:30:b9:7a",
             server.takeRequest().getHeader("Device-Id"),
         )
         stt.release()

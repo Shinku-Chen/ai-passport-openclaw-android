@@ -21,7 +21,7 @@ import org.junit.Test
 class XiaozhiBindGateTest {
 
     private val xiaozhi = XiaozhiIdentity.GATEWAY_XIAOZHI
-    private val macA = "4C:11:AE:30:B9:7A"
+    private val macA = "4c:11:ae:30:b9:7a"
     private val macB = "AA:BB:CC:DD:EE:FF"
 
     /** 本地绑定记录的三种形态:**不参与分流**的同一个输入维度。 */
