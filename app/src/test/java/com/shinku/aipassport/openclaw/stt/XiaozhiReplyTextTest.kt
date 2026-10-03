@@ -28,7 +28,7 @@ class XiaozhiReplyTextTest {
     /** 真机报文里的表情(UTF-16 下是 2 个 char,断言长度时要用它而不是手写的数字)。 */
     private val EMOJI = "😊"
 
-    /** 一次结算的记录:正文、说明、触发者、是否真的产生了新正文、段号、触发者描述。 */
+    /** 一次结算的记录:正文、说明、触发者、是否真的产生了新正文、段号、触发者描述、是否新段。 */
     private data class Settle(
         val body: String,
         val detail: String,
@@ -36,6 +36,7 @@ class XiaozhiReplyTextTest {
         val changed: Boolean,
         val deliveryIndex: Int,
         val triggerLabel: String,
+        val isNewSegment: Boolean,
     )
 
     /** 记录 [XiaozhiReplyText.emit] 交出的每一次结算(含「未变化」的诊断)与每一行段级日志。 */
@@ -51,6 +52,7 @@ class XiaozhiReplyTextTest {
                     outcome.changed,
                     outcome.deliveryIndex,
                     outcome.triggerLabel,
+                    outcome.isNewSegment,
                 )
             },
             log = { line -> logs += line },
@@ -99,6 +101,11 @@ class XiaozhiReplyTextTest {
             r.bodies(),
         )
         assertEquals("段号 1/2/3(与「第 N 段已声明」对得上)", listOf(1, 2, 3), r.ordinals())
+        assertEquals(
+            "每一条都是「新段」(App 侧据此各追加一条气泡,不是覆盖同一条)",
+            listOf(true, true, true),
+            r.settles.filter { it.changed }.map { it.isNewSegment },
+        )
         assertEquals(
             "首段 = 首段;之后两条都是「下一段」",
             listOf(
@@ -262,6 +269,11 @@ class XiaozhiReplyTextTest {
         )
         assertEquals(listOf(1, 1), r.ordinals())
         assertEquals(XiaozhiReplyTrigger.PROGRESS_UPDATE, r.settles.last().trigger)
+        assertEquals(
+            "本段更新不是新段(App 侧要**就地替换该段那一条**,而不是再追加一条)",
+            listOf(true, false),
+            r.settles.filter { it.changed }.map { it.isNewSegment },
+        )
         assertTrue(
             "日志要说清这是「本段更新」",
             r.logs.any { it.contains("第 1 段字幕更新(本段") },

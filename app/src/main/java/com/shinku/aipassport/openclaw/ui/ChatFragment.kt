@@ -105,7 +105,8 @@ class ChatFragment : Fragment() {
                     // 流式帧只推最后一条 assistant 消息(常是状态话术):网关用 chat.history
                     // 补正出真正的答案后,把本轮正文气泡**就地替换**成 [来自历史] 正文
                     // (与语音路径同一套规则;不再追加第二个正文气泡)。
-                    onBodyCorrection = { corrected -> replaceBodyBubble(bodies, corrected) },
+                    // [BodyDelivery.segmentOrdinal] = 0 = 不分段的整轮补正,这里只取正文。
+                    onBodyCorrection = { delivery -> replaceBodyBubble(bodies, delivery.text) },
                 )
             }
             val err = reply.error?.trim()?.takeIf { it.isNotEmpty() }

@@ -1,7 +1,9 @@
 package com.shinku.aipassport.openclaw.gateway
 
 import com.shinku.aipassport.openclaw.stt.XiaozhiLlmSource
+import com.shinku.aipassport.openclaw.stt.XiaozhiReplyOutcome
 import com.shinku.aipassport.openclaw.stt.XiaozhiReplyText
+import com.shinku.aipassport.openclaw.stt.XiaozhiReplyTrigger
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.test.advanceTimeBy
@@ -38,10 +40,13 @@ class XiaozhiGatewayTest {
     private class FakeSession(var available: Boolean = true) : XiaozhiLlmSource {
 
         /** 当前观察者;null = 没人接(llm 无处可去,与真会话里没有网关挂载时一致)。 */
-        var observer: ((String) -> Unit)? = null
+        var observer: ((XiaozhiReplyOutcome) -> Unit)? = null
 
         var prewarmCount = 0
         var warm = true
+
+        /** 已推送过的段号(与真装配器的「第 N 段」同一套编号)。 */
+        private var nextSegment = 0
 
         /** 会话层的结算说明(见 [XiaozhiLlmSource.lastReplyDetail]):网关拿它拼可读原因。 */
         override var lastReplyDetail: String? = null
@@ -54,16 +59,34 @@ class XiaozhiGatewayTest {
 
         override fun isWarmReady(): Boolean = warm
 
-        override fun setLlmObserver(observer: ((String) -> Unit)?) {
+        override fun setLlmObserver(observer: ((XiaozhiReplyOutcome) -> Unit)?) {
             this.observer = observer
         }
 
-        override fun clearLlmObserver(observer: (String) -> Unit) {
+        override fun clearLlmObserver(observer: (XiaozhiReplyOutcome) -> Unit) {
             if (this.observer === observer) this.observer = null
         }
 
-        fun pushLlm(text: String) {
-            observer?.invoke(text)
+        /**
+         * 等价于真会话在 WS 回调线程里分流出一条装配好的正文。
+         *
+         * @param isNewSegment 默认 true = 新的一段(段号自增);false = 同一段的更新(段号不变)。
+         */
+        fun pushLlm(text: String, isNewSegment: Boolean = true) {
+            val ordinal = if (isNewSegment) ++nextSegment else nextSegment.coerceAtLeast(1)
+            observer?.invoke(
+                XiaozhiReplyOutcome(
+                    body = text,
+                    detail = "测试",
+                    trigger = if (isNewSegment) {
+                        XiaozhiReplyTrigger.PROGRESS_NEXT
+                    } else {
+                        XiaozhiReplyTrigger.PROGRESS_UPDATE
+                    },
+                    deliveryIndex = ordinal,
+                    isNewSegment = isNewSegment,
+                ),
+            )
         }
     }
 
@@ -112,7 +135,7 @@ class XiaozhiGatewayTest {
         val corrections = CopyOnWriteArrayList<String>()
         var reply: ChatReply? = null
         val job = launch {
-            reply = gw.chatMulti("明天天气怎么样", onBodyCorrection = { corrections += it })
+            reply = gw.chatMulti("明天天气怎么样", onBodyCorrection = { corrections += it.text })
         }
         runCurrent()
         replyText.onTurnStart()
@@ -326,7 +349,7 @@ class XiaozhiGatewayTest {
         val gw = XiaozhiGateway(session, replyTimeoutMs = 60_000)
         val corrections = CopyOnWriteArrayList<String>()
         var reply: ChatReply? = null
-        val job = launch { reply = gw.chatMulti("明天天气怎么样", onBodyCorrection = { corrections += it }) }
+        val job = launch { reply = gw.chatMulti("明天天气怎么样", onBodyCorrection = { corrections += it.text }) }
         runCurrent()
         session.pushLlm("明天上海是小雨喔，白天23度")                       // 中间态(首条交付)
         advanceUntilIdle()
@@ -351,7 +374,7 @@ class XiaozhiGatewayTest {
         val session = FakeSession()
         val gw = XiaozhiGateway(session, replyTimeoutMs = 60_000)
         val corrections = CopyOnWriteArrayList<String>()
-        val job = launch { gw.chatMulti("问题", onBodyCorrection = { corrections += it }) }
+        val job = launch { gw.chatMulti("问题", onBodyCorrection = { corrections += it.text }) }
         runCurrent()
         session.pushLlm("第一段。")
         advanceUntilIdle()
@@ -369,7 +392,7 @@ class XiaozhiGatewayTest {
         val session = FakeSession()
         val gw = XiaozhiGateway(session, replyTimeoutMs = 60_000)
         val corrections = CopyOnWriteArrayList<String>()
-        val job = launch { gw.chatMulti("问题", onBodyCorrection = { corrections += it }) }
+        val job = launch { gw.chatMulti("问题", onBodyCorrection = { corrections += it.text }) }
         runCurrent()
         session.pushLlm("同一段正文。")
         advanceUntilIdle()
@@ -391,7 +414,7 @@ class XiaozhiGatewayTest {
         val gw = XiaozhiGateway(session, replyTimeoutMs = 60_000)
         val corrections = CopyOnWriteArrayList<String>()
         var reply: ChatReply? = null
-        val job = launch { reply = gw.chatMulti("问题", onBodyCorrection = { corrections += it }) }
+        val job = launch { reply = gw.chatMulti("问题", onBodyCorrection = { corrections += it.text }) }
         runCurrent()
         session.pushLlm("")
         advanceUntilIdle()
@@ -402,5 +425,39 @@ class XiaozhiGatewayTest {
         session.pushLlm("工具调用完成后才到的真答案。")
         advanceUntilIdle()
         assertEquals(listOf("工具调用完成后才到的真答案。"), corrections.toList())
+    }
+
+    /**
+     * **段号 + 「新段 / 本段更新」必须一路传到补正出口**:App 侧据此决定「追加一条气泡」
+     * 还是「就地替换该段那一条」(三段流屏上 A、B、C 各一条,而不是只剩最后一段)。
+     */
+    @Test
+    fun segment_deliveries_carry_new_segment_flag_and_ordinal() = runTest {
+        val session = FakeSession()
+        val gw = XiaozhiGateway(session, replyTimeoutMs = 60_000)
+        val deliveries = CopyOnWriteArrayList<BodyDelivery>()
+        val job = launch { gw.chatMulti("问题", onBodyCorrection = { deliveries += it }) }
+        runCurrent()
+        session.pushLlm("A")                                  // 第 1 段:走返回值(首条)
+        advanceUntilIdle()
+        session.pushLlm("B")                                  // 第 2 段:新段
+        advanceUntilIdle()
+        session.pushLlm("B 更完整", isNewSegment = false)      // 第 2 段变完整:本段更新
+        advanceUntilIdle()
+        session.pushLlm("C")                                  // 第 3 段:新段
+        advanceUntilIdle()
+        job.join()
+
+        assertEquals(listOf("B", "B 更完整", "C"), deliveries.map { it.text })
+        assertEquals(
+            "新段 / 本段更新必须显式标出(App 侧据此追加 vs 就地替换)",
+            listOf(true, false, true),
+            deliveries.map { it.isNewSegment },
+        )
+        assertEquals(
+            "本段更新的段号不变(仍是第 2 段),不是全局最后一条",
+            listOf(2, 2, 3),
+            deliveries.map { it.segmentOrdinal },
+        )
     }
 }

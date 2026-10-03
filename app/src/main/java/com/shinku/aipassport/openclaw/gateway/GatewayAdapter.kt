@@ -55,17 +55,19 @@ interface GatewayAdapter {
      *   以同样的增量形式回调(追加在流式条目之后)。
      *   回调可能在网关线程执行,实现必须线程安全且不得回调网关。**设备与 TTS 不受影响**:
      *   body 仍由 [ChatReply.messages] 立即返回,本回调只服务 App 的调试展示。
-     * @param onBodyCorrection 可选的**正文补正**回调:仅 OpenClaw 支持。流式 `chat delta/final`
-     *   只推本轮**最后一条** assistant 消息(实测常常是「已回复完毕…」这类状态话术),
-     *   真正的答案只在 `chat.history` 里。OpenClaw 在**同一个终局后宽限窗**内查一次历史,
-     *   当历史里的正文与流式 body **不同**时回调该正文:调用方应把它**再发一帧 `'A'`**
-     *   给设备屏,并在 App 里以**正常气泡**展示。相同/查不到/查询失败时**不会**回调
-     *   (不重复上屏、不重复朗读),不额外增加设备侧时延。
+     * @param onBodyCorrection 可选的**正文补正/逐段交付**回调:[BodyDelivery]。
+     *   OpenClaw 在**同一个终局后宽限窗**内查一次历史,当历史里的正文与流式 body **不同**时
+     *   回调该正文([BodyDelivery.segmentOrdinal] = 0 = 不分段的整轮补正,调用方沿用旧语义:
+     *   在 App 里**就地替换**本轮第一条正文气泡 + 多余正文降级)。
+     *   小智 AI 按段交付:[BodyDelivery.isNewSegment] = true 的每一条都是**新的一段**
+     *   ([BodyDelivery.segmentOrdinal] ≥ 1,调用方**追加**一条新气泡),false = 同一段变完整
+     *   (调用方**就地替换该段那一条**,不新增)。
+     *   相同/查不到/查询失败时**不会**回调(不重复上屏、不重复朗读),不额外增加设备侧时延。
      */
     suspend fun chatMulti(
         text: String,
         onRawUpdate: ((List<RawEntry>) -> Unit)? = null,
-        onBodyCorrection: ((String) -> Unit)? = null,
+        onBodyCorrection: ((BodyDelivery) -> Unit)? = null,
     ): ChatReply {
         val one = chat(text)
         return if (one == null) {
@@ -105,6 +107,16 @@ interface GatewayAdapter {
      * 默认 false,只有 OpenClaw 重写。
      */
     val supportsBodyCorrection: Boolean get() = false
+
+    /**
+     * 本轮正文是否**按段交付**(小智 AI:同一轮 A、B、C 各一条,与设备屏一致)。
+     *
+     * true 时流水线把本轮**第一条**正文气泡当作**第 1 段**记账(日志 `App 气泡:新段(第 1 段)追加`);
+     * 后续的每一段经 [chatMulti] 的 [onBodyCorrection] 以 [BodyDelivery.isNewSegment] = true 到达
+     * (**追加**一条新气泡),同一段变完整则 false(**就地替换该段那一条**)。
+     * 默认 false(OpenClaw / Hermes / 自定义 OpenAI 兼容 / Echo 仍是「一轮一条正文」)。
+     */
+    val deliversSegmentedBodies: Boolean get() = false
 
     /**
      * 是否由网关**自己**提供设备朗读音频(小智 AI:音频随会话下行的 opus 直通给设备)。
@@ -151,6 +163,26 @@ data class ChatReply(
     /** 完全没有可上屏的回复(失败或空回复)。 */
     val isEmpty: Boolean get() = messages.isEmpty()
 }
+
+/**
+ * 网关交付的一条**助手正文**(逐段交付 / 历史补正),由 `chatMulti` 的 `onBodyCorrection` 回调。
+ *
+ * 背景:`onBodyCorrection` 旧签名只有字符串 —— 调用方只能把它当「替换当前正文气泡」处理,于是小智的
+ * 多段正文(A、B、C)在 App 里被逐条覆盖,最后只剩最后一段(真机现象)。装配器
+ * ([com.shinku.aipassport.openclaw.stt.XiaozhiReplyText])是唯一知道段界的地方,所以把段号与
+ * 「新段 / 本段更新」一起交付到这里,由 UI 决定**追加**还是**就地替换那一段**。
+ *
+ * @param text 该条正文(已清洗,非空)
+ * @param isNewSegment true = **新的一段**:调用方**追加**一条新的助手气泡;
+ *   false = **本段更新**:调用方**就地替换该段**那条气泡(不新增、不动其它段)。
+ * @param segmentOrdinal 段号(1 起,与小智设备屏「第 N 段」同一套编号);
+ *   0 = 不分段的整轮正文补正(OpenClaw 历史补正,调用方沿用旧语义处理)
+ */
+data class BodyDelivery(
+    val text: String,
+    val isNewSegment: Boolean,
+    val segmentOrdinal: Int = 0,
+)
 
 sealed interface GatewayDraft {
     /** OpenClaw:WS connect + Ed25519 鉴权。 */

@@ -55,9 +55,14 @@ interface XiaozhiLlmSource {
      *    不要空等超时,更不要把 `emotion` 之类的非正文字段或空串当正文上屏;
      *  - **同一轮会通知多次**(详见 `docs/design/xiaozhi-ai-gateway.md` §6.4):首条之后每次都是
      *    「**下一段**的正文」或「**本段**的正文变完整了」——实现应当把它当成**下一段/本段更新**
-     *    (再发一帧给设备并就地替换 App 气泡),否则那一段就永远上不了屏。
+     *    (再发一帧给设备;App 气泡与设备屏一致:**新段追加一条**、**本段更新就地替换该段那一条**),
+     *    否则那一段就永远上不了屏。
+     *
+     * 交付的是整个 [XiaozhiReplyOutcome](而不是只有字符串):**段号 [XiaozhiReplyOutcome.deliveryIndex]
+     * 与「新段 / 本段更新」[XiaozhiReplyOutcome.isNewSegment] 必须一路带到 UI** —— App 侧据此决定
+     * 「追加一条新气泡」还是「就地替换该段那一条」(见 `VoicePipeline.replaceBodyBubbles`)。
      */
-    fun setLlmObserver(observer: ((String) -> Unit)?)
+    fun setLlmObserver(observer: ((XiaozhiReplyOutcome) -> Unit)?)
 
     /**
      * 本轮正文的**结算说明**(日志与可读原因用):正常时说明取自哪一层(tts 句级文本 / llm.text 兜底),
@@ -75,7 +80,7 @@ interface XiaozhiLlmSource {
      * 为什么不能盲摘:网关实例会被设置页保存后的重建替换,而旧实例的 `close()` 可能晚于
      * 新实例挂观察者 —— 盲摘会把新实例的观察者一起摘掉,下一轮就永远等不到 `llm`。
      */
-    fun clearLlmObserver(observer: (String) -> Unit)
+    fun clearLlmObserver(observer: (XiaozhiReplyOutcome) -> Unit)
 }
 
 /**
@@ -279,7 +284,7 @@ class XiaozhiSession(
 
     /** `llm` 正文观察者(构造参数之外的第二条接入口,供「小智 AI 网关」挂载;见 [setLlmObserver])。 */
     @Volatile
-    private var llmObserver: ((String) -> Unit)? = null
+    private var llmObserver: ((XiaozhiReplyOutcome) -> Unit)? = null
 
     /** [setLlmObserver]/[clearLlmObserver] 的锁:保证「挂」与「按身份摘」不交叉。 */
     private val llmObserverLock = Any()
@@ -373,11 +378,11 @@ class XiaozhiSession(
     override var lastReplyDetail: String? = null
         private set
 
-    override fun setLlmObserver(observer: ((String) -> Unit)?) {
+    override fun setLlmObserver(observer: ((XiaozhiReplyOutcome) -> Unit)?) {
         synchronized(llmObserverLock) { llmObserver = observer }
     }
 
-    override fun clearLlmObserver(observer: (String) -> Unit) {
+    override fun clearLlmObserver(observer: (XiaozhiReplyOutcome) -> Unit) {
         // 身份比较:旧网关实例的 close() 不能摘掉新实例刚挂上的观察者(见 [XiaozhiLlmSource])。
         synchronized(llmObserverLock) { if (llmObserver === observer) llmObserver = null }
     }
@@ -1521,7 +1526,7 @@ class XiaozhiSession(
         }
         ttsObserver?.onReplyBody(body)
         onLlm?.invoke(body)
-        llmObserver?.invoke(body)
+        llmObserver?.invoke(outcome)
     }
 
     /** 取 JSON 字符串字段(非字符串原语/缺失 → null)。 */

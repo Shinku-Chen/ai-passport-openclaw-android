@@ -64,6 +64,119 @@ sealed interface BodyCorrectionPlan {
 }
 
 /**
+ * 「这一条助手正文该**追加**还是**就地替换**」的纯决策(不依赖 Android,可 JVM 单测)。
+ *
+ * 背景(真机现象):设备屏已经是「每段一条」(A、B、C),App 侧却把每一段都当成「替换同一个正文气泡」
+ * —— 因为网关补正回调旧签名只有字符串,没有「这是新的一段还是本段的更新」的信息,于是三轮段过后 App 只
+ * 剩最后一段。装配器([com.shinku.aipassport.openclaw.stt.XiaozhiReplyText])是唯一知道段界的地方,
+ * 把段号与「新段 / 本段更新」带到 UI 后,由本判据决定写入方式。
+ */
+sealed interface SegmentBodyPlan {
+    /** **新的一段**(小智按段交付):**追加**一条新的助手气泡。 */
+    data object AppendSegment : SegmentBodyPlan
+
+    /** **本段更新**:就地替换第 [ordinal] 段(1 起)那条气泡 —— 不是全局最后一条,也不动其它段。 */
+    data class ReplaceSegment(val ordinal: Int) : SegmentBodyPlan
+
+    /** **整轮正文补正**(段号 0,OpenClaw 历史补正):替换本轮第一条正文气泡,其余降级成弱化小字。 */
+    data class ReplaceTurnBody(val firstId: Long?, val extraIds: List<Long>) : SegmentBodyPlan
+}
+
+/**
+ * 按「新段 / 本段更新 / 整轮补正」决定一条助手正文的写入方式。
+ *
+ * @param bodyIds 本轮**已写入**的正文气泡 id(按写入顺序):小智按段交付时它就是 A、B、C 的槽位,
+ *   于是「第 N 段」= 下标 N-1;OpenClaw 仍是「一轮第一条」。
+ * @param isNewSegment 装配器给出的「新段 / 本段更新」(见 `BodyDelivery.isNewSegment`)
+ * @param segmentOrdinal 段号(1 起);0 = 不分段的整轮正文补正(OpenClaw 历史补正)
+ */
+fun planSegmentBody(
+    bodyIds: List<Long>,
+    isNewSegment: Boolean,
+    segmentOrdinal: Int,
+): SegmentBodyPlan = when {
+    isNewSegment -> SegmentBodyPlan.AppendSegment
+    segmentOrdinal >= 1 -> SegmentBodyPlan.ReplaceSegment(segmentOrdinal)
+    else -> SegmentBodyPlan.ReplaceTurnBody(bodyIds.firstOrNull(), bodyIds.drop(1))
+}
+
+/** [applySegmentBody] 的落地结果(日志与测试用)。 */
+data class SegmentBodyWrite(
+    /** 本次落地/替换的正文气泡 id。 */
+    val bubbleId: Long,
+    /** true = **新增**了一条气泡(新段);false = **就地替换**已有那条(本段更新/整轮补正)。 */
+    val appended: Boolean,
+)
+
+/**
+ * 按 [plan] 把一条助手正文写进对话列表,并就地更新本轮正文气泡记账 [bubbles](id → 文本,写入顺序)。
+ *
+ * 与设备屏一致的不变量:
+ *  - [SegmentBodyPlan.AppendSegment] → **追加**一条新的正常气泡(同一段不会再产生第二条);
+ *  - [SegmentBodyPlan.ReplaceSegment] → **只替换该段那一条**(同一段多次更新不增加气泡);
+ *  - [SegmentBodyPlan.ReplaceTurnBody] → 沿用 OpenClaw 旧语义(替换第一条 + 多余降级),
+ *    **行为一行不变**。
+ *
+ * 只依赖线程安全的 [ConversationStore],不碰 View/Context,因此可 JVM 单测。
+ *
+ * @param bubbles 本轮正文气泡记账(与 `VoicePipeline.TurnBodies.bubbles` 同一份)
+ * @param bodySource 正文来源标记([BodySource.STREAM] / [BodySource.HISTORY])
+ */
+fun applySegmentBody(
+    plan: SegmentBodyPlan,
+    text: String,
+    source: String,
+    bodySource: BodySource,
+    bubbles: MutableList<Pair<Long, String>>,
+): SegmentBodyWrite {
+    val flag = bodyFlag(text, bodySource)
+    when (plan) {
+        SegmentBodyPlan.AppendSegment -> {
+            val id = ConversationStore.add("agent", text, source, flag = flag)
+            bubbles += id to text
+            return SegmentBodyWrite(id, appended = true)
+        }
+
+        is SegmentBodyPlan.ReplaceSegment -> {
+            val index = plan.ordinal - 1
+            val existing = bubbles.getOrNull(index)
+            if (existing == null) {
+                // 该段还没有气泡(例:体为空但历史/后续段才到)→ 新增一条,绝不丢弃正文
+                val id = ConversationStore.add("agent", text, source, flag = flag)
+                bubbles += id to text
+                return SegmentBodyWrite(id, appended = true)
+            }
+            ConversationStore.replaceById(existing.first, text, label = null, flag = flag)
+            bubbles[index] = existing.first to text
+            return SegmentBodyWrite(existing.first, appended = false)
+        }
+
+        is SegmentBodyPlan.ReplaceTurnBody -> {
+            val first = plan.firstId
+            if (first == null) {
+                val id = ConversationStore.add("agent", text, source, flag = flag)
+                bubbles += id to text
+                return SegmentBodyWrite(id, appended = true)
+            }
+            ConversationStore.replaceById(first, text, label = null, flag = flag)
+            bubbles.forEachIndexed { index, (id, _) ->
+                if (id == first) bubbles[index] = first to text
+            }
+            plan.extraIds.forEach { id ->
+                val extraText = bubbles.firstOrNull { it.first == id }?.second.orEmpty()
+                ConversationStore.replaceById(
+                    id,
+                    extraText,
+                    label = RawLabel.ASSISTANT,
+                    flag = statusTalkFlag(extraText),
+                )
+            }
+            return SegmentBodyWrite(first, appended = false)
+        }
+    }
+}
+
+/**
  * 把本轮展示项写进 [ConversationStore](第一条复用 [placeholderId] 的「…」占位气泡,其余按顺序追加)。
  *
  * 与语音路径同一套规则:

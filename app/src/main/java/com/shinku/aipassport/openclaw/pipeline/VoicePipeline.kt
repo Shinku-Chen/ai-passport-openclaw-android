@@ -3,11 +3,11 @@ package com.shinku.aipassport.openclaw.pipeline
 import android.util.Log
 import com.google.gson.Gson
 import com.google.gson.JsonObject
+import com.shinku.aipassport.openclaw.gateway.BodyDelivery
 import com.shinku.aipassport.openclaw.gateway.ChatReply
 import com.shinku.aipassport.openclaw.gateway.GatewayAdapter
 import com.shinku.aipassport.openclaw.gateway.OpenClawGateway
 import com.shinku.aipassport.openclaw.gateway.RawEntry
-import com.shinku.aipassport.openclaw.gateway.RawLabel
 import com.shinku.aipassport.openclaw.gateway.VoicePrompt
 import com.shinku.aipassport.openclaw.protocol.VbFrame
 import com.shinku.aipassport.openclaw.protocol.VbFrameData
@@ -20,10 +20,10 @@ import com.shinku.aipassport.openclaw.tts.parseTtsPlaybackReport
 import com.shinku.aipassport.openclaw.tts.ttsPlaybackLogLine
 import com.shinku.aipassport.openclaw.ui.BodySource
 import com.shinku.aipassport.openclaw.ui.ConversationStore
-import com.shinku.aipassport.openclaw.ui.bodyFlag
+import com.shinku.aipassport.openclaw.ui.applySegmentBody
 import com.shinku.aipassport.openclaw.ui.bodySourceOf
+import com.shinku.aipassport.openclaw.ui.planSegmentBody
 import com.shinku.aipassport.openclaw.ui.replyDisplayEntries
-import com.shinku.aipassport.openclaw.ui.statusTalkFlag
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
@@ -58,12 +58,15 @@ private class TurnBodies(val turn: Int) {
     var resolved = false
 
     /**
-     * 本轮已经应用过的**补正正文**(按文本去重)。
+     * 本轮已经应用过的**补正正文**(去重键,见 [VoicePipeline.resolveTurnBody])。
      *
      * 为什么同一轮允许多次补正:小智那条路是流式的,同一轮的正文会变完整多次(多段 `tts[start…stop]`
      * 的第二段、「先用了 `llm.text` 兜底、随后 tts 句级文本才到」)。旧实现只让第一条补正生效,后面
      * 更完整的正文就再也上不了屏(真机现象「从小智获取的文本不是完整的」)。同一段文本重复到达仍然只
      * 应用一次(不重复上屏、不重复朗读)。
+     *
+     * 去重键**带上段号**(`段号|文本`,小智按段交付):不同段偶然文本相同时必须各写成一条气泡
+     * (设备屏也是两条);段号 0(OpenClaw 整轮补正)仍只用文本,行为不变。
      */
     val appliedCorrections = mutableSetOf<String>()
 }
@@ -517,9 +520,10 @@ class VoicePipeline(
                 gateway.chatMulti(
                     outgoing,
                     onRawUpdate = { added -> publishRawUpdatesToApp(myTurn, added) },
-                    // 历史补正到达即结算本轮正文:就地替换 App 正文气泡([来自历史])并把
-                    // 真答案补发一帧 'A' 给设备;若流式正文是缓发的状态话术,则直接丢弃它。
-                    onBodyCorrection = { corrected -> resolveTurnBody(myTurn, corrected) },
+                    // 历史补正/逐段交付到达即结算本轮正文:就地替换 App 正文气泡([来自历史])并把
+                    // 真答案补发一帧 'A' 给设备;**小智按段交付时** [BodyDelivery] 带段号与
+                    // 「新段/本段更新」,新段追加一条气泡(与设备屏 A/B/C 一致),本段更新只替换该段那条。
+                    onBodyCorrection = { delivery -> resolveTurnBody(myTurn, delivery) },
                 )
             } catch (e: Exception) {
                 Log.e(tag, "gateway.chatMulti 异常", e)
@@ -643,6 +647,11 @@ class VoicePipeline(
             // label == null 的才是正文气泡(正常气泡);补正时就地替换用
             if (entry.label == null) {
                 bodies?.let { b -> synchronized(b) { b.bubbles += id to shown } }
+                // 按段交付的通道(小智 AI):本轮**第一条**正文气泡就是第 1 段 —— 与设备屏一致,
+                // 日志与后续每段的 `App 气泡:新段(第 N 段)追加` 同一套编号,真机可逐段对数。
+                if (gateway.deliversSegmentedBodies && bodies?.bubbles?.size == 1) {
+                    Log.i(tag, "App 气泡:新段(第 1 段)追加(${shown.length} 字)")
+                }
             }
         }
     }
@@ -690,47 +699,52 @@ class VoicePipeline(
         if (myTurn != turnId) null else turnBodies.takeIf { it.turn == myTurn }
 
     /**
-     * 本轮正文的**最终结算**(历史补正到达 / 宽限窗超时都会走这里;同轮只结算一次)。
+     * 本轮正文的**最终结算**(正文补正/逐段交付到达 / 宽限窗超时都会走这里)。
      *
      * 真机现象:一轮里的真实答案与后续状态话术是**两条** assistant 消息,流式 `chat delta/final`
      * 只推最后一条(状态话术)—— 设备屏与 App 因此只看到「已经回复完毕…」。网关在终局宽限窗内
      * 查回历史后回调真答案,这里据此结算:
      *
-     *  - [corrected] 非空 → 历史补正到位:给设备**补发一帧 `'A'`**(只发真答案),并把本轮
-     *    App 正文气泡**就地替换**成补正后的正文(`[来自历史]` 标记,不新增气泡);
+     *  - [corrected] 非空 → 正文到位:给设备**补发一帧 `'A'`**(只发这一条正文),并按
+     *    [BodyDelivery] 给出的段号/新段标记写入 App:
+     *      - 小智按段交付([com.shinku.aipassport.openclaw.gateway.GatewayAdapter.deliversSegmentedBodies]):
+     *        [BodyDelivery.isNewSegment] = true
+     *        → **追加**一条新气泡(A、B、C),false → **就地替换该段那一条**(不新增、不动其它段);
+     *      - OpenClaw 历史补正(段号 0)→ 沿用旧语义:替换本轮第一条 + 多余降级。
      *    若流式正文是缓发的状态话术,则直接丢弃它(设备屏只有真答案)。
-     *    同一轮**允许多次补正**(小智那条路是流式的:正文会变完整多次),但**同一段文本只应用一次**。
+     *    同一轮**允许多次交付**,但**同一段文本只应用一次**。
      *  - [corrected] 为空 → 历史没有更好的正文:把缓发的状态话术**补发给设备**(设备不能空着);
      *    这条分支同轮只做一次(它是「等不到历史的兜底」而不是「新正文」)。
      *
-     * 重复保护:只有「历史正文与已下发正文不同」才会带着非空 [corrected] 来到这里
-     * (网关侧已按文本去重),因此不会重复上屏、也不会重复朗读(本回调不重新触发 TTS)。
+     * 重复保护:同一段文本只应用一次(不会重复上屏/重复朗读,本回调不重新触发 TTS)。
      * 可能在网关线程执行:只用线程安全的 [ConversationStore] 与注入的 [sendText],不碰 UI/Context。
-     * 已开新一轮(barge)时丢弃:补正/补发属于旧轮。
+     * 已开新一轮(barge)时丢弃:补正/后续段属于旧轮。
      */
-    private fun resolveTurnBody(myTurn: Int, corrected: String?) {
-        val text = corrected?.trim()?.takeIf { it.isNotEmpty() }
+    private fun resolveTurnBody(myTurn: Int, corrected: BodyDelivery?) {
+        val text = corrected?.text?.trim()?.takeIf { it.isNotEmpty() }
         val bodies = turnBodiesOf(myTurn)
         if (bodies == null) {
             if (text != null) Log.i(tag, "丢弃旧轮的历史补正正文(${text.length} 字)")
             return
         }
         val held: List<String>
-        val firstId: Long?
-        val extraBubbles: List<Pair<Long, String>>
         synchronized(bodies) {
             if (text == null) {
                 // 缓发补发分支:同轮只做一次(旧语义不变)。
                 if (bodies.resolved) return
                 bodies.resolved = true
             } else {
-                // 补正分支:同一段正文只应用一次;不同正文可以多次(正文变完整多次就多次替换)。
-                if (!bodies.appliedCorrections.add(text)) return
+                // 补正/逐段分支:同一段文本只应用一次;不同文本可以多次(每段各一条/本段变完整)。
+                // 去重键带段号:不同段偶然文本相同也要各写一条(与设备屏一致);段号 0 仍只用文本。
+                val key = if (corrected != null && corrected.segmentOrdinal >= 1) {
+                    "${corrected.segmentOrdinal}|$text"
+                } else {
+                    text
+                }
+                if (!bodies.appliedCorrections.add(key)) return
                 bodies.resolved = true
             }
             held = bodies.held.toList()
-            firstId = bodies.bubbles.firstOrNull()?.first
-            extraBubbles = bodies.bubbles.drop(1)
         }
         // 历史判定已完成:统一由纯函数 [bodyDispatch] 决定「只发真答案」还是「补发缓存的流式 body」。
         // 带走的是【缓发的状态话术】(没有缓发时是非状态话术正文,它早已下发 → 本步不做事)。
@@ -748,10 +762,16 @@ class VoicePipeline(
                     Log.i(tag, "历史补正到位,丢弃缓发的状态话术(${held.sumOf { it.length }} 字)")
                 }
                 sendText('A', action.text)
-                // 补正后的正文刚刚上屏(设备屏的真答案):朗读也改读它。
+                // 补正后的正文刚刚上屏(设备屏的真答案/这一段):朗读也改读它。
                 // 服务侧会先中止上一段(若流式正文已开始播),只保证「最终正文」被完整读出。
                 speakReply(action.text)
-                replaceBodyBubbles(firstId, extraBubbles, action.text, bodySourceOf(corrected = true))
+                replaceBodyBubbles(
+                    bodies = bodies,
+                    corrected = action.text,
+                    source = bodySourceOf(corrected = true),
+                    isNewSegment = corrected?.isNewSegment == true,
+                    segmentOrdinal = corrected?.segmentOrdinal ?: 0,
+                )
             }
 
             is BodyAction.SendHeld -> {
@@ -765,27 +785,35 @@ class VoicePipeline(
     }
 
     /**
-     * 用历史补正后的正文替换本轮已写入 App 的**正文气泡**(就地替换,不新增气泡)。
+     * 把一条正文写进本轮已登记的**正文气泡**(见 `ui/BodyBubbles.kt` 的 [planSegmentBody]/[applySegmentBody]):
      *
-     * 第一条替换为补正正文([来自历史] 标记,与「疑似状态话术」标记可同时存在);
-     * 同一轮若还有其它正文气泡,降级成弱化小字(`正文 · 全文` 标签),
-     * 保证「同一轮只有一个正常正文气泡」。本轮还没有正文气泡(例:body 为空但历史有答案)
-     * → 新增一个正常气泡。
+     *  - **新段**(小智按段交付)→ **追加**一条新的助手气泡(与设备屏 A、B、C 一致,不覆盖前面的段);
+     *  - **本段更新** → 只**就地替换该段那一条**(段号定位,不是全局最后一条,也不新增气泡);
+     *  - **整轮正文补正**(段号 0,OpenClaw 历史补正)→ 替换本轮第一条,其余降级成弱化小字
+     *    (`正文 · 全文`),保证「同一轮只有一个正常正文气泡」(行为一行不变)。
+     *
+     * 本轮还没有正文气泡(例:body 为空但历史/后续段才到)→ 新增一个正常气泡。
      */
     private fun replaceBodyBubbles(
-        firstId: Long?,
-        extraBubbles: List<Pair<Long, String>>,
+        bodies: TurnBodies,
         corrected: String,
         source: BodySource,
+        isNewSegment: Boolean,
+        segmentOrdinal: Int,
     ) {
-        val flag = bodyFlag(corrected, source)
-        if (firstId == null) {
-            ConversationStore.add("agent", corrected, ConversationStore.SOURCE_VOICE, flag = flag)
-            return
+        val write = synchronized(bodies) {
+            val plan = planSegmentBody(bodies.bubbles.map { it.first }, isNewSegment, segmentOrdinal)
+            applySegmentBody(plan, corrected, ConversationStore.SOURCE_VOICE, source, bodies.bubbles)
         }
-        ConversationStore.replaceById(firstId, corrected, label = null, flag = flag)
-        extraBubbles.forEach { (id, text) ->
-            ConversationStore.replaceById(id, text, label = RawLabel.ASSISTANT, flag = statusTalkFlag(text))
+        if (segmentOrdinal >= 1) {
+            val verb = if (write.appended) {
+                "新段(第 $segmentOrdinal 段)追加"
+            } else {
+                "本段更新(第 $segmentOrdinal 段)就地替换"
+            }
+            Log.i(tag, "App 气泡:$verb(${corrected.length} 字)")
+        } else {
+            Log.i(tag, "App 气泡:整轮补正就地替换首条(${corrected.length} 字)")
         }
     }
 

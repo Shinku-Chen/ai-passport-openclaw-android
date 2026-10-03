@@ -320,6 +320,7 @@ class XiaozhiReplyText(
                 trigger = trigger,
                 changed = true,
                 deliveryIndex = seg.ordinal,
+                isNewSegment = isNew,
             ),
         )
         return true
@@ -424,6 +425,7 @@ class XiaozhiReplyText(
                 trigger = trigger,
                 changed = true,
                 deliveryIndex = ordinal,
+                isNewSegment = true,
             ),
         )
     }
@@ -571,6 +573,9 @@ enum class XiaozhiReplyTrigger(val logName: String) {
  *   工具调用静默期挂起),调用方**只记日志**:不上屏、不通知观察者(否则设备上会出现重复气泡)。
  * @param deliveryIndex 本次交付的**段号**(1 起,= 本轮第几次真正上屏);0 = 这次没有交付新正文。
  *   真机日志用它把「第 N 段字幕上屏」与直通侧的「第 N 段已声明」对上。
+ * @param isNewSegment 这次交付是**新的一段**(调用方在 App 侧**追加**一条助手气泡)还是**本段更新**
+ *   (同一句在 `sentence_end`/结算点上变完整 → **就地替换该段那一条**,不新增)。段号见 [deliveryIndex]。
+ *   装配器是**唯一**知道段界的地方(段界 = `start`/`sentence_start`),所以这个信息必须一路带到 UI。
  */
 data class XiaozhiReplyOutcome(
     val body: String,
@@ -578,6 +583,7 @@ data class XiaozhiReplyOutcome(
     val trigger: XiaozhiReplyTrigger = XiaozhiReplyTrigger.UNKNOWN,
     val changed: Boolean = true,
     val deliveryIndex: Int = 0,
+    val isNewSegment: Boolean = false,
 ) {
     /**
      * 交付日志里的**触发者描述**:`首段` / `第N段` / `第N段更新` / `stop 最终结算` / …(见

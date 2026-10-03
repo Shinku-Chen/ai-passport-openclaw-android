@@ -2,6 +2,7 @@ package com.shinku.aipassport.openclaw.gateway
 
 import android.util.Log
 import com.shinku.aipassport.openclaw.stt.XiaozhiLlmSource
+import com.shinku.aipassport.openclaw.stt.XiaozhiReplyOutcome
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.withTimeoutOrNull
 
@@ -45,7 +46,7 @@ class XiaozhiGateway(
      * 观察者实例:必须是**同一个** lambda,才能让 [XiaozhiLlmSource.clearLlmObserver]
      * 按身份摘除(旧实例的 close() 不能摘掉新实例的观察者)。
      */
-    private val observer: (String) -> Unit = { text -> onLlm(text) }
+    private val observer: (XiaozhiReplyOutcome) -> Unit = { outcome -> onLlm(outcome) }
 
     /** 等待/暂存/错误几处状态的锁(WS 回调线程与流水线 IO 协程都会动它们)。 */
     private val lock = Any()
@@ -73,8 +74,11 @@ class XiaozhiGateway(
      * 为什么小智也要用它:小智那条会话是流式的,同一轮的正文可能在首条之后继续变完整;而
      * [chatMulti] 早已返回,唯一能把「更好的正文」再送到设备屏/App 的出口就是它(流水线收到后会补发一帧
      * `TEXT('A')` 并就地替换 App 的正文气泡)。每轮登记、[interrupt] 作废。
+     *
+     * 交付的是 [BodyDelivery]:**段号 + 「新段 / 本段更新」**由装配器给出,让 App 侧能把每段各写成
+     * 一条气泡(A、B、C),而不是把每条都当成「替换同一条」。
      */
-    private var corrector: ((String) -> Unit)? = null
+    private var corrector: ((BodyDelivery) -> Unit)? = null
 
     @Volatile
     private var closed = false
@@ -121,6 +125,12 @@ class XiaozhiGateway(
      */
     override val providesDeviceTtsAudio: Boolean get() = true
 
+    /**
+     * 同上（小智是同轮多段交付的唯一通道）：告诉流水线「本轮第一条正文气泡 = 第 1 段」，
+     * 之后每一条 [BodyDelivery] 的段号与「新段/本段更新」由装配器给出。
+     */
+    override val deliversSegmentedBodies: Boolean get() = true
+
     /** 单条回复版:正文由 [chatMulti] 给出,失败/打断时为 null(失败原因在 [lastError])。 */
     override suspend fun chat(text: String): String? = chatMulti(text).messages.firstOrNull()
 
@@ -135,7 +145,7 @@ class XiaozhiGateway(
     override suspend fun chatMulti(
         text: String,
         onRawUpdate: ((List<RawEntry>) -> Unit)?,
-        onBodyCorrection: ((String) -> Unit)?,
+        onBodyCorrection: ((BodyDelivery) -> Unit)?,
     ): ChatReply {
         if (closed) return fail(CLOSED)
         if (source == null || !source.isAvailable) return fail(NO_SESSION)
@@ -234,15 +244,18 @@ class XiaozhiGateway(
      *
      * 空串不是「没到」而是**明确语义**:会话层已经确认本轮没有可上屏正文(只有表情/空文本) ——
      * 此时立刻给可读原因收尾,既不要把空串/表情当正文,也不要空等一个超时(见 [XiaozhiLlmSource])。
+     *
+     * 交付的是整个 [XiaozhiReplyOutcome]:后续段经补正出口交付时带上 **段号 + 「新段/本段更新」**
+     * ([BodyDelivery]),App 侧据此决定追加气泡还是就地替换该段那一条(见设计 §6.0)。
      */
-    private fun onLlm(text: String) {
-        val body = text.trim()
+    private fun onLlm(outcome: XiaozhiReplyOutcome) {
+        val body = outcome.body.trim()
         if (body.isEmpty()) {
             onNoBody()
             return
         }
         val waiter: CompletableDeferred<Outcome>?
-        val correction: ((String) -> Unit)?
+        val correction: ((BodyDelivery) -> Unit)?
         val staged: Boolean
         synchronized(lock) {
             waiter = pending
@@ -284,7 +297,13 @@ class XiaozhiGateway(
             return
         }
         if (correction != null) {
-            correction(body)
+            correction(
+                BodyDelivery(
+                    text = body,
+                    isNewSegment = outcome.isNewSegment,
+                    segmentOrdinal = outcome.deliveryIndex,
+                ),
+            )
             return
         }
         if (staged) Log.d(tag, "收到小智正文(${body.length} 字),暂存等 chatMulti")

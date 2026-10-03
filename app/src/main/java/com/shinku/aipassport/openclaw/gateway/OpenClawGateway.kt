@@ -305,14 +305,15 @@ class OpenClawGateway(
      *
      * @param onRawUpdate 迟到的 raw 增量(含宽限窗内的帧,以及从 `chat.history` 补进来的历史条目)
      * @param onBodyCorrection 历史补正回调:当 `chat.history` 里本轮的正文与流式 body **不同**时,
-     *   用它回调**该补发的正文**(调用方负责再发一帧 `'A'` 给设备并在 App 里以正常气泡展示)。
+     *   用它回调**该补发的正文**([BodyDelivery],`segmentOrdinal = 0` / `isNewSegment = false` ——
+     *   这是**不分段的整轮补正**,调用方在 App 里就地替换本轮第一条正文气泡并在设备屏补一帧 `'A'`)。
      *   与 [onRawUpdate] 同样的线程约定:可能在网关线程执行,必须线程安全、不碰 UI/Context;
      *   相同/查不到时**不会**回调(不重复上屏、不重复朗读)。
      */
     override suspend fun chatMulti(
         text: String,
         onRawUpdate: ((List<RawEntry>) -> Unit)?,
-        onBodyCorrection: ((String) -> Unit)?,
+        onBodyCorrection: ((BodyDelivery) -> Unit)?,
     ): ChatReply = withContext(Dispatchers.IO) {
         if (!ensureConnected()) return@withContext ChatReply(emptyList(), failReason())
         // 幂等键在本轮内不变:重连后重新订阅要用同一个键,网关才不会把同一条消息再执行一遍
@@ -414,7 +415,7 @@ class OpenClawGateway(
         userText: String,
         streamedBody: List<String>,
         onRawUpdate: ((List<RawEntry>) -> Unit)?,
-        onBodyCorrection: ((String) -> Unit)?,
+        onBodyCorrection: ((BodyDelivery) -> Unit)?,
     ) {
         scope.launch {
             val startedAt = System.currentTimeMillis()
@@ -449,7 +450,7 @@ class OpenClawGateway(
         userText: String,
         streamedBody: List<String>,
         onRawUpdate: ((List<RawEntry>) -> Unit)?,
-        onBodyCorrection: ((String) -> Unit)?,
+        onBodyCorrection: ((BodyDelivery) -> Unit)?,
     ) {
         // 补正是内部动作:即使将来把它标成关键查询,也**绝不允许**污染对外的 lastError
         // (辅助查询本身已经不写 lastError 了,这里只是再加一道防线)
@@ -487,7 +488,7 @@ class OpenClawGateway(
             "历史补正: 用 chat.history 的答案替换/补发正文(${send.length} 字," +
                 " 流式 body ${streamedBody.sumOf { it.length }} 字)",
         )
-        onBodyCorrection.invoke(send)
+        onBodyCorrection.invoke(BodyDelivery(send, isNewSegment = false, segmentOrdinal = 0))
     }
 
     /** 可读失败原因(供 [ChatReply.error] 使用);无则 null。 */
