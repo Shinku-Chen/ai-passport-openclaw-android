@@ -52,7 +52,9 @@ import com.shinku.aipassport.openclaw.tts.TtsFlowControl
 import com.shinku.aipassport.openclaw.tts.TtsFraming
 import com.shinku.aipassport.openclaw.tts.TtsPlaybackReport
 import com.shinku.aipassport.openclaw.tts.TtsPushPlan
+import com.shinku.aipassport.openclaw.tts.XiaozhiFrameLog
 import com.shinku.aipassport.openclaw.tts.XiaozhiTtsDownlink
+import com.shinku.aipassport.openclaw.tts.XiaozhiTtsGate
 import com.shinku.aipassport.openclaw.tts.XiaozhiTtsRelay
 import com.shinku.aipassport.openclaw.tts.buildTtsPushPlan
 import com.shinku.aipassport.openclaw.tts.ttsPlaybackLogLine
@@ -535,15 +537,20 @@ class VoiceBridgeService : Service() {
         deviceTts = DeviceTtsSession(enabled = { this.settings.ttsEnabled }, downlink = deviceTtsPush)
         // 小智 TTS 直通(增量 3):只挂观察者,不建连接 —— 音频在小智会话里已经下来,
         // 直接按 [SEQ][rate_khz][frame_ms]+opus 组 TTS_OPUS 帧转发给设备(不本地合成/不重编码)。
-        // enabled 门同时要求「当前网关类型是小智 AI」:小智服务端并不知道 App 用哪个后端,
-        // 任何类型下它都会推自己的 TTS 音频;不挡住就会和本地合成的朗读叠着出声。
+        //
+        // 直通门的三项逐项进日志(见 [XiaozhiTtsGate]):
+        //  ① 当前网关类型是小智 AI —— 小智服务端并不知道 App 用哪个后端,任何类型下它都会推自己的
+        //     TTS 音频;不挡住就会和本地合成的朗读叠着出声;
+        //  ② 设备朗读开关 `tts_enabled`(读设置时用它自己的默认 true,「没这个键」不等于关闭);
+        //  ③ 设备在 hello 里报过 `caps:["tts_opus"]` —— 没报就绝不能发 0x06(未知类型会被当错位帧,
+        //     连带丢掉后面一帧),与本地合成那条路的设备能力门控同一语义。
         XiaozhiTtsRelay(
-            enabled = {
-                this.settings.type == GatewaySettings.TYPE_XIAOZHI &&
-                    this.settings.ttsEnabled &&
-                    // 设备没在 hello 里报 tts_opus 时绝不能发 0x06(未知类型会被当错位帧,
-                    // 连带丢掉后面一帧)—— 与本地合成那条路的设备能力门控同一语义。
-                    (!::pipeline.isInitialized || pipeline.deviceTtsSupported)
+            gate = {
+                XiaozhiTtsGate(
+                    gatewayType = this.settings.type,
+                    ttsEnabled = this.settings.ttsEnabled,
+                    deviceTtsCapable = !::pipeline.isInitialized || pipeline.deviceTtsSupported,
+                )
             },
             downlink = deviceTtsPush,
         ).also {
@@ -1289,6 +1296,10 @@ class VoiceBridgeService : Service() {
         @Volatile
         private var xzPushId = 0
 
+        /** `start()` 之前被丢弃的帧数(只用于节流日志:链路断在「没开段」这一步时要能看出来)。 */
+        @Volatile
+        private var xzNotStartedDropped = 0
+
         @Volatile
         private var xzJob: Job? = null
 
@@ -1307,6 +1318,7 @@ class VoiceBridgeService : Service() {
             xzJob?.cancel()
             xzJob = null
             synchronized(xzLock) { xzFrames.clear() }
+            xzNotStartedDropped = 0    // 新一段:重置「没开段就来的帧」计数
             xzSentAtMs = System.currentTimeMillis()
             xzStarted = true
             Log.i(TAG, "小智 TTS 直通:下发 tts_start(采样率/帧长由帧头携带)")
@@ -1315,7 +1327,19 @@ class VoiceBridgeService : Service() {
         override fun pushFrame(rateKhz: Int, frameMs: Int, payload: ByteArray) {
             // rateKhz 已经在 payload 的帧头里(由 XiaozhiTtsRelay 组好),这里不再用;
             // 保留形参是为了满足 [XiaozhiTtsDownlink] 的接口形状(体上看到的速率/帧长)。
-            if (!xzStarted) return
+            if (!xzStarted) {
+                // 没走过 start()(没下发 tts_start):帧没有 bracket,设备会当错位帧 —— 丢弃并留痕,
+                // 否则「relay 说发了、设备侧计数却是 0」这条链就断在这里而毫无证据。
+                xzNotStartedDropped++
+                if (XiaozhiFrameLog.shouldLog(xzNotStartedDropped)) {
+                    Log.w(
+                        TAG,
+                        "小智 TTS 直通:未开始(还没下发 tts_start),丢弃一帧 ${payload.size}B" +
+                            "(累计 $xzNotStartedDropped 帧)",
+                    )
+                }
+                return
+            }
             val overflow: Boolean
             synchronized(xzLock) {
                 overflow = xzFrames.size >= MAX_XIAOZHI_TTS_QUEUE_FRAMES
@@ -1437,6 +1461,15 @@ class VoiceBridgeService : Service() {
                             ble.writeBytes(vbEncodeFrame(VbFrame.TYPE_TTS_OPUS, 0, item.payload))
                             sent++
                             lastFrames = sent
+                            // 逐帧取证(节流):这是「真的写进 BLE 写队列」的那一跳,
+                            // 设备侧 TTS 计数为 0 时靠它与「已组帧」日志分层定位。
+                            if (XiaozhiFrameLog.shouldLog(sent)) {
+                                Log.i(
+                                    TAG,
+                                    "小智 TTS 直通:实际写入 BLE 帧 seq=${item.payload[0].toInt() and 0xFF}" +
+                                        " ${item.payload.size}B(第 $sent 帧)",
+                                )
+                            }
                         }
                     }
                 }

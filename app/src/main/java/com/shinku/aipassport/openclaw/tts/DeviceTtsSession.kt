@@ -57,7 +57,7 @@ interface DeviceTtsDownlink {
  *  - [onDeviceEvent](设备 `tts_playback_done` / `tts_playback_aborted`):转给 [downlink] 记日志。
  */
 class DeviceTtsSession(
-    /** 设置项 `tts_enabled`(默认关,真机验收后再默认开);每次调用时实时读取。 */
+    /** 设置项 `tts_enabled`(**默认开**,见 `GatewaySettings.ttsEnabled`;真机播放通路已验收);每次调用时实时读取。 */
     private val enabled: () -> Boolean,
     private val downlink: DeviceTtsDownlink,
 ) {

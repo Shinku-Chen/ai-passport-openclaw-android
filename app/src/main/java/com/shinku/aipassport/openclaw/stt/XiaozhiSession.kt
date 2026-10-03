@@ -5,6 +5,7 @@ import com.google.gson.Gson
 import com.google.gson.JsonObject
 import com.theeasiestway.opus.Constants
 import com.theeasiestway.opus.Opus
+import com.shinku.aipassport.openclaw.tts.XiaozhiFrameLog
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -421,6 +422,14 @@ class XiaozhiSession(
 
     @Volatile private var ttsFrameMs = 0
 
+    /**
+     * 本轮收到的下行 TTS 音频帧数（只用于日志）:新一轮 [startTurn] 时归零并打一行上一轮的合计。
+     *
+     * 为什么要合计:**轮级**的「收了几帧」比逐帧行更能一眼判定 —— 设备侧 TTS 计数为 0 而这里
+     * 每轮几十帧,说明断点一定在会话层之后的某一跳(直通门/接收窗口/BLE 下发)。
+     */
+    @Volatile private var ttsFramesThisTurn = 0
+
     @Volatile private var listening = false
 
     /** turn 是否在进行(startTurn 置 true,endTurn/barge 置 false)。feedPcm 据此刻允许上送,不依赖 hello 回包。
@@ -480,6 +489,14 @@ class XiaozhiSession(
     fun startTurn(onReady: () -> Unit) {
         // 新一轮开始:先把上一轮的 TTS 直通记账作废(打断时服务端不一定回 `tts.stop`,
         // 否则下一段音频会缺一个 `tts_start` 而直接甩给设备)。设备侧 `tts_abort` 由流水线另发。
+        val lastTurnFrames = ttsFramesThisTurn
+        ttsFramesThisTurn = 0
+        if (lastTurnFrames > 0) {
+            Log.i(
+                tag,
+                "上一轮小智下行音频帧共 $lastTurnFrames 帧(TTS 观察者=${if (ttsObserver != null) "有" else "无"})",
+            )
+        }
         ttsObserver?.onTurnStart()
         // 正文记账同理作废:上一轮迟到的句级文本/兜底正文绝不能进这一轮。
         resetReply()
@@ -1137,10 +1154,21 @@ class XiaozhiSession(
          */
         override fun onMessage(webSocket: WebSocket, bytes: okio.ByteString) {
             if (ws !== webSocket) return
-            Log.d(tag, "收到小智音频帧 ${bytes.size}B(下行 ${ttsRateKhz}kHz/${ttsFrameMs}ms)")
-            // 两条出口:构造参数(直接构造会话的调用方)与观察者(共用本会话的 TTS 直通)。
+            // 逐跳取证（节流）：「收到了帧」与「帧交给了谁」是两件事 —— 真机上设备侧 TTS 计数为 0 时，
+            // 这一行（观察者 有/无）就能区分「会话没分流」与「直通门/窗口把帧拦了」。
+            val observer = ttsObserver
+            val index = ++ttsFramesThisTurn
+            if (XiaozhiFrameLog.shouldLog(index)) {
+                Log.d(
+                    tag,
+                    "小智下行音频帧 #$index ${bytes.size}B(下行 ${ttsRateKhz}kHz/${ttsFrameMs}ms)" +
+                        " → 观察者(${if (observer != null) "有" else "无"})" +
+                        " 构造回调(${if (onTtsAudio != null) "有" else "无"})",
+                )
+            }
+            // 两条出口：构造参数（直接构造会话的调用方）与观察者（共用本会话的 TTS 直通）。
             onTtsAudio?.invoke(bytes.toByteArray(), ttsRateKhz, ttsFrameMs)
-            ttsObserver?.onTtsAudio(bytes.toByteArray(), ttsRateKhz, ttsFrameMs)
+            observer?.onTtsAudio(bytes.toByteArray(), ttsRateKhz, ttsFrameMs)
         }
 
         override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
