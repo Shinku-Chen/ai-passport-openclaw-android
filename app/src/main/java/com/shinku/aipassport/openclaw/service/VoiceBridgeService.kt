@@ -997,6 +997,16 @@ class VoiceBridgeService : Service() {
         // 分片回退到 UTF-8 边界(见 splitTextPayload),不切坏汉字/emoji
         val chunks = splitTextPayload(body, bodyMax)
         val totalChunks = chunks.size
+        // 真机对照用:**上屏正文全文 + 字节数 + 分片数**一行打完(不节流、不截断)。
+        // 作者就是拿这一行与「小智本轮正文已结算…全文=«…»」逐字对照:
+        // 两者不一致 = 中间某一跳改了文本;一致而设备屏不对 = 固件/分片的问题。
+        // 只对 `'A'`(网关回复)打全文:同一段回复可能分片下发,全文比逐片都有用;
+        // `'U'` 是用户语音的识别原文(已在识别处打过),这里只留前 30 字免得重复扫屏。
+        if (role == XiaozhiScreenSignal.REPLY_ROLE) {
+            Log.i(TAG, "sendTextFrame role=$role ${body.size} 字节 分片=$totalChunks 全文=«$text»")
+        } else {
+            Log.i(TAG, "sendTextFrame role=$role ${body.size} 字节 分片=$totalChunks text=${text.take(30)}")
+        }
         chunks.forEachIndexed { chunkIdx, chunk ->
             val payload = ByteArray(chunk.size + 1)
             payload[0] = role.code.toByte()
@@ -1008,7 +1018,7 @@ class VoiceBridgeService : Service() {
                 else -> VbFrame.FLAG_MORE                        // 中间片
             }
             val frame = vbEncodeFrame(VbFrame.TYPE_TEXT, flags, payload)
-            Log.i(TAG, "sendTextFrame role=$role text=${text.take(30)} 分片$chunkIdx/$totalChunks 字节=${frame.size} flags=$flags")
+            Log.d(TAG, "sendTextFrame role=$role 分片$chunkIdx/$totalChunks 字节=${frame.size} flags=$flags")
             ble.writeBytes(frame)
         }
         notifyXiaozhiReplyOnScreen(role, text)

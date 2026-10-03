@@ -53,8 +53,19 @@ private class TurnBodies(val turn: Int) {
     /** 缓发等历史判定的状态话术正文(未下发设备;通常 0 或 1 条)。 */
     val held = mutableListOf<String>()
 
-    /** 正文是否已结算(历史补正到达 / 宽限窗超时),保证同轮只结算一次。 */
+    /** 正文是否已结算(历史补正到达 / 宽限窗超时),保证 [VoicePipeline.resolveTurnBody] 的
+     *  「缓发补发」分支同轮只做一次。 */
     var resolved = false
+
+    /**
+     * 本轮已经应用过的**补正正文**(按文本去重)。
+     *
+     * 为什么同一轮允许多次补正:小智那条路是流式的,同一轮的正文会变完整多次(多段 `tts[start…stop]`
+     * 的第二段、「先用了 `llm.text` 兜底、随后 tts 句级文本才到」)。旧实现只让第一条补正生效,后面
+     * 更完整的正文就再也上不了屏(真机现象「从小智获取的文本不是完整的」)。同一段文本重复到达仍然只
+     * 应用一次(不重复上屏、不重复朗读)。
+     */
+    val appliedCorrections = mutableSetOf<String>()
 }
 
 /**
@@ -688,7 +699,9 @@ class VoicePipeline(
      *  - [corrected] 非空 → 历史补正到位:给设备**补发一帧 `'A'`**(只发真答案),并把本轮
      *    App 正文气泡**就地替换**成补正后的正文(`[来自历史]` 标记,不新增气泡);
      *    若流式正文是缓发的状态话术,则直接丢弃它(设备屏只有真答案)。
-     *  - [corrected] 为空 → 历史没有更好的正文:把缓发的状态话术**补发给设备**(设备不能空着)。
+     *    同一轮**允许多次补正**(小智那条路是流式的:正文会变完整多次),但**同一段文本只应用一次**。
+     *  - [corrected] 为空 → 历史没有更好的正文:把缓发的状态话术**补发给设备**(设备不能空着);
+     *    这条分支同轮只做一次(它是「等不到历史的兜底」而不是「新正文」)。
      *
      * 重复保护:只有「历史正文与已下发正文不同」才会带着非空 [corrected] 来到这里
      * (网关侧已按文本去重),因此不会重复上屏、也不会重复朗读(本回调不重新触发 TTS)。
@@ -706,8 +719,15 @@ class VoicePipeline(
         val firstId: Long?
         val extraBubbles: List<Pair<Long, String>>
         synchronized(bodies) {
-            if (bodies.resolved) return
-            bodies.resolved = true
+            if (text == null) {
+                // 缓发补发分支:同轮只做一次(旧语义不变)。
+                if (bodies.resolved) return
+                bodies.resolved = true
+            } else {
+                // 补正分支:同一段正文只应用一次;不同正文可以多次(正文变完整多次就多次替换)。
+                if (!bodies.appliedCorrections.add(text)) return
+                bodies.resolved = true
+            }
             held = bodies.held.toList()
             firstId = bodies.bubbles.firstOrNull()?.first
             extraBubbles = bodies.bubbles.drop(1)

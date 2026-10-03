@@ -20,7 +20,13 @@ import kotlinx.coroutines.withTimeoutOrNull
  *    另建一条会话不可能收到这次问答的正文(所以构造函数要求注入 [XiaozhiLlmSource]);
  *  - **必须有超时**:等不到正文时按现有网关的失败语义返回可读原因 + 写 [lastError],绝不无限挂着;
  *    会话层明确说「本轮没有可上屏正文」时([NO_BODY])则**立刻**给原因,不白等一个超时;
+ *  - **一轮可以有多条正文,后面的是补正**:会话层按 `XiaozhiReplyText` 的规则装配,同一轮里正文
+ *    **可以变好**(多段 `tts[start…stop]` 的第二段、迟到的句级文本、以及「先用了 `llm.text` 兜底、
+ *    随后 tts 句级文本才到」)。第一条经 [chatMulti] 的返回值交付,之后的**每一条变化**都经
+ *    [chatMulti] 登记的[onBodyCorrection] 交付 —— 否则设备屏会永远停在那个更短的兜底正文上
+ *    (真机现象「从小智获取的文本不是完整的」);
  *  - **打断必须作废本轮等待**:流水线每轮 `turn_start` 都会调 [interrupt],不能留下悬挂的 deferred;
+ *    同一轮的补正出口也一并作废(旧轮的补正不得改写新一轮);
  *  - **[close] 不关会话**:会话归 STT 所有(关掉等于每轮重新握手),这里只摘观察者并作废等待。
  *
  * @param source 共用的小智会话(`XiaozhiStt.session`);null = 没接线(App 内文本输入页没有语音会话),
@@ -49,6 +55,26 @@ class XiaozhiGateway(
 
     /** `llm` 比 `chatMulti` 早到时暂存的正文(见 [onLlm]);null = 无。 */
     private var buffered: Buffered? = null
+
+    /**
+     * 本轮**已交付**的正文(非空;null = 还没交过正文,或交过的是「没有可上屏正文」)。
+     *
+     * 用它与新到的正文比对:[onLlm] 只在文本**变了**时候才当补正交出去(重复交付会让设备屏多一个
+     * 重复气泡、App 气泡重复替换)。
+     */
+    private var deliveredBody: String? = null
+
+    /** 本轮是否已经交付过结论(正文或「没有可上屏正文」),见 [onLlm] 的两条分支。 */
+    private var deliveredSomething: Boolean = false
+
+    /**
+     * 本轮登记的**正文补正**出口([chatMulti] 的 `onBodyCorrection`)。
+     *
+     * 为什么小智也要用它:小智那条会话是流式的,同一轮的正文可能在首条之后继续变完整;而
+     * [chatMulti] 早已返回,唯一能把「更好的正文」再送到设备屏/App 的出口就是它(流水线收到后会补发一帧
+     * `TEXT('A')` 并就地替换 App 的正文气泡)。每轮登记、[interrupt] 作废。
+     */
+    private var corrector: ((String) -> Unit)? = null
 
     @Volatile
     private var closed = false
@@ -122,12 +148,24 @@ class XiaozhiGateway(
         }
         if (early != null) {
             _lastError = null
+            // 暂存正文就是本轮的首条交付:之后更完整的正文要经补正出口送到设备屏。
+            synchronized(lock) {
+                deliveredBody = early.text
+                deliveredSomething = true
+                corrector = onBodyCorrection
+            }
             Log.i(tag, "本轮回复直接用暂存的 llm 正文(${early.text.length} 字)")
             return ChatReply(listOf(early.text))
         }
 
         val deferred = CompletableDeferred<Outcome>()
-        synchronized(lock) { pending = deferred }
+        synchronized(lock) {
+            pending = deferred
+            // 新一轮的记账:首条交付走本方法的返回值,之后的每条变化走 corrector。
+            deliveredBody = null
+            deliveredSomething = false
+            corrector = onBodyCorrection
+        }
         val outcome = try {
             withTimeoutOrNull(replyTimeoutMs) { deferred.await() }
         } finally {
@@ -161,6 +199,10 @@ class XiaozhiGateway(
             waiter = pending
             pending = null
             buffered = null   // 旧轮暂存的正文一并作废,不当作下一轮的回复
+            // 旧轮的补正出口与已交付记账一并作废:打断后迟到的正文绝不能改写新一轮。
+            corrector = null
+            deliveredBody = null
+            deliveredSomething = false
         }
         // 用「已完成(Aborted)」而不是 cancel():cancel 会让 await 抛 CancellationException,
         // 把调用方(流水线的那一轮协程)一起取消;这里只是把本轮判为打断,让它照常返回。
@@ -182,8 +224,12 @@ class XiaozhiGateway(
     }
 
     /**
-     * 会话层推来的**本轮正文**(可能运行在 OkHttp 的 WS 回调线程):
-     * 有人等 → 完成它;没人等 → 暂存,给稍后几百毫秒内到达的 [chatMulti] 用。
+     * 会话层推来的**本轮正文**(可能运行在 OkHttp 的 WS 回调线程),按四种情形分派:
+     *  1. 有人在等 → 作为本轮**首条**正文完成 [chatMulti] 的等待;
+     *  2. 本轮已交过结论、而这条正文**不同** → 作为**补正**交给 [chatMulti] 登记的出口(流水线补发一帧
+     *     `TEXT('A')` 并就地替换 App 气泡)—— 这是「兜底正文先上屏、完整正文随后到达」的修法;
+     *  3. 还没人等也没交过结论(`llm` 早于 `chatMulti` 的几百毫秒竞态)→ 暂存,等他来取;
+     *  4. 与已交付正文相同 / 已无补正出口(旧轮)→ 丢弃,不重复上屏。
      *
      * 空串不是「没到」而是**明确语义**:会话层已经确认本轮没有可上屏正文(只有表情/空文本) ——
      * 此时立刻给可读原因收尾,既不要把空串/表情当正文,也不要空等一个超时(见 [XiaozhiLlmSource])。
@@ -195,17 +241,52 @@ class XiaozhiGateway(
             return
         }
         val waiter: CompletableDeferred<Outcome>?
+        val correction: ((String) -> Unit)?
+        val staged: Boolean
         synchronized(lock) {
             waiter = pending
             pending = null
-            if (waiter == null) buffered = Buffered(System.currentTimeMillis(), body)
+            correction = when {
+                // 有人等 = 本轮首条正文:交给他(照旧)。
+                waiter != null -> {
+                    deliveredBody = body
+                    deliveredSomething = true
+                    null
+                }
+                // 本轮已经交过结论(正文 / 「没有可上屏正文」),而现在来的正文不同
+                // → **补正**:再发一帧给设备屏并就地替换 App 的正文气泡。
+                deliveredSomething && body != deliveredBody && corrector != null -> {
+                    Log.i(
+                        tag,
+                        "收到更完整的本轮正文(${body.length} 字;上一条 ${deliveredBody?.length ?: 0} 字)"
+                            + ",作为补正交给流水线",
+                    )
+                    deliveredBody = body
+                    corrector
+                }
+                // 还没交过任何结论 = `llm` 早于 `chatMulti`(几百毫秒的竞态):暂存等他来取。
+                !deliveredSomething -> {
+                    buffered = Buffered(System.currentTimeMillis(), body)
+                    null
+                }
+                // 与已交付的正文相同,或本轮已经没有补正出口(旧轮/未登记):丢掉,不重复上屏。
+                else -> {
+                    Log.d(tag, "忽略与已交付正文相同/无处交付的小智正文(${body.length} 字)")
+                    null
+                }
+            }
+            staged = buffered?.text == body
         }
         if (waiter != null) {
             Log.i(tag, "收到小智正文(${body.length} 字),完成本轮等待")
             waiter.complete(Outcome.Text(body))
-        } else {
-            Log.d(tag, "收到小智正文(${body.length} 字),暂存等 chatMulti")
+            return
         }
+        if (correction != null) {
+            correction(body)
+            return
+        }
+        if (staged) Log.d(tag, "收到小智正文(${body.length} 字),暂存等 chatMulti")
     }
 
     /**
@@ -224,6 +305,10 @@ class XiaozhiGateway(
             waiter = pending
             pending = null
             buffered = null
+            // 「没有可上屏正文」也是一条结论:之后若真的来了正文,要走补正把它替换掉
+            // (工具调用静默期先报原因、真答案随后到达就是这种形态)。
+            deliveredBody = null
+            deliveredSomething = true
         }
         val reason = noBodyReason()
         _lastError = reason

@@ -51,7 +51,10 @@ interface XiaozhiLlmSource {
      * **通知语义**(见 [XiaozhiReplyText] 与 `docs/design/xiaozhi-ai-gateway.md` §6 修订):
      *  - 非空 = 本轮正文 —— **首选** `tts` 句级文本拼接(用户听到的那句),`llm.text` 只做兜底;
      *  - 空串 = 会话层已经确认**本轮没有可上屏正文**(只有表情/空文本):实现要给可读原因收尾,
-     *    不要空等超时,更不要把 `emotion` 之类的非正文字段或空串当正文上屏。
+     *    不要空等超时,更不要把 `emotion` 之类的非正文字段或空串当正文上屏;
+     *  - **同一轮可以通知多次**(详见 `docs/design/xiaozhi-ai-gateway.md` §6.4):首条之后每次都是
+     *    「本轮正文变完整了」——实现应当把它当成**补正**(再发一帧给设备并就地替换 App 气泡),
+     *    否则设备屏会永远停在那个更短的兜底正文上(真机现象「从小智获取的文本不是完整的」)。
      */
     fun setLlmObserver(observer: ((String) -> Unit)?)
 
@@ -188,7 +191,9 @@ interface XiaozhiTtsObserver {
  * @param onStt 识别文本分流(每条 `stt` 回调一次;小智边识边发,可能是部分结果)。
  * @param onLlm 本轮**正文**分流(非空 = 正文;空串 = 本轮没有可上屏正文)。正文按 [XiaozhiReplyText]
  *   的规则装配:`tts` 的句级文本拼接**优先**(用户听到的就是它),整轮没有任何 tts 文本时才用
- *   `llm.text` 兜底;`emotion` 一类非正文字段**永不**参与。
+ *   `llm.text` 兜底;`emotion` 一类非正文字段**永不**参与。**同一轮可能回调多次**:首条之后每次都是
+ *   「正文变完整了」的补正(多段 `tts[start…stop]` 的第二段、迟到句级文本、兜底被 tts 文本替换),
+ *   实现要把它当作替换而不是忽略(见 `docs/design/xiaozhi-ai-gateway.md` §6.4)。
  *   共用本会话的网关不靠它,而是用 [setLlmObserver] 挂观察者(两条出口互不覆盖)。
  * @param onTtsState TTS 状态分流(`state`, `text`);共用本会话的 TTS 直通用 [setTtsObserver]。
  *   `tts.state=stop` = 「整段正文齐了、可以开播了」(正文在这里一次性交出):音频直通侧把它当作
@@ -1397,7 +1402,10 @@ class XiaozhiSession(
                 "tts" -> {
                     val state = obj.stringOrNull("state").orEmpty()
                     val sentence = obj.stringOrNull("text").orEmpty()
-                    Log.d(tag, "收到小智 tts[$state]: ${sentence.take(200)}")
+                    // 取证:**每条 tts 报文的完整文本**(不节流、不截断;句级文本本来就不长)。
+                    // 为什么必须打全:真机「上屏的正文比小智实际说的短/漏句」只能靠「服务端发来了哪几句、
+                    // 什么顺序、有没有 stop」与结算日志逐条对照才能定案(截断/节流会正好把要看的证据吃掉)。
+                    Log.i(tag, "收到小智 tts[$state] 文本(${sentence.length} 字): $sentence")
                     onTtsState?.invoke(state, sentence)
                     // 正文装配优先喂:`tts.state=stop` 同时意味着「整段正文齐了」与「可以开播了」——
                     // 先走正文(一次性上屏),再让 TTS 直通记账。
@@ -1467,10 +1475,29 @@ class XiaozhiSession(
     private fun emitReply(outcome: XiaozhiReplyOutcome) {
         val body = outcome.body
         lastReplyDetail = outcome.detail
+        // 本次结算没产生新正文(重复结算 / 工具调用静默期挂起):只记日志,绝不上屏、也不通知观察者 ——
+        // 否则设备屏上会出现重复气泡,甚至把已经上屏的完整正文退回成一个更短的兜底文本。
+        if (!outcome.changed) {
+            Log.i(
+                tag,
+                "小智本轮正文结算未产生新正文(触发者=${outcome.trigger.logName}):${outcome.detail}" +
+                    if (body.isNotEmpty()) " 当前正文=$body" else "",
+            )
+            return
+        }
+        val bytes = body.toByteArray(Charsets.UTF_8).size
         if (body.isBlank()) {
-            Log.w(tag, "小智本轮没有可上屏正文(${outcome.detail}):按失败语义给可读原因")
+            Log.w(
+                tag,
+                "小智本轮没有可上屏正文(触发者=${outcome.trigger.logName},${outcome.detail}):按失败语义给可读原因",
+            )
         } else {
-            Log.i(tag, "小智本轮正文已就绪(${body.length} 字,${outcome.detail}): ${body.take(40)}")
+            // 真机对照用:这一行就是「设备屏上应该出现什么」,与 sendTextFrame 的「全文=…」逐字对得上。
+            Log.i(
+                tag,
+                "小智本轮正文已结算:触发者=${outcome.trigger.logName} ${outcome.detail} " +
+                    "| ${body.length} 字/${bytes} 字节 | 全文=«$body»",
+            )
         }
         ttsObserver?.onReplyBody(body)
         onLlm?.invoke(body)

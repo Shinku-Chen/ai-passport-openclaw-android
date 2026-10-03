@@ -205,9 +205,85 @@ class XiaozhiReplySanitizerTest {
             "今天 100% 的用户都能听懂。",
             "价格为 12 元(含税)，退换请在 7 天内办理。",
             "OK！就这么定了——明天见。",
+            "打折全 50％ 哦，别错过了。",
+            "通关率 90％ 以上。",
+            "命中率 50 % off 的时间都不到。",
         )
         cases.forEach { body ->
             assertEquals("正常正文必须原样保留: $body", body, XiaozhiReplySanitizer.clean(body))
         }
+    }
+
+    // ---- 模板形态的真机兼容(2026-10-06:「上屏正文里还混着模板」的可能成因) ----
+
+    /**
+     * 全角百分号 `％`:中文生成里很常见,旧规则只认半角 —— 模板会整段上屏。
+     */
+    @Test
+    fun fullwidth_percent_template_is_removed() {
+        assertEquals(
+            "明天小雨。",
+            XiaozhiReplySanitizer.clean("％ get_weather(city=\"上海\"):明天小雨。"),
+        )
+        assertEquals(
+            "明天小雨。",
+            XiaozhiReplySanitizer.clean("％get_weather 明天小雨。"),
+        )
+        assertEquals(
+            "明天小雨。",
+            XiaozhiReplySanitizer.clean("明天小雨。\n％ get_weather(city=\"上海\")"),
+        )
+    }
+
+    /** 带连字符的工具名(`get-weather` / `search-web`):旧规则不认 `-`,整个模板漏网。 */
+    @Test
+    fun hyphenated_tool_name_is_removed() {
+        assertEquals(
+            "明天小雨。",
+            XiaozhiReplySanitizer.clean("% get-weather(city=\"上海\"):明天小雨。"),
+        )
+        assertEquals(
+            "明天小雨。",
+            XiaozhiReplySanitizer.clean("% search-web(q=\"天气\") 明天小雨。"),
+        )
+    }
+
+    /**
+     * 行中(不在行首)的**裸模板 token**、且**紧跟中文/emoji**:只删 token,正文一个字不少。
+     *
+     * 真机形状:模板与正文挤在一行且模板不带参数列表 —— 旧规则只认「行首」或「带参数」,
+     * 于是 `% get_weather` 原样留在设备屏上。
+     */
+    @Test
+    fun inline_bare_template_glued_to_prose_keeps_the_prose() {
+        assertEquals(
+            "好的，明天小雨，白天23度。",
+            XiaozhiReplySanitizer.clean("好的，% get_weather明天小雨，白天23度。"),
+        )
+        assertEquals(
+            "表情不会被删掉(它不是模板):token 剔干净、正文一个字不少",
+            "好的，😊明天小雨，白天23度。",
+            XiaozhiReplySanitizer.clean("好的，% get_weather😊明天小雨，白天23度。"),
+        )
+        assertEquals(
+            "明天小雨。",
+            XiaozhiReplySanitizer.clean("％ get_weather：明天小雨。"),
+        )
+    }
+
+    /**
+     * 句级文本是**不带分隔符拼接**的:模板句末尾的那个 `:` 也必须跟模板一起删掉,
+     * 否则设备屏会以 `:明天小雨。` 这种形状开头。
+     */
+    @Test
+    fun colon_after_an_inline_template_is_removed_too() {
+        assertEquals(
+            "明天小雨。",
+            XiaozhiReplySanitizer.clean("% get_weather(city=\"上海\"):明天小雨。"),
+        )
+        assertEquals(
+            "明天小雨。",
+            XiaozhiReplySanitizer.clean("% get_weather(location=\"上海\", date=\"明天\"):明天小雨。"),
+        )
     }
 }

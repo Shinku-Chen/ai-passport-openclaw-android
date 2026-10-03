@@ -275,4 +275,41 @@ class XiaozhiTtsObserverDeliveryTest {
         )
         session.release()
     }
+
+    /**
+     * 真机问题「从小智获取的文本不是完整的」的**端到端回归**(会话层接线 → 正文观察者)。
+     *
+     * 真机交错流:① `llm.text` 先到,是「中间态 + 工具模板」那截更短的文本;② 工具调用轮次的第一段
+     * 只有模板句级文本、随后 `stop`;③ 工具结果回来后真答案作为**第二段**到达、再来一个 `stop`。
+     *
+     * 断言观察者（→ 直通 relay / 网关 / 流水线）**只能**收到完整的那句长文本:
+     * 第一段的 `stop` 不得把中间态兜底交出去(否则设备屏就永远停在那截 102 字节的文本上)。
+     */
+    @Test
+    fun session_delivers_the_complete_multisegment_body_not_the_intermediate_fallback() {
+        val replyBodyLatch = CountDownLatch(1)
+        val observer = RecordingObserver(CountDownLatch(1), replyBodyLatch)
+        val full = "明天上海是小雨喔，白天都湿湿的，晚上才转阴，算不上好天气啦。"
+        val (session, fake) = newSession(
+            frames = 0,
+            withTtsState = false,
+            observer = observer,
+            extraMessages = listOf(
+                """{"type":"llm","emotion":"😊","text":"% get_weather(location=\"上海\", date=\"明天\")明天上海是小雨喔，白天23度"}""",
+                """{"type":"tts","state":"sentence_start","text":"% get_weather(location=\"上海\", date=\"明天\"):"}""",
+                """{"type":"tts","state":"stop"}""",
+                """{"type":"tts","state":"sentence_start","text":"$full"}""",
+                """{"type":"tts","state":"stop"}""",
+            ),
+        )
+
+        assertTrue("push 到了", fake.pushed.await(5, TimeUnit.SECONDS))
+        assertTrue("观察者必须拿到本轮正文", replyBodyLatch.await(5, TimeUnit.SECONDS))
+        assertEquals(
+            "只能收到完整的句级拼接:第一段 stop 上的中间态兜底正文绝不能上屏",
+            listOf(full),
+            observer.replyBodies.toList(),
+        )
+        session.release()
+    }
 }

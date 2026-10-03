@@ -13,6 +13,7 @@ import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import java.util.concurrent.CopyOnWriteArrayList
 
 /**
  * 小智 AI 网关「文本这条路」的单测:无网络、无 Android 依赖。
@@ -265,8 +266,7 @@ class XiaozhiGatewayTest {
         assertFalse(gw.isReady())
     }
 
-    /** `close()` 只摘观察者、作废等待:**绝不能关掉共用的会话**(那是识别通道的)。 */
-    @Test
+    /** `close()` 只摘观察者、作废等待:**绝不能关掉共用的会话**(那是识别通道的)。 */    @Test
     fun close_detaches_observer_without_touching_shared_session() = runTest {
         val session = FakeSession()
         val gw = XiaozhiGateway(session, replyTimeoutMs = 60_000)
@@ -284,5 +284,98 @@ class XiaozhiGatewayTest {
         val after = gw.chatMulti("问题")
         assertTrue(after.messages.isEmpty())
         assertTrue(after.error!!.contains("已关闭"))
+    }
+
+    // ---- 真机问题「从小智获取的文本不是完整的」:同一轮后续到达的更完整正文必须能上屏 ----
+
+    /**
+     * 同一轮的**第二条**正文(更完整的那条)必须经 `onBodyCorrection` 交付给流水线。
+     *
+     * 真机形状:首条正文可能是「中间态 + 工具模板」那种更短的文本(或纯 llm 兜底),
+     * 真答案随后的分段才到。旧实现在第一条之后就没人能再上屏了(回复已交、deferred 已完),
+     * 设备屏就永远停在那条更短的文本上 —— 这就是本轮的根因。
+     */
+    @Test
+    fun later_full_body_is_delivered_as_a_body_correction() = runTest {
+        val session = FakeSession()
+        val gw = XiaozhiGateway(session, replyTimeoutMs = 60_000)
+        val corrections = CopyOnWriteArrayList<String>()
+        var reply: ChatReply? = null
+        val job = launch { reply = gw.chatMulti("明天天气怎么样", onBodyCorrection = { corrections += it }) }
+        runCurrent()
+        session.pushLlm("明天上海是小雨喔，白天23度")                       // 中间态(首条交付)
+        advanceUntilIdle()
+        job.join()
+        assertEquals(listOf("明天上海是小雨喔，白天23度"), reply!!.messages)
+        assertTrue("首条交付时还没有补正", corrections.isEmpty())
+
+        // 真答案随第二个分段到达:更完整的那条正文必须作为补正交出去
+        val full = "明天上海是小雨喔，白天都湿湿的，晚上才转阴，算不上好天气啦。"
+        session.pushLlm(full)
+        advanceUntilIdle()
+        assertEquals(listOf(full), corrections.toList())
+        assertNull("补正不是失败,不写 lastError", gw.lastError)
+    }
+
+    /**
+     * 同一轮的**多次**补正(多段 `tts[start…stop]`)都要交付 —— 不能只认第一条补正,
+     * 否则第三段之后的文本又会丢掉。
+     */
+    @Test
+    fun every_growing_body_is_delivered_to_the_pipeline() = runTest {
+        val session = FakeSession()
+        val gw = XiaozhiGateway(session, replyTimeoutMs = 60_000)
+        val corrections = CopyOnWriteArrayList<String>()
+        val job = launch { gw.chatMulti("问题", onBodyCorrection = { corrections += it }) }
+        runCurrent()
+        session.pushLlm("第一段。")
+        advanceUntilIdle()
+        session.pushLlm("第一段。第二段。")
+        advanceUntilIdle()
+        session.pushLlm("第一段。第二段。第三段。")
+        advanceUntilIdle()
+        job.join()
+        assertEquals(listOf("第一段。第二段。", "第一段。第二段。第三段。"), corrections.toList())
+    }
+
+    /** 与已交付正文相同的那条不再重复交付(否则设备屏会多一个重复气泡)。 */
+    @Test
+    fun identical_body_is_not_re_delivered() = runTest {
+        val session = FakeSession()
+        val gw = XiaozhiGateway(session, replyTimeoutMs = 60_000)
+        val corrections = CopyOnWriteArrayList<String>()
+        val job = launch { gw.chatMulti("问题", onBodyCorrection = { corrections += it }) }
+        runCurrent()
+        session.pushLlm("同一段正文。")
+        advanceUntilIdle()
+        session.pushLlm("同一段正文。")
+        session.pushLlm("  同一段正文。  ")
+        advanceUntilIdle()
+        job.join()
+        assertTrue("文本没变就不重复上屏", corrections.isEmpty())
+    }
+
+    /**
+     * 「本轮没有可上屏正文」(空串 = 只表情/工具模板)也是一条**结论**:
+     * 真答案随后到达时同样要作为补正把它替掉(否则设备屏永远停在那句可读原因上)。
+     */
+    @Test
+    fun real_body_after_a_no_body_outcome_is_delivered_as_a_correction() = runTest {
+        val session = FakeSession()
+        session.lastReplyDetail = "tts 句级文本 1 条(原始 30 字→清洗后 0 字);llm.text 无"
+        val gw = XiaozhiGateway(session, replyTimeoutMs = 60_000)
+        val corrections = CopyOnWriteArrayList<String>()
+        var reply: ChatReply? = null
+        val job = launch { reply = gw.chatMulti("问题", onBodyCorrection = { corrections += it }) }
+        runCurrent()
+        session.pushLlm("")
+        advanceUntilIdle()
+        job.join()
+        assertTrue(reply!!.messages.isEmpty())
+        assertTrue(reply!!.error!!.contains("没有返回可上屏的正文"))
+
+        session.pushLlm("工具调用完成后才到的真答案。")
+        advanceUntilIdle()
+        assertEquals(listOf("工具调用完成后才到的真答案。"), corrections.toList())
     }
 }

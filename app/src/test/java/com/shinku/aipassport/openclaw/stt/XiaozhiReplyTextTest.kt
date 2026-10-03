@@ -7,7 +7,7 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 /**
- * 「本轮正文取哪一路」的 JVM 单测(纯逻辑,无网络/无 Android)。
+ * 「本轮正文取哪一路 / 什么时候结算」的 JVM 单测(纯逻辑,无网络/无 Android)。
  *
  * 被测的 [XiaozhiReplyText] 就是 `XiaozhiSession` 里 `llm`/`tts` 两条下行的装配点:会话层只把
  * **`text` 字段**喂进来(`emotion` 一律不喂),`emit` 收到的正文字符串就是流水线 `sendText('A', …)`
@@ -18,21 +18,37 @@ import org.junit.Test
  *  4. `sentence_start` 与 `sentence_end` 都带同一句文本时只算一次;
  *  5. **真机回归(2026-10-05)**:tts 句级文本里混着 `% get_weather…` 与 emoji 时,
  *     只要有清洗后含文字的 tts 文本就**必须**上屏,不许退化成「没有可上屏正文」;
- *  6. 没有可上屏文字时不用短窗口结算(否则会把随后到达的真答案吞掉),而是等长的空闲窗口。
+ *  6. **真机回归(2026-10-06,本轮主问题)**:「从小智获取的文本不是完整的」——
+ *     `tts.stop` 是**唯一权威**结算点:工具调用静默期(tts 已有文本但清洗后不可上屏)在 `stop` 上
+ *     **挂起不结算**;同一轮后续分段/迟到句级文本到达时必须把**完整正文**交出去(第二轮补正),
+ *     绝不让「先上屏的兜底正文」把更完整的正文挡在门外。
  */
 class XiaozhiReplyTextTest {
 
-    /** 记录 [XiaozhiReplyText.emit] 交出的每一条正文(顺便把结算说明也留下,便于断言“哪一层为空”)。 */
+    /** 真机报文里的表情(UTF-16 下是 2 个 char,断言长度时要用它而不是手写的数字)。 */
+    private val EMOJI = "😊"
+
+    /** 一次结算的记录:正文、说明、触发者、是否真的产生了新正文。 */
+    private data class Settle(val body: String, val detail: String, val trigger: XiaozhiReplyTrigger, val changed: Boolean)
+
+    /** 记录 [XiaozhiReplyText.emit] 交出的每一次结算(含「未变化」的诊断)。 */
     private class Recorder {
-        val emitted = ArrayList<String>()
-        val details = ArrayList<String>()
+        val settles = ArrayList<Settle>()
         val reply = XiaozhiReplyText(emit = { outcome ->
-            emitted += outcome.body
-            details += outcome.detail
+            settles += Settle(outcome.body, outcome.detail, outcome.trigger, outcome.changed)
         })
 
+        /** 真正上屏的正文(按顺序;`changed = false` 的诊断不进这里)。 */
+        fun bodies(): List<String> = settles.filter { it.changed }.map { it.body }
+
         /** 最后一次结算的说明。 */
-        fun lastDetail(): String = details.last()
+        fun lastDetail(): String = settles.last().detail
+
+        /** 最后一次结算的触发者。 */
+        fun lastTrigger(): XiaozhiReplyTrigger = settles.last().trigger
+
+        /** 最后一次**真正上屏**的正文。 */
+        fun lastBody(): String = bodies().last()
     }
 
     /** 验收点 1:llm 的正文是表情(真机形态)→ 以 tts 两句拼接为准,表情不上屏。 */
@@ -46,11 +62,12 @@ class XiaozhiReplyTextTest {
         r.reply.onTtsState("sentence_start", "气温大概十八到二十三度，")
         r.reply.onTtsState("sentence_end", "气温大概十八到二十三度，")
         r.reply.onTtsState("sentence_end", "出门记得带把伞喔。")
-        assertTrue("整段在 stop 之前不上屏(方案 A:一条回复一个气泡)", r.emitted.isEmpty())
+        assertTrue("整段在 stop 之前不上屏(方案 A:一条回复一个气泡)", r.settles.isEmpty())
 
         r.reply.onTtsState("stop", "")
-        assertEquals(listOf("气温大概十八到二十三度，出门记得带把伞喔。"), r.emitted)
-        assertFalse("表情绝不能进正文", r.emitted.any { it.contains("😊") })
+        assertEquals(listOf("气温大概十八到二十三度，出门记得带把伞喔。"), r.bodies())
+        assertEquals(XiaozhiReplyTrigger.STOP, r.lastTrigger())
+        assertFalse("表情绝不能进正文", r.bodies().any { it.contains("😊") })
     }
 
     /** 验收点 2:整轮没有任何 tts 文本 → 用 `llm.text` 兜底(stop 到来即结算,不拖)。 */
@@ -63,7 +80,7 @@ class XiaozhiReplyTextTest {
         r.reply.onTtsState("start", "")
         r.reply.onTtsState("sentence_start", "")
         r.reply.onTtsState("stop", "")
-        assertEquals(listOf("今天晴，20 度。"), r.emitted)
+        assertEquals(listOf("今天晴，20 度。"), r.bodies())
     }
 
     /** 纯 llm 服务端(没有任何 tts 报文)时,也要能兜底交出正文 —— 但只在长窗口后,不抢跑。 */
@@ -78,32 +95,36 @@ class XiaozhiReplyTextTest {
             r.reply.pendingIdleGraceMs(),
         )
         r.reply.onIdle()
-        assertEquals(listOf("只有 llm 的正文"), r.emitted)
+        assertEquals(listOf("只有 llm 的正文"), r.bodies())
+        assertEquals(XiaozhiReplyTrigger.IDLE_LLM_FALLBACK, r.lastTrigger())
         assertTrue("结算说明里要看出取自 llm 兜底", r.lastDetail().contains("llm.text"))
     }
 
-    /** 只要来了一条 tts 报文(哪怕不带文本),「纯 llm 兜底」的长窗口就作废,改走正常路径。 */
+    /**
+     * 只要来了一条 tts 报文(哪怕不带文本),「纯 llm 兜底」的短窗口就作废,改走「**等 `stop`**」:
+     * 此时空闲窗口只剩一条很长的**强制兜底**(收过 tts 报文的服务端几乎总会发 `stop`)。
+     */
     @Test
-    fun any_tts_message_cancels_the_llm_only_grace() {
+    fun any_tts_message_switches_to_the_forced_window_and_never_uses_llm_early() {
         val r = Recorder()
         r.reply.onTurnStart()
         r.reply.onLlm("😊")
         r.reply.onTtsState("start", "")
         assertEquals(
-            "只有表情、还没有任何可上屏文字:窗口必须足够长(不得用 2s 的短窗口把真答案抢掉)",
-            XiaozhiReplyText.NOISE_ONLY_IDLE_GRACE_MS,
+            "收到过 tts 报文:空闲窗口退化为强制兜底(远长于旧实现的 2s,不得把真答案抢掉)",
+            XiaozhiReplyText.FORCED_IDLE_GRACE_MS,
             r.reply.pendingIdleGraceMs(),
         )
-        r.reply.onIdle()   // 窗口到点:只能交「没有可上屏正文」,**绝不能**把表情当正文交出
-        assertEquals(listOf(""), r.emitted)
-        assertFalse("表情绝不能进正文", r.emitted.any { it.contains("😊") })
+        r.reply.onIdle()   // 强制兜底到点:只能交「没有可上屏正文」,**绝不能**把表情当正文交出
+        assertEquals(listOf(""), r.bodies())
+        assertFalse("表情绝不能进正文", r.bodies().any { it.contains("😊") })
         assertTrue("原因里要写清哪一层为空", r.lastDetail().contains("llm.text"))
 
         // 新一轮:真的正文到达后照常上屏
         r.reply.onTurnStart()
         r.reply.onTtsState("sentence_end", "真正的回复。")
         r.reply.onTtsState("stop", "")
-        assertEquals(listOf("", "真正的回复。"), r.emitted)
+        assertEquals(listOf("", "真正的回复。"), r.bodies())
     }
 
     /** 验收点 3:只有 emotion、没有任何文本 → 交空串(调用方可读原因),不空等、不上屏表情。 */
@@ -114,8 +135,8 @@ class XiaozhiReplyTextTest {
         r.reply.onLlm("")            // llm 报文只有 emotion,没有 text
         r.reply.onTtsState("start", "")
         r.reply.onTtsState("stop", "")
-        assertEquals(listOf(""), r.emitted)
-        assertFalse(r.emitted.any { it.contains("😊") })
+        assertEquals(listOf(""), r.bodies())
+        assertFalse(r.bodies().any { it.contains("😊") })
         assertTrue(
             "原因必须写清哪一层为空(真机排查要看这句)",
             r.lastDetail().contains("tts 句级文本 无") && r.lastDetail().contains("llm.text 无"),
@@ -132,7 +153,7 @@ class XiaozhiReplyTextTest {
         r.reply.onTtsState("sentence_start", "第二句。")
         r.reply.onTtsState("sentence_end", "第二句。")
         r.reply.onTtsState("stop", "")
-        assertEquals(listOf("第一句。第二句。"), r.emitted)
+        assertEquals(listOf("第一句。第二句。"), r.bodies())
     }
 
     /** 句子在增长(start 给部分文本、end 给完整文本)时取更完整的那份,而不是两边都拼上。 */
@@ -143,7 +164,7 @@ class XiaozhiReplyTextTest {
         r.reply.onTtsState("sentence_start", "气温大概")
         r.reply.onTtsState("sentence_end", "气温大概十八到二十三度。")
         r.reply.onTtsState("stop", "")
-        assertEquals(listOf("气温大概十八到二十三度。"), r.emitted)
+        assertEquals(listOf("气温大概十八到二十三度。"), r.bodies())
     }
 
     /** 反过来(end 比 start 短 / 少一个标点)也不能把同一句拼两遍。 */
@@ -154,21 +175,42 @@ class XiaozhiReplyTextTest {
         r.reply.onTtsState("sentence_start", "气温大概十八到二十三度。")
         r.reply.onTtsState("sentence_end", "气温大概十八到二十三度")
         r.reply.onTtsState("stop", "")
-        assertEquals(listOf("气温大概十八到二十三度。"), r.emitted)
+        assertEquals(listOf("气温大概十八到二十三度。"), r.bodies())
     }
 
-    /** 没有 `stop` 的服务端:最后一句之后无新增即结算(有 tts 文本时才挂这个窗口)。 */
+    /**
+     * 验收点 A1:句级文本**按到达顺序累积**;空句、纯空白句与**相邻重复**句丢掉,
+     * 但**不能连带丢掉正常句子**(去重只针对相邻的同句子/前后缀关系)。
+     */
     @Test
-    fun sentences_are_flushed_when_stop_never_arrives() {
+    fun empty_and_duplicate_sentences_are_dropped_without_losing_normal_ones() {
+        val r = Recorder()
+        r.reply.onTurnStart()
+        r.reply.onTtsState("sentence_start", "")
+        r.reply.onTtsState("sentence_start", "   ")
+        r.reply.onTtsState("sentence_start", "第一句。")
+        r.reply.onTtsState("sentence_end", "第一句。")        // 同一句:只算一次
+        r.reply.onTtsState("start", "第一句。")               // 又一次重复(不是句子内容)
+        r.reply.onTtsState("sentence_start", "第二句，")      // 正常句子:必须留下
+        r.reply.onTtsState("sentence_end", "第二句，带更多内容。") // 句子在增长:取更完整的
+        r.reply.onTtsState("sentence_end", "第三句。")
+        r.reply.onTtsState("stop", "")
+        assertEquals(listOf("第一句。第二句，带更多内容。第三句。"), r.bodies())
+    }
+
+    /** 没有 `stop` 的服务端:收到过 tts 报文时只挂**强制兜底**窗口,到点才结算(而不是半路 2s)。 */
+    @Test
+    fun sentences_are_flushed_only_by_the_forced_window_when_stop_never_arrives() {
         val r = Recorder()
         r.reply.onTurnStart()
         r.reply.onTtsState("sentence_end", "只有这一句。")
         assertEquals(
-            XiaozhiReplyText.SENTENCE_IDLE_GRACE_MS,
+            XiaozhiReplyText.FORCED_IDLE_GRACE_MS,
             r.reply.pendingIdleGraceMs(),
         )
         r.reply.onIdle()
-        assertEquals(listOf("只有这一句。"), r.emitted)
+        assertEquals(listOf("只有这一句。"), r.bodies())
+        assertEquals(XiaozhiReplyTrigger.FORCED, r.lastTrigger())
     }
 
     /** 还没有任何文本时没有可结算候选(不挂定时器、不交出任何东西)。 */
@@ -179,21 +221,7 @@ class XiaozhiReplyTextTest {
         assertNull(r.reply.pendingIdleGraceMs())
         r.reply.onIdle()
         r.reply.onLlm("")
-        assertTrue(r.emitted.isEmpty())
-        assertNull(r.reply.pendingIdleGraceMs())
-    }
-
-    /** 每轮只结算一次:结算后迟到的文本不再追加/再次上屏(一条回复一个气泡)。 */
-    @Test
-    fun turn_emits_exactly_once_and_ignores_late_text() {
-        val r = Recorder()
-        r.reply.onTurnStart()
-        r.reply.onLlm("兜底候选")
-        r.reply.onTtsState("sentence_end", "第一句。")
-        r.reply.onTtsState("stop", "")
-        r.reply.onTtsState("sentence_end", "迟到的第二句。")
-        r.reply.onIdle()
-        assertEquals(listOf("第一句。"), r.emitted)
+        assertTrue(r.settles.isEmpty())
         assertNull(r.reply.pendingIdleGraceMs())
     }
 
@@ -206,7 +234,7 @@ class XiaozhiReplyTextTest {
         r.reply.onTurnStart()                 // 新一轮:上一轮的句级文本作废
         r.reply.onTtsState("sentence_end", "这一句。")
         r.reply.onTtsState("stop", "")
-        assertEquals(listOf("这一句。"), r.emitted)
+        assertEquals(listOf("这一句。"), r.bodies())
     }
 
     /**
@@ -225,22 +253,7 @@ class XiaozhiReplyTextTest {
         r.reply.onTtsState("sentence_start", "北京今天晴，二十度。")
         r.reply.onTtsState("sentence_end", "% get_weather(city=\"北京\")")
         r.reply.onTtsState("stop", "")
-        assertEquals(listOf("北京今天晴，二十度。"), r.emitted)
-    }
-
-    /** 整段只剩模板/占位 → 交空串(走「本轮没有可上屏正文」的可读原因路径,不上屏噪声)。 */
-    @Test
-    fun noise_only_turn_emits_empty_body() {
-        val r = Recorder()
-        r.reply.onTurnStart()
-        r.reply.onTtsState("sentence_end", "<tool_call>{\"name\":\"get_weather\"}</tool_call>")
-        r.reply.onTtsState("sentence_end", "% get_weather(city=\"北京\")")
-        r.reply.onTtsState("stop", "")
-        assertEquals(listOf(""), r.emitted)
-        assertTrue(
-            "原因必须能看出「收到了文本但都不可上屏」:tts 2 条 / 清洗后 0 字",
-            r.lastDetail().contains("tts 句级文本 2 条(清洗后 0 字)"),
-        )
+        assertEquals(listOf("北京今天晴，二十度。"), r.bodies())
     }
 
     // ---- 真机回归(2026-10-05):有可上屏的 tts 句级文本就必须上屏,绝不能退化成「没有可上屏正文」 ----
@@ -266,59 +279,185 @@ class XiaozhiReplyTextTest {
         assertEquals(
             "tts 句级文本就是用户听到的那句:必须原样(模板行已剔掉)上屏,而且不能退化成空串",
             listOf("明天上海是小雨喔，白天23度😊"),
-            r.emitted,
+            r.bodies(),
         )
-        assertFalse("工具模板不能上屏", r.emitted.any { it.contains("get_weather") })
-        assertFalse("也绝不是「没有可上屏正文」那条空串", r.emitted.any { it.isEmpty() })
+        assertFalse("工具模板不能上屏", r.bodies().any { it.contains("get_weather") })
+        assertFalse("也绝不是「没有可上屏正文」那条空串", r.bodies().any { it.isEmpty() })
     }
 
     /**
-     * 真机 bug 的**成因回归**:工具调用轮次里,先到的只有「模板/表情」这种不可上屏的 tts 文本,
-     * 真答案在后面 —— 这段静默里**不得**用 2s 的短窗口结算(否则真答案到达时本轮已结算、被丢掉),
-     * 而应该继续等长窗口/`stop`。
+     * **本轮主问题的真机回归(2026-10-06)**：「从小智获取的文本不是完整的」。
+     *
+     * 真机交错流(与作者给的证据同形):
+     *  1. `llm.text` 先到,里面是**中间态**的一句话 + `% get_weather…` 模板残留(清洗后仍可上屏);
+     *  2. 工具调用轮次先推一条**只含模板**的 tts 句级文本,然后 `stop`(第一段结束);
+     *  3. 工具结果回来后,真答案作为**第二段**的句级文本到达,再来一个 `stop`。
+     *
+     * 旧实现在第 2 步的 `stop` 上就把 `llm.text` 兜底交了出去(于是设备屏是那截 102 字节的中间态文本),
+     * 第 3 步的完整句级文本因为「本轮已结算」被丢掉。现在:第 2 步**挂起不结算**,
+     * 第 3 步交出**完整句级拼接**——一个字不少。
      */
     @Test
-    fun tool_call_gap_does_not_settle_into_no_body_before_the_real_answer() {
+    fun real_device_multisegment_tool_call_turn_ends_with_the_complete_sentence() {
         val r = Recorder()
         r.reply.onTurnStart()
-        r.reply.onLlm("😊")
-        r.reply.onTtsState("sentence_start", "% get_weather(city=\"上海\")")
-        r.reply.onTtsState("sentence_end", "% get_weather(city=\"上海\")")
-
-        assertEquals(
-            "收到了文本但都不可上屏:不得用 2s 短窗口(工具调用还没回来)",
-            XiaozhiReplyText.NOISE_ONLY_IDLE_GRACE_MS,
-            r.reply.pendingIdleGraceMs(),
-        )
-
-        // 工具调用完成:真答案作为新的句级文本到达(此时窗口变成正常的 2s)
-        r.reply.onTtsState("sentence_start", "明天上海是小雨喔，白天23度")
-        assertEquals(
-            "有可上屏的 tts 文本 → 回到正常短窗口(紧跟 stop 结算)",
-            XiaozhiReplyText.SENTENCE_IDLE_GRACE_MS,
-            r.reply.pendingIdleGraceMs(),
-        )
+        // 1) 中间态 llm.text(真机取证形状:模板 + 截短的句子;清洗后仍含文字 → 是个「可上屏候选」)
+        r.reply.onLlm("% get_weather(location=\"上海\", date=\"明天\")明天上海是小雨喔，白天23度")
+        // 2) 第一段:只有模板的句级文本 → stop
+        r.reply.onTtsState("sentence_start", "% get_weather(location=\"上海\", date=\"明天\"):")
+        r.reply.onTtsState("sentence_end", "% get_weather(location=\"上海\", date=\"明天\"):")
         r.reply.onTtsState("stop", "")
-        assertEquals(listOf("明天上海是小雨喔，白天23度"), r.emitted)
+        assertTrue(
+            "工具调用静默期(tts 有文本但清洗后不可上屏)不得在 stop 上结算",
+            r.bodies().isEmpty(),
+        )
+        assertFalse("诊断行必须标明这次 stop 没有产生新正文", r.settles.last().changed)
+        assertEquals(XiaozhiReplyTrigger.STOP, r.settles.last().trigger)
+
+        // 3) 第二段:真答案(完整长句)→ stop
+        r.reply.onTtsState("sentence_start", "明天上海是小雨喔，白天都湿湿的，晚上才转阴，算不上好天气啦。")
+        r.reply.onTtsState("stop", "")
+
+        val full = "明天上海是小雨喔，白天都湿湿的，晚上才转阴，算不上好天气啦。"
+        assertEquals("最终上屏 = 完整句级拼接(清洗后)", listOf(full), r.bodies())
+        assertEquals("结算由 stop 触发", XiaozhiReplyTrigger.STOP, r.lastTrigger())
+        assertFalse("模板绝不能残留", r.lastBody().contains("get_weather"))
+        assertFalse("不能是那条更短的中间态兜底文本", r.lastBody().contains("白天23度"))
+        assertTrue("整段一句都不能少", r.lastBody().contains("晚上才转阴") && r.lastBody().contains("好天气"))
     }
 
-    /** tts 那一路不可上屏(只 emoji/模板)时,用 `llm.text` 兜底 —— 不得直接报「没有可上屏正文」。 */
+    /**
+     * 验收点 A3:兜底正文**先**上屏(纯 llm 兜底窗口到点,当时还没有 tts 句级文本),
+     * 随后 tts 句级文本到达 —— 必须把它**当作新正文再交一次**(调用方替换屏幕上那条),
+     * 同一轮内不得出现「兜底先上屏、完整正文再也上不了」。
+     */
     @Test
-    fun llm_text_is_used_when_the_tts_text_is_not_displayable() {
+    fun late_tts_text_after_the_llm_fallback_is_delivered_as_a_new_body() {
+        val r = Recorder()
+        r.reply.onTurnStart()
+        r.reply.onLlm("中间态的兜底正文。")
+        // 没有 tts 报文 → 纯 llm 兜底窗口到点,先把兜底交出去(设备不能空着)
+        r.reply.onIdle()
+        assertEquals(listOf("中间态的兜底正文。"), r.bodies())
+
+        // 之后 tts 句级文本才到(真答案更完整)
+        r.reply.onTtsState("sentence_start", "真正的完整回答，")
+        r.reply.onTtsState("sentence_end", "真正的完整回答，包含更多细节。")
+        r.reply.onTtsState("stop", "")
+        assertEquals(
+            "tts 句级文本到达后必须**替换**已上屏的兜底正文(第二次交付)",
+            listOf("中间态的兜底正文。", "真正的完整回答，包含更多细节。"),
+            r.bodies(),
+        )
+        assertEquals(XiaozhiReplyTrigger.STOP, r.lastTrigger())
+    }
+
+    /**
+     * 验收点 A2:收到过 tts 报文后,句与句之间的**长间隔不会提前结算**(旧实现在最后一句后 2s 就交,
+     * 正好把工具调用/长生成的停顿当成一轮结束 —— 真机「文本不完整」的另一条成因)。
+     */
+    @Test
+    fun long_gap_between_sentences_never_settles_before_stop() {
+        val r = Recorder()
+        r.reply.onTurnStart()
+        r.reply.onTtsState("sentence_start", "第一句，")
+        val grace = r.reply.pendingIdleGraceMs()
+        assertEquals("有 tts 报文时只有强制兜底窗口", XiaozhiReplyText.FORCED_IDLE_GRACE_MS, grace)
+        assertTrue(
+            "强制兜底必须明显长于正常停顿(旧实现的 2s 正是抢跑的原因)",
+            grace!! >= 15_000L,
+        )
+        // 间隔期间即便窗口判定被触发也只会重算(真答案还没来)
+        r.reply.onTtsState("sentence_start", "第二句，")
+        r.reply.onTtsState("sentence_end", "第三句。")
+        r.reply.onTtsState("stop", "")
+        assertEquals(listOf("第一句，第二句，第三句。"), r.bodies())
+        assertTrue("只上屏一次(不是逐句碎气泡)", r.bodies().size == 1)
+    }
+
+    /**
+     * 验收点 A4:同一轮**多段** `tts[start…stop]` —— 第二段的文本也要处理(不能只认第一段),
+     * 第二段到达后交出的正文是**整段拼接**(第一段 + 第二段)。
+     */
+    @Test
+    fun second_segment_text_is_appended_and_delivered_again() {
+        val r = Recorder()
+        r.reply.onTurnStart()
+        r.reply.onTtsState("start", "")
+        r.reply.onTtsState("sentence_start", "第一段的话。")
+        r.reply.onTtsState("stop", "")
+        assertEquals(listOf("第一段的话。"), r.bodies())
+
+        r.reply.onTtsState("start", "")
+        r.reply.onTtsState("sentence_start", "第二段的话。")
+        r.reply.onTtsState("stop", "")
+        assertEquals(
+            "第二段文本不能丢:第二段 stop 上交出整段拼接(调用方替换屏幕上的那条)",
+            listOf("第一段的话。", "第一段的话。第二段的话。"),
+            r.bodies(),
+        )
+    }
+
+    /** 同一段正文被第二个 `stop` / 强制窗口再结算一次时:只记日志,不重复上屏。 */
+    @Test
+    fun identical_body_is_not_emitted_twice() {
+        val r = Recorder()
+        r.reply.onTurnStart()
+        r.reply.onTtsState("sentence_start", "只有这一句。")
+        r.reply.onTtsState("stop", "")
+        r.reply.onTtsState("stop", "")   // 服务端重复发 stop(或第二段没有新文本)
+        r.reply.onIdle()
+        assertEquals(listOf("只有这一句。"), r.bodies())
+        assertEquals(
+            "重复结算仍然要留诊断行(真机日志靠它确认「结算了几次、为什么没变」)",
+            XiaozhiReplyTrigger.FORCED,
+            r.lastTrigger(),
+        )
+        assertFalse("重复结算不得产生新正文", r.settles.last().changed)
+    }
+
+    /**
+     * 验收点 A5/A6:**工具调用静默期**在 `stop` 上挂起(不结算、不上屏),等到**强制兜底窗口**才交出
+     * 兜底/可读原因 —— 这样「真答案在下一个分段」时屏幕不会被中间态文本占住。
+     */
+    @Test
+    fun tool_call_silence_holds_at_stop_until_the_forced_window() {
+        val r = Recorder()
+        r.reply.onTurnStart()
+        // 真机形状:llm.text 是中间态的一句话(带模板残留,清洗后仍有文字 → 是个可上屏候选)
+        r.reply.onLlm("% get_weather(location=\"上海\", date=\"明天\")明天上海是小雨喔，白天23度")
+        r.reply.onTtsState("sentence_start", "% get_weather(location=\"上海\", date=\"明天\")")
+        r.reply.onTtsState("stop", "")
+        assertTrue("平静期:一条正文都不交", r.bodies().isEmpty())
+        assertFalse("且只记诊断行(changed=false)", r.settles.last().changed)
+        assertTrue("诊断行要看得出是「工具调用静默期挂起」", r.lastDetail().contains("静默期"))
+
+        // 一直等不到后续分段 → 强制兜底到点:才交兜底(llm.text 清洗后的那句)
+        r.reply.onIdle()
+        assertEquals(listOf("明天上海是小雨喔，白天23度"), r.bodies())
+        assertEquals(XiaozhiReplyTrigger.FORCED, r.lastTrigger())
+    }
+
+    /** tts 那一路不可上屏(只 emoji/模板)时,`llm.text` 兜底是**强制兜底窗口**才交 —— 不是 stop 上抢跑。 */
+    @Test
+    fun llm_text_fallback_waits_for_the_forced_window_when_tts_is_noise_only() {
         val r = Recorder()
         r.reply.onTurnStart()
         r.reply.onLlm("真正的回复在 llm 里。")
         r.reply.onTtsState("sentence_end", "% get_weather(city=\"上海\")")
         r.reply.onTtsState("sentence_end", "😊")
         r.reply.onTtsState("stop", "")
+        assertTrue("tts 侧只有模板/表情:stop 上挂起,不抢注中间态文本", r.bodies().isEmpty())
+
+        r.reply.onIdle()
         assertEquals(
-            "tts 侧没有可上屏文字 → 兜底用 llm.text(比「没有可上屏正文」正确得多)",
+            "强制兜底到点才用 llm.text 兜底(比「没有可上屏正文」正确得多)",
             listOf("真正的回复在 llm 里。"),
-            r.emitted,
+            r.bodies(),
         )
     }
 
-    /** 两路都只有 emoji/模板时:交空串(带说明),**绝不**上屏 emoji。 */
+    /** 两路都只有 emoji/模板时:强制兜底窗口到点交空串(带说明),**绝不**上屏 emoji。 */
     @Test
     fun emoji_only_on_both_layers_emits_empty_with_detail() {
         val r = Recorder()
@@ -326,10 +465,28 @@ class XiaozhiReplyTextTest {
         r.reply.onLlm("😊")
         r.reply.onTtsState("sentence_end", "😊😊")
         r.reply.onTtsState("stop", "")
-        assertEquals(listOf(""), r.emitted)
+        assertTrue("工具调用静默期:stop 上不交空串(那是要等后续分段的)", r.bodies().isEmpty())
+
+        r.reply.onIdle()
+        assertEquals(listOf(""), r.bodies())
         assertTrue(
-            "说明里两层都要写清楚(真机排查要看这句)",
-            r.lastDetail().contains("tts 句级文本 1 条") && r.lastDetail().contains("llm.text 2 字"),
+            "说明里两层都要写清楚原始/清洗后字数(真机排查要看这句)",
+            r.lastDetail().contains("tts 句级文本 1 条") &&
+                r.lastDetail().contains("llm.text(原始 ${EMOJI.length} 字"),
         )
+    }
+
+    /** 清洗前后字数必须进结算说明(真机排查「正文变短」的第一个依据)。 */
+    @Test
+    fun settle_detail_carries_before_and_after_cleaning_lengths() {
+        val r = Recorder()
+        r.reply.onTurnStart()
+        val raw = "% get_weather(city=\"上海\")明天小雨。"
+        r.reply.onTtsState("sentence_start", raw)
+        r.reply.onTtsState("stop", "")
+        val detail = r.lastDetail()
+        assertTrue("要看到 tts 的原始字数", detail.contains("原始 ${raw.length} 字"))
+        assertTrue("也要看到清洗后的字数", detail.contains("→清洗后 5 字"))
+        assertEquals("明天小雨。", r.lastBody())
     }
 }
