@@ -42,6 +42,9 @@ class XiaozhiGatewayTest {
         var prewarmCount = 0
         var warm = true
 
+        /** 会话层的结算说明(见 [XiaozhiLlmSource.lastReplyDetail]):网关拿它拼可读原因。 */
+        override var lastReplyDetail: String? = null
+
         override val isAvailable: Boolean get() = available
 
         override fun prewarm() {
@@ -100,7 +103,7 @@ class XiaozhiGatewayTest {
     fun tts_concat_body_reaches_the_gateway_verbatim() = runTest {
         val session = FakeSession()
         // 与会话层同构:装配器的 emit 就是推给本会话正文观察者的那个回调。
-        val replyText = XiaozhiReplyText(emit = session::pushLlm)
+        val replyText = XiaozhiReplyText(emit = { outcome -> session.pushLlm(outcome.body) })
         val gw = XiaozhiGateway(session)
         var reply: ChatReply? = null
         val job = launch { reply = gw.chatMulti("明天天气怎么样") }
@@ -153,6 +156,31 @@ class XiaozhiGatewayTest {
 
         assertTrue("没有正文就不该产出气泡", reply!!.messages.isEmpty())
         assertTrue("原因必须可读", reply!!.error!!.contains("没有返回可上屏的正文"))
+        assertEquals("原因要能被状态卡读到", reply!!.error, gw.lastError)
+    }
+
+    /**
+     * 「没有可上屏正文」的可读原因必须带上会话层的结算说明([XiaozhiLlmSource.lastReplyDetail]):
+     * 写清是**哪一层为空** —— 真机排查就靠这句分辨「压根没收到文本」与「收到的全是表情/工具模板」。
+     */
+    @Test
+    fun no_body_reason_names_the_empty_layer() = runTest {
+        val session = FakeSession()
+        session.lastReplyDetail = "tts 句级文本 2 条(清洗后 0 字);llm.text 1 字(清洗后 0 字)"
+        val gw = XiaozhiGateway(session, replyTimeoutMs = 60_000)
+        var reply: ChatReply? = null
+        val job = launch { reply = gw.chatMulti("明天天气怎么样") }
+        runCurrent()
+        session.pushLlm("")
+        advanceUntilIdle()
+        job.join()
+
+        assertTrue("结论文案保持可读", reply!!.error!!.contains("没有返回可上屏的正文"))
+        assertTrue(
+            "必须写清哪一层为空",
+            reply!!.error!!.contains("tts 句级文本 2 条(清洗后 0 字)") &&
+                reply!!.error!!.contains("llm.text 1 字(清洗后 0 字)"),
+        )
         assertEquals("原因要能被状态卡读到", reply!!.error, gw.lastError)
     }
 

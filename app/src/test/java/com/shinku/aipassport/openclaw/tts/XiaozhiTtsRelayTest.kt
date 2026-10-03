@@ -18,19 +18,24 @@ import org.junit.Test
  *
  * 覆盖的契约:
  *  1. **触发点**:`{"type":"tts","state":"stop"}`(整段正文齐)之前/之后都不自动开播 —— 开播由
- *     **「正文已上屏」信号**([XiaozhiTtsRelay.onReplyTextDisplayed])触发,已缓冲的帧按到达顺序下发、
+ *     **「本轮正文已上屏」信号**([XiaozhiTtsRelay.onReplyTextDisplayed])触发,已缓冲的帧按到达顺序下发、
  *     `tts_start` 必在首帧前;
- *  2. **顺序**:正文上屏必须早于第一个音频帧(信号之前一个音频字节都不下发);
+ *  2. **顺序**:正文上屏必须早于第一个音频帧(信号之前一个音频字节都不下发),而且**只有「本轮正文」**
+ *     上屏才算信号 —— 识别原文(`'U'`)、同为 `'A'` 的提示/兜底文本、上一轮的迟到信号都不许抢跑;
  *  3. **窗口在 `stop` 之后保持打开**:迟到帧照常下发(一边播一边缓冲),SEQ 连续;
  *  4. **窗口收尾**:新一轮 `turn_start` / barge / 设备 `turn_cancel`(都走 [XiaozhiTtsRelay.onTurnStart])
  *     与设备回报本段播放结束([XiaozhiTtsRelay.onDevicePlaybackFinished])→ 丢弃剩余缓冲 + `tts_stop`;
+ *     另一条**不依赖设备回报**的确定收尾是「推空 + 静默达上限」([XiaozhiTtsRelay.onIdleTailStop],
+ *     由服务侧 [com.shinku.aipassport.openclaw.tts.XiaozhiTailStop] 判定)—— 幂等,且不关窗口
+ *     (迟到帧仍会续一段,不切尾音);
  *  5. **一轮开始/打断清空缓冲**:上一轮的残帧绝不进下一轮;
- *  6. **缓冲上限**:正文上屏之前超限时「先推已收 + 之后即时下发」,不丢整段;
+ *  6. **缓冲上限**:正文上屏之前超限时**丢最旧的一帧**(内存有界),绝不为保音频而提前开播 ——
+ *     降级不许抢跑(作者要求「降级时宁可稍晚也别抢跑」);
  *  7. **帧头**:`[SEQ][rate_khz][frame_ms] + opus`,rate/frame 用小智 hello 自报的 24 kHz/60 ms,
  *     SEQ 每帧 +1、到 256 回绕;opus 包原样透传(不解码/不重编码);非法帧丢弃;
  *  8. **设备朗读关掉就不下发音频**(直通门),小智模式**不回退**本地合成;
- *  9. **服务端只推二进制音频、一条 `tts` JSON 都没有时,首帧兜底开段并即时下发**
- *     (这种服务端没有「整段正文齐」的信号,缓冲等待会让整段音频永远发不出去)。
+ *  9. **服务端只推二进制音频、一条 `tts` JSON 都没有时**,帧不按窗口丢弃,但**仍然**等
+ *     「正文已上屏」信号才下发(否则声音会跑到文字前面)。
  */
 class XiaozhiTtsRelayTest {
 
@@ -78,13 +83,18 @@ class XiaozhiTtsRelayTest {
     ) = XiaozhiTtsRelay(gate = gate, downlink = downlink, maxBufferFrames = maxBufferFrames)
 
     /**
-     * 走完「正文上屏」这一步:真实实现是服务侧 `sendTextFrame('A')` 把分片写进 BLE 串行写队列**之后**
-     * 调 [XiaozhiTtsRelay.onReplyTextDisplayed](见 `VoiceBridgeService.notifyXiaozhiReplyOnScreen`)。
-     * 单测里直接调它,并在需要顺序断言时往下发通路的 events 里插一条 `screen` 标记。
+     * 走完「本轮正文上屏」这一步:真实实现是服务侧 `sendTextFrame('A', 正文)` 把分片写进 BLE 串行写队列
+     * **之后**调 [XiaozhiTtsRelay.onReplyTextDisplayed](见 `VoiceBridgeService.notifyXiaozhiReplyOnScreen`),
+     * 而本轮正文则由会话层先经 [XiaozhiTtsRelay.onReplyBody] 告知。单测里两个调用都走一遍,
+     * 并在需要顺序断言时往下发通路的 events 里插一条 `screen` 标记。
+     *
+     * @param body 本轮正文(默认「正文」);必须与 [XiaozhiReplyText] 交出的那个字符串一致,
+     *   否则会被直通侧按「这条 `'A'` 不是本轮正文」拒掉(见下方的抢跑用例)。
      */
-    private fun FakeDownlink.replyOnScreen(relay: XiaozhiTtsRelay) {
+    private fun FakeDownlink.replyOnScreen(relay: XiaozhiTtsRelay, body: String = "正文") {
+        relay.onReplyBody(body)
         events.add("screen")
-        relay.onReplyTextDisplayed()
+        relay.onReplyTextDisplayed(XiaozhiScreenSignal.REPLY_ROLE, body)
     }
 
     // ---- ① 开播时机与顺序(本次返工的核心) ----
@@ -133,15 +143,21 @@ class XiaozhiTtsRelayTest {
 
     /**
      * 验收点 ②(**顺序断言**):同一条交错事件流同时喂正文装配器([XiaozhiReplyText],会话层的喂法)
-     * 与直通 relay —— 整段正文只在 `stop` 时上屏一次,而**第一个音频帧必须晚于正文上屏**。
+     * 与直通 relay —— 整段正文只在 `stop` 时上屏一次,而**第一个音频帧必须晚于正文上屏**;
+     * 而且上屏信号拿的就是装配器交出的**那串文本**(与真实链路的转手一致)。
      */
     @Test
     fun reply_text_is_on_screen_before_the_first_audio_frame() {
         val emitted = ArrayList<String>()
         val link = FakeDownlink()
         val r = relay(link)
-        // 正文装配器把「上屏」记进同一条时间线(真实实现里这之后才会走 sendTextFrame 并信号 relay)
-        val reply = XiaozhiReplyText(emit = { body -> link.events.add("text"); emitted += body })
+        // 正文装配器把「本轮正文」与「上屏」都记进同一条时间线:真实实现里,会话层先调 relay.onReplyBody,
+        // 然后流水线把同一串文本写成 TEXT('A')(写完才信号 relay)。
+        val reply = XiaozhiReplyText(emit = { outcome ->
+            link.events.add("text")
+            emitted += outcome.body
+            r.onReplyBody(outcome.body)
+        })
         reply.onTurnStart()
         r.onTurnStart()
         val onState: (String, String) -> Unit = { state, text ->
@@ -164,8 +180,9 @@ class XiaozhiTtsRelayTest {
         assertEquals("整段正文只在 stop 时一次性上屏", listOf("今天晴，二十度。记得带伞。"), emitted)
         assertEquals("stop 时只有正文上屏,还没有任何音频事件", listOf("text"), link.events)
 
-        // 服务侧在 TEXT('A') 分片已写进 BLE 串行写队列之后发这个信号(见 VoiceBridgeService)
-        link.replyOnScreen(r)
+        // 服务侧在 TEXT('A') 分片已写进 BLE 串行写队列之后发这个信号(文本就是刚上屏的那串正文)
+        link.events.add("screen")
+        r.onReplyTextDisplayed(XiaozhiScreenSignal.REPLY_ROLE, emitted.last())
 
         assertEquals(
             "时间线:正文上屏 → 开播 → 首帧",
@@ -231,20 +248,25 @@ class XiaozhiTtsRelayTest {
 
     /**
      * 正文可能比 `stop` 早结算(空闲兜底窗口 / 纯 `llm` 兜底):信号先到、`stop` 后到 ——
-     * 这种情况下 `stop` 一到就开播,绝不能等一个不会再来的信号(否则本段音频永远留在缓冲里)。
+     * 信号一到就开播(作者要求:文字上屏后**立刻**开始播放,不等 `stop`、也不等整段音频),`stop`
+     * 到达只是继续把窗口开着。
      */
     @Test
-    fun text_on_screen_before_stop_starts_playback_at_stop() {
+    fun text_on_screen_starts_playback_immediately_even_before_stop() {
         val link = FakeDownlink()
         val r = relay(link)
 
         r.onTtsState("sentence_start", "你好")
         r.onTtsAudio(opus(1), 24, 60)
         link.replyOnScreen(r)
-        assertTrue("还没有 stop(整段正文没齐):不上屏就开播是不对的", link.events == listOf("screen"))
+        assertEquals("上屏信号一到就开播,不再等 stop", listOf("screen", "start", "frame"), link.events)
 
         r.onTtsState("stop", "")
-        assertEquals("stop 到达即开播,不再等信号", listOf("screen", "start", "frame"), link.events)
+        assertEquals("stop 到达不改节奏(窗口仍开)", listOf("screen", "start", "frame"), link.events)
+
+        r.onTtsAudio(opus(2), 24, 60)
+        assertEquals(listOf("screen", "start", "frame", "frame"), link.events)
+        assertEquals(listOf(0, 1), link.seqs())
     }
 
     /** 同一轮里第二个 `stop` 不能把后续帧重新「武装」成等待信号(否则迟到帧会被永远缓冲)。 */
@@ -397,16 +419,14 @@ class XiaozhiTtsRelayTest {
         assertEquals("新一轮的音频不能被旧回报清掉", listOf("screen", "start", "frame"), link.events)
     }
 
-    // ---- ⑥ 缓冲上限 ----
+    // ---- ⑥ 缓冲上限(降级不许抢跑) ----
 
     /**
-     * 验收点 ⑥:正文上屏之前缓冲到上限时**先推已收(此时才开段)+ 之后改为即时下发**,
-     * 而不是丢整段;帧序与 SEQ 都不能乱,窗口仍由收尾条件关闭。
-     *
-     * 注意这是**退化路径**:它不再等「正文已上屏」信号(宁可牺牲一次「文字先于声音」也不丢音频)。
+     * 验收点 ⑥:正文上屏之前缓冲到上限时**丢最旧的一帧**(内存有界),并继续等「正文已上屏」信号 ——
+     * **绝不**为了保住音频而提前开播:文字必须早于声音,降级时宁可稍晚。
      */
     @Test
-    fun buffer_overflow_flushes_received_frames_then_keeps_streaming() {
+    fun buffer_overflow_drops_the_oldest_frame_but_never_starts_before_the_screen_signal() {
         val link = FakeDownlink()
         val r = relay(link, maxBufferFrames = 3)
 
@@ -416,35 +436,34 @@ class XiaozhiTtsRelayTest {
         assertTrue("没到上限就还在缓冲", link.events.isEmpty())
 
         r.onTtsAudio(opus(3), 24, 60)
-        assertEquals(
-            "到上限:开段并推出已收的 3 帧(不丢整段)",
-            listOf("start", "frame", "frame", "frame"),
-            link.events,
-        )
-
         r.onTtsAudio(opus(4), 24, 60)
         r.onTtsAudio(opus(5), 24, 60)
+        assertTrue("超限也只丢最旧的一帧,一个字节都不抢跑", link.events.isEmpty())
+
+        // 上屏信号之后:把仍在缓冲的帧(最旧的 1/2 已被丢)按到达顺序推出。
+        r.onTtsState("stop", "")
+        assertTrue("stop 不开播", link.events.isEmpty())
+        link.replyOnScreen(r)
         assertEquals(
-            "之后改为即时下发(顺序不变)",
-            listOf("start", "frame", "frame", "frame", "frame", "frame"),
+            "开播后才下发",
+            listOf("screen", "start", "frame", "frame", "frame"),
             link.events,
         )
-
-        r.onTtsState("stop", "")
-        link.replyOnScreen(r)
-        assertEquals("已经在即时下发:stop/上屏信号不改动节奏", 5, link.events.count { it == "frame" })
-        assertEquals("仍然没有 tts_stop", 0, link.events.count { it == "stop" })
-
-        r.onTurnStart()
-        assertEquals("start", link.events.first())
-        assertEquals("stop", link.events.last())
-        assertEquals(1, link.events.count { it == "start" })
-        assertEquals(1, link.events.count { it == "stop" })
-        assertEquals("不丢帧、SEQ 连续", listOf(0, 1, 2, 3, 4), link.seqs())
         assertEquals(
-            listOf(1, 2, 3, 4, 5).map { opus(it).toList() },
+            "丢的是最旧的帧,剩下的按到达顺序(SEQ 从 0 起递增)",
+            listOf(opus(3).toList(), opus(4).toList(), opus(5).toList()),
             link.opusBodies(),
         )
+        assertEquals(listOf(0, 1, 2), link.seqs())
+
+        r.onTurnStart()
+        assertEquals(
+            "窗口收尾:已开段要 tts_stop",
+            listOf("screen", "start", "frame", "frame", "frame", "stop"),
+            link.events,
+        )
+        assertEquals(1, link.events.count { it == "start" })
+        assertEquals(1, link.events.count { it == "stop" })
     }
 
     // ---- ⑧ 直通门 ----
@@ -511,30 +530,29 @@ class XiaozhiTtsRelayTest {
     }
 
     /**
-     * 已开段(缓冲超限降级后才关的开关)的一段仍要在窗口收尾时 `tts_stop`,否则设备停在播放态;
+     * 已开段(上屏信号之后才关的开关)的一段仍要在窗口收尾时 `tts_stop`,否则设备停在播放态;
      * 但**不再补推**未发的帧。
      */
     @Test
-    fun gate_closed_after_degraded_start_still_sends_tts_stop_on_window_close() {
+    fun gate_closed_after_segment_started_still_sends_tts_stop_on_window_close() {
         val link = FakeDownlink()
         var on = true
-        val r = relay(link, maxBufferFrames = 2) { openGate(ttsEnabled = on) }
+        val r = relay(link) { openGate(ttsEnabled = on) }
 
         r.onTtsState("sentence_start", "长回复")
         r.onTtsAudio(opus(1), 24, 60)
-        r.onTtsAudio(opus(2), 24, 60)   // 到上限 → 已开段并推了 2 帧
-        assertEquals(listOf("start", "frame", "frame"), link.events)
-
-        on = false
-        r.onTtsAudio(opus(3), 24, 60)   // 关掉后不再推
         r.onTtsState("stop", "")
         link.replyOnScreen(r)
-        assertEquals("已开段不能补推未发的帧", listOf("start", "frame", "frame", "screen"), link.events)
+        assertEquals("信号到、开关还开着 → 开段并推已缓冲的帧", listOf("screen", "start", "frame"), link.events)
+
+        on = false
+        r.onTtsAudio(opus(2), 24, 60)   // 关掉后不再推
+        assertEquals("关掉后不得补推未发的帧", listOf("screen", "start", "frame"), link.events)
 
         r.onTurnStart()
         assertEquals(
             "窗口收尾:已开段必须 tts_stop",
-            listOf("start", "frame", "frame", "screen", "stop"),
+            listOf("screen", "start", "frame", "stop"),
             link.events,
         )
     }
@@ -699,16 +717,17 @@ class XiaozhiTtsRelayTest {
         assertEquals("窗口仍开:末帧不是 tts_stop", "frame", link.events.last())
     }
 
-    // ---- 只推音频、没有状态报文的服务端(既有兜底,不能改成缓冲) ----
+    // ---- 只推音频、没有状态报文的服务端(不按窗口丢弃,但也不抢跑) ----
 
     /**
-     * 真机 bug 的回归测试:服务端只推二进制音频、一条 `tts` JSON 都没有时,**首帧必须兜底开段**。
+     * 服务端只推二进制音频、一条 `tts` JSON 都没有时,帧**不按窗口丢弃**,但**仍然**只在
+     * 「正文已上屏」信号之后才下发 —— 顺序优先于及时(作者要求:文字先于声音)。
      *
-     * 这种服务端没有「整段正文齐(`stop`)」的信号:缓冲等待会让整段音频永远发不出去,
-     * 所以这里保持既有的即时下发(缓冲策略的例外,理由见 [XiaozhiTtsRelay] 类注释)。
+     * 为什么不能像上一版那样「首帧即开段、即时下发」:那条兜底会让声音跑到文字前面。信号本身是
+     * 会来的 —— 正文装配器的空闲兜底窗口 / `llm` 兜底都会走 `sendText('A')`。
      */
     @Test
-    fun audio_without_any_tts_state_report_opens_segment_and_pushes() {
+    fun audio_without_any_tts_state_report_waits_for_the_screen_signal() {
         val link = FakeDownlink()
         val r = relay(link)
 
@@ -716,19 +735,224 @@ class XiaozhiTtsRelayTest {
         r.onTtsAudio(opus(1), 24, 60)
         r.onTtsAudio(opus(2), 24, 60)
         r.onTtsAudio(opus(3), 24, 60)
+        assertTrue("信号之前一个字节都不下发", link.events.isEmpty())
 
-        assertEquals("首帧就要补上 tts_start(bracket 不能缺)", listOf("start", "frame", "frame", "frame"), link.events)
+        link.replyOnScreen(r)
+        assertEquals(
+            "上屏信号一到就补上 tts_start 并按到达顺序推帧",
+            listOf("screen", "start", "frame", "frame", "frame"),
+            link.events,
+        )
         assertEquals("一段只发一次 tts_start", 1, link.events.count { it == "start" })
         assertEquals(24, decodeTtsOpusPayload(link.frames.first())!!.rateKhz)
         assertEquals(60, decodeTtsOpusPayload(link.frames.first())!!.frameMs)
+        assertEquals(listOf(0, 1, 2), link.seqs())
 
-        // 跨轮同样成立:下一轮即使上一轮的 stop 没来,音频也要继续走到设备(并重新 bracket)
+        // 上一轮的 stop 没来时,新一轮的帧同样要等「正文已上屏」信号才下发(并重新 bracket)
         r.onTurnStart()
         r.onTtsAudio(opus(4), 24, 60)
+        r.onTtsAudio(opus(5), 24, 60)
+        assertEquals(listOf("screen", "start", "frame", "frame", "frame", "stop"), link.events)
+        link.replyOnScreen(r)
         assertEquals(
-            listOf("start", "frame", "frame", "frame", "stop", "start", "frame"),
+            listOf(
+                "screen", "start", "frame", "frame", "frame", "stop",
+                "screen", "start", "frame", "frame",
+            ),
             link.events,
         )
-        assertEquals(4, link.frames.size)
+        assertEquals(5, link.frames.size)
+    }
+
+    // ---- ⓬ 抢跑路径逐个封死(2026-10-05 真机修正) ----
+
+    /**
+     * 开播判定是**纯函数**([XiaozhiScreenSignal]):只有「角色 = `'A'` 且文本 = 本轮正文」才算信号。
+     *
+     * 这一层把服务侧所有 `sendTextFrame` 调用点一次盖全:
+     *  - `'U'`(识别原文)、`'R'`(系统提示)不是回复;
+     *  - 同为 `'A'` 的版本提示、「无语音」、网关超时/失败原因、空回复兜底都不是本轮正文;
+     *  - 本轮正文还没装配好/本轮正文为空 → 一律不算;
+     *  - 两侧首尾空白允许(网关会 trim),但正文内容必须逐字一致。
+     */
+    @Test
+    fun screen_signal_predicate_only_accepts_the_current_turn_reply_body() {
+        assertTrue(XiaozhiScreenSignal.accepts('A', "明天小雨。", "明天小雨。"))
+        assertTrue("两侧空白不影响(网关/装配器会 trim)", XiaozhiScreenSignal.accepts('A', " 明天小雨。 ", "明天小雨。"))
+
+        assertFalse("role='U'(识别原文)不是回复", XiaozhiScreenSignal.accepts('U', "明天小雨。", "明天小雨。"))
+        assertFalse("role='R'(系统提示)不是回复", XiaozhiScreenSignal.accepts('R', "明天小雨。", "明天小雨。"))
+        assertFalse(
+            "同为 'A' 的超时/失败原因/版本提示都不算",
+            XiaozhiScreenSignal.accepts('A', "小智没有返回回复(等待 30 秒超时)", "明天小雨。"),
+        )
+        assertFalse("本轮正文还没装配好 → 不算", XiaozhiScreenSignal.accepts('A', "明天小雨。", null))
+        assertFalse(
+            "本轮正文为空(只有表情/模板) → 任何 'A' 都不算",
+            XiaozhiScreenSignal.accepts('A', "小智这一轮没有返回可上屏的正文", ""),
+        )
+        assertFalse(
+            "本轮正文为空时连空文本也不算",
+            XiaozhiScreenSignal.accepts('A', "", "  "),
+        )
+    }
+
+    /**
+     * 抢跑路径之一:**非回复文本上屏**不得开播 —— 包括 `'U'` 识别原文、同为 `'A'` 的版本提示/
+     * 「无语音」/超时与失败原因/空回复兜底。帧继续缓冲,直到真正文上屏。
+     */
+    @Test
+    fun non_reply_texts_on_screen_never_open_the_gate() {
+        val link = FakeDownlink()
+        val r = relay(link)
+
+        r.onReplyBody("明天上海是小雨喔，白天23度。")
+        r.onTtsState("sentence_start", "明天上海是小雨喔，白天23度。")
+        r.onTtsAudio(opus(1), 24, 60)
+        r.onTtsState("stop", "")
+
+        // ① role='U' 识别原文(与本轮回复音频无关)
+        r.onReplyTextDisplayed('U', "明天上海天气")
+        // ② role='R' 系统提示
+        r.onReplyTextDisplayed('R', "明天上海是小雨喔，白天23度。")
+        // ③ 同为 role='A',但不是本轮正文:版本提示 / 「无语音」/ 超时与失败原因 / 空回复兜底
+        r.onReplyTextDisplayed('A', "版本提示:固件与 App 版本不一致")
+        r.onReplyTextDisplayed('A', "无语音")
+        r.onReplyTextDisplayed('A', "小智没有返回回复(等待 30 秒超时)")
+        r.onReplyTextDisplayed('A', "小智这一轮没有返回可上屏的正文(只有表情/空文本或工具模板)")
+        r.onReplyTextDisplayed('A', "(网关空回复)")
+        assertTrue("这些文本上屏都不许把音频放出来(声音不能跑到文字前面)", link.events.isEmpty())
+
+        // ④ 真正文上屏 → 这时才开播
+        val accepted = r.onReplyTextDisplayed('A', "明天上海是小雨喔，白天23度。")
+        assertTrue("本轮正文上屏必须被接受", accepted)
+        assertEquals(listOf("start", "frame"), link.events)
+    }
+
+    /** 本轮正文为空(只有表情/模板):任何 `'A'` 都不开播 —— 没有文字就没有「文字先于声音」可言。 */
+    @Test
+    fun empty_turn_body_keeps_the_gate_shut() {
+        val link = FakeDownlink()
+        val r = relay(link)
+        r.onReplyBody("")
+        r.onTtsState("sentence_start", "😊")
+        r.onTtsAudio(opus(1), 24, 60)
+        r.onTtsState("stop", "")
+
+        assertFalse(r.onReplyTextDisplayed('A', ""))
+        assertFalse(r.onReplyTextDisplayed('A', "小智这一轮没有返回可上屏的正文"))
+        assertTrue("本轮没有可上屏正文 → 一个音频字节也不下发", link.events.isEmpty())
+    }
+
+    /**
+     * 抢跑路径之二:**上一轮的迟到信号**。
+     *
+     * `turn_start` 清掉本轮正文记录后,旧轮那条 `TEXT('A')`(B3 已在写队列里、晚一步才通知)既使文本
+     * 完全正确也不得打开新一轮的闸门 —— 否则新一轮的第一帧会抢在新一轮正文之前出声。
+     */
+    @Test
+    fun late_screen_signal_from_the_previous_turn_cannot_open_the_new_turn() {
+        val link = FakeDownlink()
+        val r = relay(link)
+
+        // 上一轮:已开播
+        r.onReplyBody("旧轮正文")
+        r.onTtsState("sentence_start", "旧轮正文")
+        r.onTtsAudio(opus(0x11), 24, 60)
+        link.replyOnScreen(r, "旧轮正文")
+        assertEquals(listOf("screen", "start", "frame"), link.events)
+
+        // 新一轮(流水线 turn_start:abort + relay.onTurnStart):旧轮的播放窗口收尾,旧轮残帧丢弃
+        r.onTurnStart()
+        assertEquals(listOf("screen", "start", "frame", "stop"), link.events)
+
+        // 新一轮的帧先到:仍要等新一轮正文的上屏信号
+        r.onTtsState("sentence_start", "新轮正文")
+        r.onTtsAudio(opus(0x21), 24, 60)
+
+        // 旧轮的迟到信号(文本还是旧轮的):必须被拒
+        assertFalse(
+            "旧轮的迟到信号不得打开新一轮的闸门",
+            r.onReplyTextDisplayed('A', "旧轮正文"),
+        )
+        assertEquals("仍然只在缓冲里", listOf("screen", "start", "frame", "stop"), link.events)
+
+        // 新一轮的正文上屏(会话层先告知本轮正文,服务侧再把同一串文本写进队列并发信号)
+        r.onReplyBody("新轮正文")
+        assertTrue(r.onReplyTextDisplayed('A', "新轮正文"))
+        assertEquals(
+            listOf("screen", "start", "frame", "stop", "start", "frame"),
+            link.events,
+        )
+        assertEquals(listOf(opus(0x11).toList(), opus(0x21).toList()), link.opusBodies())
+    }
+
+    // ---- ⓭ 确定收尾:推空 + 静默达上限(不依赖设备回报) ----
+
+    /**
+     * [XiaozhiTailStop] 的纯判定:没推过帧不收尾、未到阈值不收尾、到阈值才收、已收过不重收。
+     * 这三个条件就是「不能因收尾太早把还在排队的音频切掉」与「幂等」的静态保证。
+     */
+    @Test
+    fun tail_stop_predicate_requires_frames_and_idle_and_not_already_stopped() {
+        assertFalse("从没推过帧(本段没开播) → 不需要 tts_stop", XiaozhiTailStop.shouldStop(0, 60_000L, false))
+        assertFalse(
+            "推过帧但静默未到上限 → 还在等可能的后继帧",
+            XiaozhiTailStop.shouldStop(30, XiaozhiTailStop.TAIL_IDLE_MS - 1, false),
+        )
+        assertFalse(
+            "已经收过尾 → 不重发(幂等)",
+            XiaozhiTailStop.shouldStop(30, XiaozhiTailStop.TAIL_IDLE_MS, true),
+        )
+        assertTrue(XiaozhiTailStop.shouldStop(1, XiaozhiTailStop.TAIL_IDLE_MS, false))
+        assertTrue(XiaozhiTailStop.shouldStop(300, XiaozhiTailStop.TAIL_IDLE_MS * 3, false))
+    }
+
+    /**
+     * 「推空 + 静默」的主动收尾([XiaozhiTtsRelay.onIdleTailStop]):
+     * 已开段 → `tts_stop`(设备回到空闲);幂等;**不关窗口** —— 迟到帧仍会续一段(不切尾音)。
+     */
+    @Test
+    fun idle_tail_stop_closes_the_play_state_but_keeps_late_frames_flowing() {
+        val link = FakeDownlink()
+        val r = relay(link)
+
+        r.onReplyBody("正文")
+        r.onTtsState("sentence_start", "正文")
+        r.onTtsAudio(opus(1), 24, 60)
+        r.onTtsAudio(opus(2), 24, 60)
+        r.onTtsState("stop", "")
+        link.replyOnScreen(r)
+        assertEquals(listOf("screen", "start", "frame", "frame"), link.events)
+
+        r.onIdleTailStop(2)
+        assertEquals(
+            "本段推空且静默:主动收尾(设备不能一直停在「接收中」)",
+            listOf("screen", "start", "frame", "frame", "stop"),
+            link.events,
+        )
+
+        // 幂等:再叫一次不产生第二条 tts_stop(此时本段已收尾)
+        r.onIdleTailStop(2)
+        assertEquals(5, link.events.size)
+
+        // 迟到帧:**不关窗口**,所以要续一段(重新 tts_start)而不是丢弃尾音
+        r.onTtsAudio(opus(3), 24, 60)
+        assertEquals(
+            listOf("screen", "start", "frame", "frame", "stop", "start", "frame"),
+            link.events,
+        )
+        assertEquals(listOf(0, 1, 2), link.seqs())
+    }
+
+    /** 本段从未开过段(没推过任何帧)时,主动收尾不产生任何下发(设备未进入播放态,无需 tts_stop)。 */
+    @Test
+    fun idle_tail_stop_is_a_noop_when_no_segment_started() {
+        val link = FakeDownlink()
+        val r = relay(link)
+        r.onReplyBody("正文")
+        r.onTtsState("sentence_start", "正文")
+        r.onIdleTailStop(0)
+        assertTrue(link.events.isEmpty())
     }
 }

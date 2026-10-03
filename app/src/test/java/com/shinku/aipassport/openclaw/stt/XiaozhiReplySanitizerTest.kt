@@ -122,4 +122,92 @@ class XiaozhiReplySanitizerTest {
         assertEquals("", XiaozhiReplySanitizer.clean(""))
         assertEquals("", XiaozhiReplySanitizer.clean("   \n\t "))
     }
+
+    // ---- 真机那几轮的实际字形串(2026-10-05 回归:清洗不能把正文吃光) ----
+
+    /**
+     * 真机样本 ①:tts 句级拼接里**混着**工具模板行与正文 —— 模板剔掉,正文**一个字都不能少**。
+     *
+     * 这是「只要有非空、清洗后含文字的 tts 句级文本就必须上屏」的直接回归:不能让清洗把整段吃成空串,
+     * 否则设备屏就会变成「小智这一轮没有返回可上屏的正文」那一句可读原因。
+     */
+    @Test
+    fun real_device_mixed_template_and_prose_keeps_the_prose() {
+        // llm.text 里的形态(真机日志):工具模板 + emoji → 清洗后只剩 emoji,而 emoji **不可上屏**
+        val llmCleaned = XiaozhiReplySanitizer.clean("% get_weather(location=\"上海\", date=\"明天\")😊")
+        assertEquals("😊", llmCleaned)
+        assertFalse("只剩表情 → 不可上屏", XiaozhiReplySanitizer.isDisplayable(llmCleaned))
+
+        // tts 句级拼接的形态:模板行 + 真答案(模板、emoji 都不影响正文)
+        val ttsConcat = "% get_weather(location=\"上海\", date=\"明天\")\n明天上海是小雨喔，白天23度😊"
+        val cleaned = XiaozhiReplySanitizer.clean(ttsConcat)
+        assertEquals("明天上海是小雨喔，白天23度😊", cleaned)
+        assertTrue("正文必须还在", cleaned.contains("明天上海是小雨喔"))
+        assertTrue("含文字就算可上屏", XiaozhiReplySanitizer.isDisplayable(cleaned))
+
+        // 句级拼接:工具调用做成了一句、真答案一句 —— 剔掉模板后仍是完整的两句正文
+        val sentences = "% get_weather{\"city\":\"上海\"}" +
+            "明天上海是小雨喔，白天23度。" +
+            "出门记得带伞哦。"
+        assertEquals(
+            "明天上海是小雨喔，白天23度。出门记得带伞哦。",
+            XiaozhiReplySanitizer.clean(sentences),
+        )
+    }
+
+    /** 工具的**嵌套参数** / 行首无参数的裸模板 / `<tool_call>` 同现时,正文同样保留。 */
+    @Test
+    fun nested_arguments_bare_template_and_tool_block_leave_the_prose_intact() {
+        // 参数值里有括号(地名):必须整块删掉,不能把正文与括号一起留下
+        assertEquals(
+            "上海浦东明天小雨。",
+            XiaozhiReplySanitizer.clean("上海浦东明天小雨。% get_weather(location=\"浦东(上海)\")"),
+        )
+        // 行首裸模板 + 同一行的正文:只删 token
+        assertEquals(
+            "明天小雨，白天23度。",
+            XiaozhiReplySanitizer.clean("% get_weather 明天小雨，白天23度。"),
+        )
+        // 成对工具块 + 跨行的正文
+        assertEquals(
+            "明天上海小雨。",
+            XiaozhiReplySanitizer.clean(
+                "<tool_call>{\"name\":\"get_weather\",\"args\":{\"city\":\"上海\"}}</tool_call>\n明天上海小雨。",
+            ),
+        )
+    }
+
+    /**
+     * 「可上屏」判定([XiaozhiReplySanitizer.isDisplayable]):至少一个字母/数字。
+     *
+     * 为什么不能只看「清洗后非空」:emoji 不会被清洗删掉,而把 emoji 当正文上屏正是真机那个
+     * 「设备屏上一个方块」的 bug;反过来纯标点/空白也不算正文。
+     */
+    @Test
+    fun displayable_requires_at_least_one_letter_or_digit() {
+        assertTrue(XiaozhiReplySanitizer.isDisplayable("明天小雨"))
+        assertTrue(XiaozhiReplySanitizer.isDisplayable("OK"))
+        assertTrue(XiaozhiReplySanitizer.isDisplayable("23 度"))
+        assertTrue(XiaozhiReplySanitizer.isDisplayable("😊 好"))
+        assertFalse("纯 emoji 不是正文", XiaozhiReplySanitizer.isDisplayable("😊"))
+        assertFalse(XiaozhiReplySanitizer.isDisplayable("😊🎉"))
+        assertFalse(XiaozhiReplySanitizer.isDisplayable("!?。，"))
+        assertFalse(XiaozhiReplySanitizer.isDisplayable("   "))
+        assertFalse(XiaozhiReplySanitizer.isDisplayable(""))
+    }
+
+    /** 反面：清洗的每条规则都不得误伤正常中文/英文/数字/标点(真机正文的常见形态)。 */
+    @Test
+    fun realistic_prose_survives_every_rule() {
+        val cases = listOf(
+            "明天上海是小雨喔，白天23度，晚上18度左右。",
+            "湿度 50%，降水概率 100%，出门带伞。",
+            "今天 100% 的用户都能听懂。",
+            "价格为 12 元(含税)，退换请在 7 天内办理。",
+            "OK！就这么定了——明天见。",
+        )
+        cases.forEach { body ->
+            assertEquals("正常正文必须原样保留: $body", body, XiaozhiReplySanitizer.clean(body))
+        }
+    }
 }

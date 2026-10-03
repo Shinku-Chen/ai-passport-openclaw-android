@@ -112,4 +112,135 @@ class TtsFlowControlTest {
         assertTrue(TtsFlowControl.MAX_INFLIGHT_FRAMES * TtsFlowControl.FRAME_MS <=
             TtsFlowControl.TARGET_LEAD_MS / 2)
     }
+
+    // ---- 小智直通的推送节奏:开播预充 + 与领先量无关的帧间下限([pushWaitMs])----
+
+    /**
+     * 参数取值本身要站得住:预充是「几帧量级」且不会顶到硬上限;帧间下限比实时(60ms)快,
+     * 又允许落后于实测吞吐(≈54ms/帧)时它不成为新瓶颈。
+     */
+    @Test
+    fun precharge_and_realtime_floor_parameters_stay_in_the_safe_range() {
+        // 预充几帧、且远不到目标领先量 / 硬上限
+        assertTrue(TtsFlowControl.PRECHARGE_FRAMES in 3..10)
+        assertTrue(TtsFlowControl.PRECHARGE_FRAMES * TtsFlowControl.FRAME_MS < TtsFlowControl.TARGET_LEAD_MS)
+        assertTrue(TtsFlowControl.PRECHARGE_FRAMES * TtsFlowControl.FRAME_MS < 24 * TtsFlowControl.FRAME_MS)
+        // 帧间下限在用户给定的 50–55ms 区间内、且比实时(60ms)快
+        assertTrue(TtsFlowControl.MIN_SEND_INTERVAL_MS in 50L..55L)
+        assertTrue(TtsFlowControl.MIN_SEND_INTERVAL_MS < TtsFlowControl.FRAME_MS)
+        // 且不能慢于实测吞吐(≈54ms/帧),否则它会变成段落中段的新瓶颈
+        assertTrue(TtsFlowControl.MIN_SEND_INTERVAL_MS <= 54L)
+        // 在途积压有界等待必须短于写回调超时(2s),否则超时先触发、上限没意义
+        assertTrue(TtsFlowControl.MAX_INFLIGHT_WAIT_MS <= 2_000L)
+    }
+
+    /** 预充:前 [PRECHARGE_FRAMES] 帧不受帧间下限约束(开播瞬时一口气推给设备垫底)。 */
+    @Test
+    fun precharge_frames_bypass_the_realtime_floor() {
+        // 快链路(一帧一次 ATT 写、往返只要 5ms):预充阶段一个等待都不要
+        for (sent in 0 until TtsFlowControl.PRECHARGE_FRAMES) {
+            assertEquals(
+                "预充第 $sent 帧不应因帧间下限等待",
+                0L,
+                TtsFlowControl.pushWaitMs(sent, sent * 5L),
+            )
+        }
+        // 预充之后的下一帧就必须按帧间下限等
+        val sent = TtsFlowControl.PRECHARGE_FRAMES
+        val elapsed = sent * 5L
+        assertEquals(
+            sent * TtsFlowControl.MIN_SEND_INTERVAL_MS - elapsed,
+            TtsFlowControl.pushWaitMs(sent, elapsed),
+        )
+    }
+
+    /** 实时下限与领先量无关:领先量还没到目标(甚至是负的)也要按帧间下限等。 */
+    @Test
+    fun realtime_floor_is_independent_of_the_lead() {
+        val sent = 30
+        val elapsed = 1_000L   // 领先 = 30×60 − 1000 = 800ms < 目标 1200ms → 领先量那条不等待
+        assertTrue(TtsFlowControl.leadMs(sent, elapsed) < TtsFlowControl.TARGET_LEAD_MS)
+        assertEquals(0L, TtsFlowControl.waitMs(sent, elapsed))
+        // 但 30 帧 × 50ms = 1500ms > 1000ms 已过时间 → 必须等 500ms
+        assertEquals(500L, TtsFlowControl.pushWaitMs(sent, elapsed))
+    }
+
+    /** 预充 + 帧间下限的端到端节奏:不超速、不欠载、领先量不破 2s 硬上限。 */
+    @Test
+    fun precharge_plus_realtime_floor_keeps_the_device_fed_without_flooding_it() {
+        // 快的链路:一帧一次 ATT 写只要 20ms(比实测的 ≈54ms 还快 —— 帧间下限会生效)
+        val fast = simulate(writeMsPerFrame = 20L, frames = 120)
+        assertEquals(
+            "预充之后不允许超速(每帧至少隔 ${TtsFlowControl.MIN_SEND_INTERVAL_MS}ms)",
+            0,
+            fast.rateViolations,
+        )
+        assertTrue("设备侧垫底音频出现了负数(会被记成欠载):${fast.minLeadMs}", fast.minLeadMs >= 0)
+        assertTrue("预充后垫底音频应持续增长:${fast.maxLeadMs}", fast.maxLeadMs >= TtsFlowControl.PRECHARGE_FRAMES * TtsFlowControl.FRAME_MS)
+        assertTrue("领先量不得超过 2s 硬上限:${fast.maxLeadMs}", fast.maxLeadMs <= TtsFlowControl.MAX_LEAD_MS)
+
+        // 实测慢链路(带响应写 ≈54ms/帧,比 50ms 的下限还慢):帧间下限不生效,靠预充 +
+        // 每帧 6ms 的余量继续垫底 —— 下限取 50ms(20 帧/秒)正是为了让它在慢链路上不成为新瓶颈
+        val measured = simulate(writeMsPerFrame = 54L, frames = 120)
+        assertTrue("实测链路也不允许欠载:${measured.minLeadMs}", measured.minLeadMs >= 0)
+        assertTrue("领先量不得超过 2s 硬上限:${measured.maxLeadMs}", measured.maxLeadMs <= TtsFlowControl.MAX_LEAD_MS)
+    }
+
+    /** 按帧循环模拟:每帧先按 [TtsFlowControl.pushWaitMs] 等,再花 [writeMsPerFrame] 交给 BLE。 */
+    private class Rhythm(
+        val minLeadMs: Long,
+        val maxLeadMs: Long,
+        val rateViolations: Int,
+    )
+
+    private fun simulate(writeMsPerFrame: Long, frames: Int): Rhythm {
+        var sent = 0
+        var elapsedMs = 0L
+        var minLead = Long.MAX_VALUE
+        var maxLead = Long.MIN_VALUE
+        var violations = 0
+        repeat(frames) {
+            elapsedMs += TtsFlowControl.pushWaitMs(sent, elapsedMs)
+            if (sent >= TtsFlowControl.PRECHARGE_FRAMES &&
+                elapsedMs < sent * TtsFlowControl.MIN_SEND_INTERVAL_MS
+            ) {
+                violations++
+            }
+            elapsedMs += writeMsPerFrame
+            sent++
+            val lead = TtsFlowControl.leadMs(sent, elapsedMs)
+            minLead = minOf(minLead, lead)
+            maxLead = maxOf(maxLead, lead)
+        }
+        return Rhythm(minLead, maxLead, violations)
+    }
+
+    // ---- 在途积压的有界等待([backlogWaitMs])----
+
+    @Test
+    fun backlog_wait_polls_while_in_flight_and_releases_when_caught_up() {
+        // 在途 15 帧 > 8 → 每次只等一个轮询间隔
+        assertEquals(TtsFlowControl.INFLIGHT_POLL_MS, TtsFlowControl.backlogWaitMs(20, 5, waitedMs = 0))
+        // 送达追上了 → 立刻放行
+        assertEquals(0L, TtsFlowControl.backlogWaitMs(20, 15, waitedMs = 0))
+        assertEquals(0L, TtsFlowControl.backlogWaitMs(8, 0, waitedMs = 0))
+    }
+
+    /** 有界等待:最长只等 [MAX_INFLIGHT_WAIT_MS],到点必须放行(否则链路半死时整段卡死)。 */
+    @Test
+    fun backlog_wait_is_bounded_and_then_releases() {
+        var waited = 0L
+        var polls = 0
+        while (true) {
+            val step = TtsFlowControl.backlogWaitMs(sentFrames = 20, deliveredFrames = 0, waitedMs = waited)
+            if (step <= 0L) break
+            waited += step
+            polls++
+            assertTrue("轮询必须有界", polls < 10_000)
+        }
+        assertEquals(TtsFlowControl.MAX_INFLIGHT_WAIT_MS, waited)
+        assertEquals(TtsFlowControl.MAX_INFLIGHT_WAIT_MS / TtsFlowControl.INFLIGHT_POLL_MS, polls.toLong())
+        // 到上限后即使还在途也放行(服务侧据此继续下发,并留一行警告日志)
+        assertEquals(0L, TtsFlowControl.backlogWaitMs(20, 0, waitedMs = TtsFlowControl.MAX_INFLIGHT_WAIT_MS))
+    }
 }

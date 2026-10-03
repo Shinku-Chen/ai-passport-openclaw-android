@@ -252,6 +252,26 @@ fun encodeTtsOpusPayload(seq: Int, rateKhz: Int, frameMs: Int, opus: ByteArray):
 }
 
 /**
+ * 把一帧 JSON 载荷裁剪到固件该类型的载荷上限 [VbFrame.JSON_PAYLOAD_MAX](512B,
+ * 对应固件 `oc_proto.h` 的 `OC_JSON_PAYLOAD_MAX`),裁剪点回退到 UTF-8 字符边界。
+ *
+ * 为什么必须裁:固件 `header_valid()` 把「LEN 超过该类型上限」的帧头当**错位字节**逐字节丢弃
+ * (既不计类型计数,也不计「废半截」),所以超长的 CONTROL/EVENT 会被静默丢掉 —— 还会连着吃掉
+ * 后面那一帧的帧头字节。控制帧本身很短,但 `gateway.detail` 这种携带错误文案的字段没有上限。
+ *
+ * 纯函数:超限时返回裁剪后的新数组,未超限时原样返回入参(不复制)。
+ */
+fun clampJsonPayload(bytes: ByteArray, maxBytes: Int = VbFrame.JSON_PAYLOAD_MAX): ByteArray {
+    require(maxBytes > 0) { "maxBytes must be > 0" }
+    if (bytes.size <= maxBytes) return bytes
+    // 回退到 UTF-8 字符边界:cut 落在续字节(10xxxxxx)上就往前退
+    var cut = maxBytes
+    while (cut > 0 && (bytes[cut].toInt() and 0xC0) == 0x80) cut--
+    if (cut == 0) cut = maxBytes   // 极端:整段都是续字节(非法 UTF-8),至少保证有进展
+    return bytes.copyOfRange(0, cut)
+}
+
+/**
  * 解析下行 TTS 载荷。[encodeTtsOpusPayload] 的逆操作。
  *
  * 长度不足(没有 Opus 包)或超出上限([VbFrame.TTS_HEADER_SIZE] + [VbFrame.TTS_OPUS_PAYLOAD_MAX])时返回 null:

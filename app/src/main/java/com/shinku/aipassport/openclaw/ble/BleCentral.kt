@@ -289,7 +289,10 @@ class BleCentral(
         }
 
         override fun onMtuChanged(g: BluetoothGatt, mtu: Int, status: Int) {
-            Log.i(tag, "MTU=$mtu status=$status")
+            // 记下**实际协商到**的 MTU:写分片长度按它动态取(见 [WriteChunking]),不再写死 240。
+            // 协商失败(非 SUCCESS)时不猜这个值 —— 置空 = 回退 [WriteChunking.FALLBACK_CHUNK]。
+            negotiatedMtu = if (status == BluetoothGatt.GATT_SUCCESS && mtu > 0) mtu else null
+            Log.i(tag, "MTU=$mtu status=$status → 单次 ATT 写片长=${WriteChunking.chunkSize(negotiatedMtu)}")
         }
 
         override fun onCharacteristicChanged(
@@ -421,8 +424,12 @@ class BleCentral(
         connectInFlight = false
     }
 
-    /** 单次 ATT 写安全片长(MTU256-3≈253,留余量用 240)。 */
-    private val WRITE_CHUNK = 240
+    /**
+     * 协商到的 ATT MTU(null = 还没协商到或协商失败)。
+     * 写分片长度由它算:`min(mtu − 3, 253)`,协商失败回退 240(见 [WriteChunking])。
+     */
+    @Volatile
+    private var negotiatedMtu: Int? = null
 
     /**
      * 单块写入等待 onCharacteristicWrite 回调的上限。
@@ -464,10 +471,16 @@ class BleCentral(
     fun deliveredFrameCount(): Long = deliveredFrames
 
     /**
-     * 批量写模式(下行朗读用):打开后用 `WRITE_NO_RESPONSE`,关闭时恢复带响应写。
+     * 批量写模式:**打开后用 `WRITE_NO_RESPONSE`,关闭时恢复带响应写**。
      *
-     * 真机实测:带响应写是串行的,一次连接事件只能推一个包 → 仅 11 帧/秒,
-     * 低于 16kHz/60ms 实时所需的 16.7 帧/秒 → 设备解码队列见底、声音一卡一卡。
+     * 只是「写类型选择」的开关,不能保证送达:2026-10 真机 A/B(同一手机 + 同一固件)表明
+     * **本机/本固件组合上无响应写会被静默丢弃** —— 下行音频帧走无响应写时,App 侧报「写入成功
+     * N 帧」而设备侧 `TTS` 计数恒为 0、`RX 缓冲满` 计数也为 0(不是 ring 溢出,是根本没到)。
+     * 因此小智直通已固定为带响应写(`VoiceBridgeService.drainXiaozhiTts`,不再打开这个开关);
+     * 本地合成那条路仍打开(**待真机复核:可能同样静默丢帧**)。
+     *
+     * 旧注释里「带响应写是串行的,一次连接事件只能推一个包 → 仅 11 帧/秒」已被实测推翻:
+     * 带响应写实测 207 帧 / 11.2s ≈ **18.5 帧/秒**,高于 16kHz/60ms 实时所需的 16.7 帧/秒。
      */
     @Volatile
     private var bulkWrite: Boolean = false
@@ -478,6 +491,16 @@ class BleCentral(
         bulkWrite = enabled
         Log.i(tag, "批量写模式: $enabled")
     }
+
+    /**
+     * 当前写模式(只读,仅用于日志取证):true = 音频帧用的无响应写(Write Command)。
+     *
+     * 为什么要给外面看:正文分片与音频帧同处一条串行写队列,若文字还没写出去就切到了无响应写,
+     * 那些**文本**帧也会走 Write Command —— 而 Write Command 不支持 Long Write 分片,
+     * 实际 MTU 不够时会被对端静默丢弃(真机可能出现「时间顺序对、但设备屏没有字」)。
+     * 这一行(与 `writeBytes 入队/逻辑帧完成` 两行)能把这种形态区分开。
+     */
+    fun isBulkWrite(): Boolean = bulkWrite
     private var currentWrite: ByteArray? = null
     private var currentOffset = 0
     private var writeInProgress = false
@@ -543,7 +566,9 @@ class BleCentral(
             return
         }
 
-        val end = minOf(currentOffset + WRITE_CHUNK, frame.size)
+        // 片长按协商到的 MTU 动态取(协商失败回退 240):小帧因此可能一次 ATT 写就发完。
+        // 每片都重新取值:帧跨片写入期间 MTU 变了也只是下一片跟着变,offset 记账不受影响。
+        val end = minOf(currentOffset + WriteChunking.chunkSize(negotiatedMtu), frame.size)
         val slice = frame.copyOfRange(currentOffset, end)
         val offset = currentOffset
         if (!writeOne(rx, slice)) {
@@ -778,15 +803,20 @@ class BleCentral(
             g.disconnect()
             return
         }
-        // 请求高优先级连接间隔(默认间隔下每次写都要等一个连接事件:真机实测下行朗读
-        // 只能跑 11 帧/秒,而 16kHz/60ms 的实时播放需要 16.7 帧/秒 → 设备解码队列见底、
-        // 声音一卡一卡)。CONNECTION_PRIORITY_HIGH 会把间隔压到 ~11–15ms,下行/上行都受益。
+        // 请求高优先级连接间隔(每次 ATT 写/notify 都要等一个连接事件,间隔越短下行吞吐越高;
+        // CONNECTION_PRIORITY_HIGH 会把间隔压到 ~11–15ms,下行/上行都受益)。
+        // 注意旧注释把下行朗读的低吞吐归因于这里的「默认连接间隔」并写下了「11 帧/秒」这个数字 ——
+        // 该结论已被 2026-10 真机 A/B 推翻(带响应写实测 ≈18.5 帧/秒,真正的断点在选择无响应写,
+        // 见 [setBulkWrite]);这条请求保留,因为它仍然给下行留余量。
         try {
             val ok = g.requestConnectionPriority(BluetoothGatt.CONNECTION_PRIORITY_HIGH)
             Log.i(tag, "请求高优先级连接间隔: $ok")
         } catch (e: Exception) {
             Log.w(tag, "请求连接优先级失败:${e.message}")
         }
+        // 片长以**本次连接**协商到的 MTU 为准:先清空上一次连接的值 —— 在 onMtuChanged 回调
+        // 到达之前按回退片长(240)发,绝不沿用旧连接的值(换设备/重连后 MTU 可能不同)。
+        negotiatedMtu = null
         try {
             @Suppress("DEPRECATION")
             g.requestMtu(profile.requestMtu)

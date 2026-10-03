@@ -211,8 +211,12 @@ class XiaozhiGateway(
     /**
      * 本轮**没有可上屏正文**:立刻以可读原因收尾(不写暂存 —— 空串没有内容可供下一轮使用)。
      *
-     * 为什么不空等到 [DEFAULT_REPLY_TIMEOUT_MS]:会话层是在「整轮已结束且 `llm`/`tts` 都没有文本」时
-     * 才这么说的,再等下去只会让设备屏白等 —— 用户该看到的是原因,而不是一个方块/空气泡。
+     * 为什么不空等到 [DEFAULT_REPLY_TIMEOUT_MS]:会话层是在「整轮已结束且 `llm`/`tts` 都没有可上屏文字」
+     * 时才这么说的,再等下去只会让设备屏白等 —— 用户该看到的是原因,而不是一个方块/空气泡。
+     *
+     * 原因里带一句**会话层的结算说明**([XiaozhiLlmSource.lastReplyDetail]):把 `tts` / `llm` 两层各自的
+     * 条数与清洗后字数写清楚 —— 真机看到这句话时就能分辨是「压根没收到文本」还是「收到的全是
+     * 表情/工具模板」(真机那几轮就是后者:tts 句级文本里混着 `% get_weather…` 与 emoji)。
      */
     private fun onNoBody() {
         val waiter: CompletableDeferred<Outcome>?
@@ -221,9 +225,19 @@ class XiaozhiGateway(
             pending = null
             buffered = null
         }
-        _lastError = NO_BODY
-        Log.w(tag, NO_BODY)
-        waiter?.complete(Outcome.Failed(NO_BODY))
+        val reason = noBodyReason()
+        _lastError = reason
+        Log.w(tag, reason)
+        waiter?.complete(Outcome.Failed(reason))
+    }
+
+    /** 会话层给出的「哪一层为空」说明(没有就空串;只用于拼可读原因)。 */
+    private fun noBodyDetail(): String = source?.lastReplyDetail?.trim().orEmpty()
+
+    /** 最终可读原因:基串 + 会话层的结算说明(写清哪一层为空)。 */
+    private fun noBodyReason(): String {
+        val detail = noBodyDetail()
+        return if (detail.isEmpty()) NO_BODY else "$NO_BODY:$detail"
     }
 
     /** 记录可读原因并返回空结果(不抛异常,与 [GatewayAdapter] 的约定一致)。 */
@@ -274,11 +288,14 @@ class XiaozhiGateway(
         const val ABORTED = "本轮已打断"
 
         /**
-         * 会话层确认本轮**没有可上屏正文**(整轮的 `llm`/`tts` 都没有文本,只有表情一类非正文字段)。
+         * 会话层确认本轮**没有可上屏正文**(整轮的 `llm`/`tts` 都没有可上屏文字,只有表情/工具模板一类
+         * 非正文字段)。
          *
          * 为什么不静默丢弃:设备屏需要一个**可读原因**(否则用户只看到一个空气泡或方块),
          * 而原因要走既有失败语义(状态卡 + 一条 `TEXT('A')`)才与其它网关一致。
+         * 实际文案会在后面拼上会话层的结算说明([XiaozhiLlmSource.lastReplyDetail]),
+         * 写清哪一层为空 —— 拼接入口是 [XiaozhiGateway.noBodyReason]。
          */
-        const val NO_BODY = "小智这一轮没有返回可上屏的正文(只有表情/空文本)"
+        const val NO_BODY = "小智这一轮没有返回可上屏的正文(只有表情/空文本或工具模板)"
     }
 }

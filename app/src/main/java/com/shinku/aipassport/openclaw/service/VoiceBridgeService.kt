@@ -36,6 +36,7 @@ import com.shinku.aipassport.openclaw.pipeline.VoicePipeline
 import com.shinku.aipassport.openclaw.ui.ConversationStore
 import com.shinku.aipassport.openclaw.protocol.VbFrame
 import com.shinku.aipassport.openclaw.protocol.VbFrameReassembler
+import com.shinku.aipassport.openclaw.protocol.clampJsonPayload
 import com.shinku.aipassport.openclaw.protocol.splitTextPayload
 import com.shinku.aipassport.openclaw.protocol.vbEncodeFrame
 import com.shinku.aipassport.openclaw.stt.SttFactory
@@ -52,7 +53,10 @@ import com.shinku.aipassport.openclaw.tts.TtsFlowControl
 import com.shinku.aipassport.openclaw.tts.TtsFraming
 import com.shinku.aipassport.openclaw.tts.TtsPlaybackReport
 import com.shinku.aipassport.openclaw.tts.TtsPushPlan
+import com.shinku.aipassport.openclaw.tts.TtsWriteMode
 import com.shinku.aipassport.openclaw.tts.XiaozhiFrameLog
+import com.shinku.aipassport.openclaw.tts.XiaozhiScreenSignal
+import com.shinku.aipassport.openclaw.tts.XiaozhiTailStop
 import com.shinku.aipassport.openclaw.tts.XiaozhiTtsDownlink
 import com.shinku.aipassport.openclaw.tts.XiaozhiTtsGate
 import com.shinku.aipassport.openclaw.tts.XiaozhiTtsRelay
@@ -987,7 +991,7 @@ class VoiceBridgeService : Service() {
             val frame = vbEncodeFrame(VbFrame.TYPE_TEXT, VbFrame.FLAG_LAST, payload)
             Log.i(TAG, "sendTextFrame role=$role(空) 分片0/1")
             ble.writeBytes(frame)
-            notifyXiaozhiReplyOnScreen(role)
+            notifyXiaozhiReplyOnScreen(role, text)
             return
         }
         // 分片回退到 UTF-8 边界(见 splitTextPayload),不切坏汉字/emoji
@@ -1007,30 +1011,56 @@ class VoiceBridgeService : Service() {
             Log.i(TAG, "sendTextFrame role=$role text=${text.take(30)} 分片$chunkIdx/$totalChunks 字节=${frame.size} flags=$flags")
             ble.writeBytes(frame)
         }
-        notifyXiaozhiReplyOnScreen(role)
+        notifyXiaozhiReplyOnScreen(role, text)
     }
 
     /**
-     * 「小智回复正文已上屏」信号:整段回复的 `TEXT('A')` 分片**已全部写进 BLE 串行写队列**之后调用,
+     * **「本轮正文已上屏」信号**:整段回复的 `TEXT('A')` 分片**已全部写进 BLE 串行写队列**之后调用,
      * 告诉小智 TTS 直通([xiaozhiTtsRelay])可以开播了。
      *
      * 为什么要到这一层才发(而不是会话层收到 `tts.state=stop` 就开播):设备屏上的气泡与音频帧走的是
      * **同一个** BLE 串行写队列,而正文与音频分别在两个线程/协程里就绪 —— 只要不等这个信号,用户就会
-     * 先听到声音、后看到字。在这里触发后，「正文帧已入队」在「首帧入队」之前**由构造保证**
-     * (`XiaozhiTtsRelay.onReplyTextDisplayed` 只会在收到 `tts.state=stop` 后才真正开播)。
+     * 先听到声音、后看到字。正文帧与音频帧同处一条队列,所以「正文先于首帧」由构造保证。
      *
-     * 只对 `'A'`(网关回复)发信号:`'U'`(识别原文)与本轮回复无关,`'R'` 是系统提示。
+     * **哪些上屏算信号(2026-10-05 真机修正)**:只有角色为 `'A'`、且文本与**本轮正文**逐字一致的那条
+     * `TEXT` 才算(判定全在 [XiaozhiTtsRelay.onReplyTextDisplayed] 与 `XiaozhiScreenSignal`)。
+     * 同为 `'A'` 的版本提示、「无语音」、网关超时/失败原因、空回复兜底**不算** —— 否则本轮音频会抢在
+     * 真正文前面出声;`'U'`(识别原文)与 `'R'`(系统提示)更不算。
      */
-    private fun notifyXiaozhiReplyOnScreen(role: Char) {
-        if (role != 'A') return
-        xiaozhiTtsRelay?.onReplyTextDisplayed()
+    private fun notifyXiaozhiReplyOnScreen(role: Char, text: String) {
+        if (role != XiaozhiScreenSignal.REPLY_ROLE) {
+            // 识别原文/系统提示:与本轮回复音频无关(逐轮都会发生,不刷日志)
+            Log.d(TAG, "小智 TTS 直通:忽略非回复上屏(role=$role),不开播")
+            return
+        }
+        // 只在这条**真的**是本轮正文时记时刻:服务侧用它量化「上屏 → 首帧真的写出」到底多少毫秒
+        // (见 drainXiaozhiTts 的「首帧音频写出(距上屏 Xms)」)。**必须在调 relay 之前**记 ——
+        // relay 会在这次调用里同步下发 `tts_start`/首帧入队,放到后面就量不准了。
+        val relay = xiaozhiTtsRelay
+        if (relay == null) {
+            Log.d(TAG, "小智 TTS 直通未接线,不记「正文已上屏」时刻")
+            return
+        }
+        // 先预判(判定与 relay 内部同一套纯函数;不通过时它会自己打一行带原因的警告):
+        // 非本轮正文的一律不记时刻、不开播。
+        if (!relay.acceptsScreenSignal(role, text)) return
+        if (::deviceTtsPush.isInitialized) deviceTtsPush.noteReplyTextOnScreen()
+        // 【取证一跳】正文已全部入队、闸门即将打开:把当前 BLE 写模式一并打出来。
+        // 为什么要打:正文分片与音频帧同一条串行写队列,而 drain 一开段会把队列切到无响应写
+        // (Write Command)—— 若正文分片是在那个模式下真实写出的(或此刻尚未写出),
+        // 设备可能收不到字(无响应写不支持 Long Write 分段);这一行能把「顺序对但字没上屏」区分出来。
+        Log.i(
+            TAG,
+            "小智 TTS 直通:本轮正文已上屏 → 允许开播" +
+                "(当前 BLE 写模式=${if (::ble.isInitialized && ble.isBulkWrite()) "无响应写(批量)" else "带响应写"})",
+        )
+        relay.onReplyTextDisplayed(role, text)
     }
 
     // 下发当前时间给设备:CONTROL 帧 {"ev":"time","epoch":<秒>}。
     private fun sendTimeSync() {
         val json = "{\"ev\":\"time\",\"epoch\":${System.currentTimeMillis() / 1000}}"
-        val payload = json.toByteArray(Charsets.UTF_8)
-        val frame = vbEncodeFrame(VbFrame.TYPE_CONTROL, 0, payload)
+        val frame = vbEncodeFrame(VbFrame.TYPE_CONTROL, 0, encodeJsonBody(json, "时间同步帧"))
         ble.writeBytes(frame)
     }
 
@@ -1049,10 +1079,29 @@ class VoiceBridgeService : Service() {
             Log.d(TAG, "设备未连接,丢弃事件帧: $json")
             return false
         }
-        val frame = vbEncodeFrame(VbFrame.TYPE_EVENT, 0, json.toByteArray(Charsets.UTF_8))
+        val frame = vbEncodeFrame(VbFrame.TYPE_EVENT, 0, encodeJsonBody(json, "事件帧"))
         Log.i(TAG, "下发事件帧给设备: $json")
         ble.writeBytes(frame)
         return true
+    }
+
+    /**
+     * 把 JSON 文本编成帧载荷,并按固件该类型的上限([VbFrame.JSON_PAYLOAD_MAX] = 512B)裁剪。
+     *
+     * 为什么要裁:固件 `header_valid()` 会把 LEN 超上限的帧头当作**错位字节**丢弃(不计类型计数、
+     * 也不计「废半截」),所以超长 CONTROL/EVENT 会被静默丢掉,还会连带吃掉后一帧的帧头。
+     */
+    private fun encodeJsonBody(json: String, what: String): ByteArray {
+        val raw = json.toByteArray(Charsets.UTF_8)
+        val body = clampJsonPayload(raw)
+        if (body.size != raw.size) {
+            Log.w(
+                TAG,
+                "$what 载荷 ${raw.size}B 超过固件上限 ${VbFrame.JSON_PAYLOAD_MAX}B:" +
+                    "已按 UTF-8 边界裁剪到 ${body.size}B(不裁的话设备会整帧静默丢弃)",
+            )
+        }
+        return body
     }
 
     /**
@@ -1132,7 +1181,7 @@ class VoiceBridgeService : Service() {
             addProperty("state", state)
             addProperty("detail", detail)
         }.toString()
-        val frame = vbEncodeFrame(VbFrame.TYPE_CONTROL, 0, json.toByteArray(Charsets.UTF_8))
+        val frame = vbEncodeFrame(VbFrame.TYPE_CONTROL, 0, encodeJsonBody(json, "网关状态帧"))
         ble.writeBytes(frame)
         Log.i(TAG, "下发网关状态给设备: $json")
     }
@@ -1217,7 +1266,7 @@ class VoiceBridgeService : Service() {
             Log.d(TAG, "设备未连接,丢弃控制帧: $json")
             return false
         }
-        val frame = vbEncodeFrame(VbFrame.TYPE_CONTROL, 0, json.toByteArray(Charsets.UTF_8))
+        val frame = vbEncodeFrame(VbFrame.TYPE_CONTROL, 0, encodeJsonBody(json, "控制帧"))
         Log.i(TAG, "下发控制帧给设备: $json")
         ble.writeBytes(frame)
         return true
@@ -1231,11 +1280,27 @@ class VoiceBridgeService : Service() {
      *  2. **可取消**:每次 [speak]/[abort] 都自增 [pushId],在途循环在推下一帧前比对编号后退出
      *     (barge 后不会再把旧回复的音频推给设备);
      *  3. **复用现有 TX 队列**:帧只走 [BleCentral.writeBytes](同一个串行写队列 + ATT 确认),
-     *     不另开线程猛灌;节奏由 [TtsFlowControl] 算(领先设备 ≤2s,目标 800ms)。
+     *     不另开线程猛灌;节奏由 [TtsFlowControl] 算(领先设备 ≤2s,目标 1200ms)。
      */
     /** 【诊断】下行推送节奏覆盖(ms/帧):0 = 用生产参数([TtsFlowControl]);仅对**下一次**试推生效(一次性)。 */
     @Volatile
     private var ttsPacingOverrideMs: Int = 0
+
+    /**
+     * 把一帧的头几个字节打成十六进制(只用于日志):真机排查「App 说写了、设备计数为 0」时，
+     * 这一行就是自查用的逐字节样例 —— 固件解析器期望的形态是
+     * `A5 5A 06 00 <LEN:2B 大端> <SEQ> <rate_khz> <frame_ms> <opus…>`。
+     */
+    private fun frameHexPrefix(frame: ByteArray, max: Int = 24): String {
+        val sb = StringBuilder()
+        val n = minOf(max, frame.size)
+        for (i in 0 until n) {
+            if (i > 0) sb.append(' ')
+            sb.append(String.format("%02X", frame[i].toInt() and 0xFF))
+        }
+        if (frame.size > n) sb.append(" …(+${frame.size - n}B)")
+        return sb.toString()
+    }
 
     private inner class DeviceTtsPush : DeviceTtsDownlink, XiaozhiTtsDownlink {
 
@@ -1295,6 +1360,8 @@ class VoiceBridgeService : Service() {
             xzJob = null
             synchronized(xzLock) { xzFrames.clear() }
             xzStarted = false
+            // 本轮的上屏记录一并归零:新一轮必须重新拿到「正文已上屏」才允许开段(护栏据此生效)。
+            xzTurnTextOnScreenAtMs = 0L
             // 无论有没有在途下发都要发:设备最多缓存 ~2s 音频,上一轮 tts_stop 之后它可能还在播。
             sendControlJson(TtsControl.ABORT_JSON)
             if (active) Log.i(TAG, "设备朗读已中止(tts_abort)")
@@ -1304,8 +1371,10 @@ class VoiceBridgeService : Service() {
         //
         // 与上面的本地合成路径**互斥**(由网关类型决定走哪条),但复用同一套东西:
         //  - CONTROL 事件:`tts_start` / `tts_stop` / `tts_abort`(打断走上面的 [abort]);
-        //  - 流控:同一个 [TtsFlowControl](领先量 ≤ 目标、在途上限);
-        //  - 写队列:同样的 [BleCentral.writeBytes] + 批量写(WRITE_NO_RESPONSE);
+        //  - 流控:同一个 [TtsFlowControl](领先量 ≤ 目标、帧间下限、在途上限);
+        //  - 写队列:同样的 [BleCentral.writeBytes],但**固定带响应写**
+        //    ([TtsWriteMode.XIAOZHI_DIRECT];无响应写在本机/本固件上会静默丢帧,
+        //    见 [drainXiaozhiTts] 的结论注释);
         //  - 对账:同一份 lastFrames 与设备 tts_playback_* 回报日志。
         // 唯一区别:**不合成、不编码** —— 小智给的 opus 包直接进 [VbFrame.TYPE_TTS_OPUS]。
         //
@@ -1332,6 +1401,19 @@ class VoiceBridgeService : Service() {
         @Volatile
         private var xzNotStartedDropped = 0
 
+        /**
+         * **本轮**「正文已上屏」的时刻(ms):[notifyXiaozhiReplyOnScreen] 在整段 `TEXT('A')` 已写进
+         * BLE 串行写队列、且确认它就是本轮正文时记一次 —— 首帧音频真的写出时用它算 `距上屏 Xms`。
+         * 0 = 本轮还没有正文上屏记录(每轮 `abort()` 归零)。
+         */
+        @Volatile
+        private var xzTurnTextOnScreenAtMs = 0L
+
+        /** 记下「正文已上屏」的时刻(由服务侧的上屏信号调用;只有 text 与本轮正文一致时才会调到)。 */
+        fun noteReplyTextOnScreen() {
+            xzTurnTextOnScreenAtMs = System.currentTimeMillis()
+        }
+
         @Volatile
         private var xzJob: Job? = null
 
@@ -1345,6 +1427,11 @@ class VoiceBridgeService : Service() {
                 xzStarted = false
                 synchronized(xzLock) { xzFrames.clear() }
                 return
+            }
+            // 【抢跑护栏】走到这里说明直通 relay 已经过了「正文已上屏」那道唯一闸门(见 [XiaozhiTtsRelay]);
+            // 若本轮压根没有记录,说明有人绕过了闸门 —— 留一行错误日志,便于真机定位。
+            if (xzTurnTextOnScreenAtMs == 0L) {
+                Log.e(TAG, "小智 TTS 直通:本轮没有「正文已上屏」记录就开段(护栏:检查是否有路径绕过了 relay 的闸门)")
             }
             xzPushId++                 // 旧 drain 立即失效(不会把上一段尚未推完的帧接着推)
             xzJob?.cancel()
@@ -1418,10 +1505,15 @@ class VoiceBridgeService : Service() {
          * 逐项出队下发(流控与本地合成那条路同一套规则)。
          *
          * 正文上屏时队列会被 relay **一次性**灌满(已缓冲的那一段),所以这里的循环通常一上来
-         * 就有几十到几百帧要推;流控([TtsFlowControl])负责把它们按“不领先设备超过目标领先量”的节奏
-         * **连续**送出去。队列空时等 [XIAOZHI_TTS_IDLE_POLL_MS] 再查(`stop` 之后迟到帧是正常形态);
-         * 超过 [XIAOZHI_TTS_SLOW_POLL_AFTER_MS] 仍无新项则降频等待 —— 不主动收尾(见该常量注释),
-         * 由 relay 的窗口收尾(`stop` 项)或下一轮 `abort` 终止。
+         * 就有几十到几百帧要推;流控([TtsFlowControl.pushWaitMs])负责把它们按「预充几帧 + 之后每帧不
+         * 快于实时下限、且不领先设备超过目标领先量」的节奏**连续**送出去。队列空时等
+         * [XIAOZHI_TTS_IDLE_POLL_MS] 再查(`stop` 之后迟到帧是正常形态);
+         * 超过 [XIAOZHI_TTS_SLOW_POLL_AFTER_MS] 仍无新项则降频等待。
+         *
+         * **确定的收尾([XiaozhiTailStop])**:本段已真推出过帧、且「推空 + 静默达上限」→ 主动叫 relay
+         * 收尾(`tts_stop`,设备从播放态(“接收中”)回到空闲)。这是**不依赖设备回报**的兜底路径 ——
+         * 旧实现只有「设备回报本段播完 / 新一轮 turn_start / barge」三条收尾,三条都不发生时设备就一直
+         * 停在播放态。此处的收尾**不关 relay 的窗口**,迟到帧仍会续一段(不会把尾音切掉)。
          */
         private suspend fun drainXiaozhiTts(id: Int) {
             if (!::ble.isInitialized || !ble.isConnected()) {
@@ -1430,12 +1522,26 @@ class VoiceBridgeService : Service() {
                 xzStarted = false
                 return
             }
-            // 与本地合成同一理由:带响应写只有 11 帧/秒,低于实时所需的 16.7 帧/秒。
-            ble.setBulkWrite(true)
+            // ---- 写模式:小智直通**固定带响应写**(2026-10 真机 A/B 结论,不是临时诊断)----
+            // 同机同固件实测:
+            //   · 无响应写(WRITE_NO_RESPONSE / Write Command):App 侧报「写入成功 N 帧」,
+            //     设备侧 `TTS` 计数恒为 0,且设备的 `RX 缓冲满` 计数也是 0 —— 不是 ring 溢出,
+            //     是这些写**根本没到设备**(无响应写没有 ATT 应答,丢了也不会报错);
+            //   · 带响应写(WRITE_TYPE_DEFAULT):设备 `帧到达 … TTS=215`,App 与设备数量对得上。
+            // 旧注释「带响应写只有 ~11 帧/秒、低于实时 16.7」已被实测推翻:本轮 207 帧 / 11.2s
+            // ≈ **18.5 帧/秒**,比实时快。而且只有带响应写才有 GATT 写回调,
+            // `deliveredFrameCount()`(流控的在途量)才是真的。
+            // 写模式本身由 [TtsWriteMode.XIAOZHI_DIRECT] 一处定义、单测钉住,这里只取它的值。
+            ble.setBulkWrite(TtsWriteMode.XIAOZHI_DIRECT.bulkWrite)
             val deliveredBase = ble.deliveredFrameCount()
             var sent = 0
             var idleMs = 0L
             var slow = false
+            // 本段是否已经因「推空且静默」而主动收尾(幂等:[XiaozhiTtsRelay.onIdleTailStop] 自身也幂等)
+            var tailStopped = false
+            // 首帧之前的每一次等待都记下来(真机用它量化「上屏 → 首帧」到底花在哪)。
+            var firstFrameWritten = false
+            val headWaits = StringBuilder()
             try {
                 while (true) {
                     if (id != xzPushId) {
@@ -1448,6 +1554,17 @@ class VoiceBridgeService : Service() {
                             slow = true
                             Log.w(TAG, "小智 TTS 直通:${idleMs}ms 无新帧也无 tts_stop,降频等待下一轮/迟到的 stop")
                         }
+                        // 【确定收尾】推空 + 静默达上限 → 主动 tts_stop,把设备从播放态放回空闲。
+                        // 与上一轮/下一段的界线靠 relay 的窗口:它只关设备播放态,不丢迟到帧。
+                        if (XiaozhiTailStop.shouldStop(sent, idleMs, tailStopped)) {
+                            tailStopped = true
+                            Log.i(
+                                TAG,
+                                "小智 TTS 直通:已推空 $sent 帧且 ${idleMs}ms 无新帧 → 主动收尾" +
+                                    "(tts_stop;窗口保持打开,迟到帧会续一段)",
+                            )
+                            xiaozhiTtsRelay?.onIdleTailStop(sent)
+                        }
                         val poll = if (slow) XIAOZHI_TTS_SLOW_POLL_MS else XIAOZHI_TTS_IDLE_POLL_MS
                         delay(poll)
                         idleMs += poll
@@ -1455,6 +1572,7 @@ class VoiceBridgeService : Service() {
                     }
                     idleMs = 0L
                     slow = false
+                    tailStopped = false   // 又有新帧:本段的收尾作废(新一段重新计数)
                     when (item) {
                         is XiaozhiTtsItem.Stop -> {
                             finishXiaozhiTts(sent)
@@ -1462,23 +1580,45 @@ class VoiceBridgeService : Service() {
                         }
 
                         is XiaozhiTtsItem.Frame -> {
-                            // 节奏:与本地合成同一条 TtsFlowControl(领先设备 ≤2s,目标 1200ms)。
-                            val wait = TtsFlowControl.waitMs(
+                            // 节奏:领先量节流 + 与领先量无关的实时下限(见 [TtsFlowControl.pushWaitMs]):
+                            // 开播瞬时先预充前 [TtsFlowControl.PRECHARGE_FRAMES] 帧(不受下限约束),
+                            // 之后每帧至少隔 [TtsFlowControl.MIN_SEND_INTERVAL_MS] —— 只按领先量节流时
+                            // 设备侧缓冲会十几秒贴近空转,一次写抖动就是一次 `欠载`(实测 `欠载=32`)。
+                            val wait = TtsFlowControl.pushWaitMs(
                                 sent,
                                 System.currentTimeMillis() - xzSentAtMs,
                                 frameMs = item.frameMs,
                             )
-                            if (wait > 0) delay(wait)
+                            if (wait > 0) {
+                                // 首帧之前的等待必须留痕:作者要求「上屏信号之后到首帧之间不应该再有等待」,
+                                // 这里就是量化它的地方(有等待必须能说出为什么)。
+                                if (!firstFrameWritten) headWaits.append("流控 ${wait}ms(领先量/帧间下限);")
+                                delay(wait)
+                            }
                             // 在途积压上限:入队快、送达慢时手机会凭空「领先」,设备侧却是空的。
-                            var backlogGuard = 0
-                            while (TtsFlowControl.inFlightExceeds(
+                            // **有界等待**[TtsFlowControl.MAX_INFLIGHT_WAIT_MS] = 1s:到点仍然放行并留一行
+                            // 警告 —— 无限等会在链路半死时把整段卡死(写回调本身有 2s 超时兜底),
+                            // 等待上限内的每一次轮询都是同一个纯判定([TtsFlowControl.backlogWaitMs])。
+                            var backlogWaitedMs = 0L
+                            while (true) {
+                                if (id != xzPushId || !ble.isConnected()) break
+                                val backlog = TtsFlowControl.backlogWaitMs(
                                     sent,
                                     (ble.deliveredFrameCount() - deliveredBase).toInt().coerceAtLeast(0),
-                                ) && backlogGuard < 200
-                            ) {
-                                if (id != xzPushId || !ble.isConnected()) break
-                                delay(5)
-                                backlogGuard++
+                                    backlogWaitedMs,
+                                )
+                                if (backlog <= 0L) break
+                                delay(backlog)
+                                backlogWaitedMs += backlog
+                            }
+                            if (backlogWaitedMs >= TtsFlowControl.MAX_INFLIGHT_WAIT_MS) {
+                                Log.w(
+                                    TAG,
+                                    "小智 TTS 直通:在途积压等待到上限 ${TtsFlowControl.MAX_INFLIGHT_WAIT_MS}ms" +
+                                        "(GATT 写回调未回,已发 $sent 帧):继续下发,避免整段卡死",
+                                )
+                            } else if (backlogWaitedMs > 0L && !firstFrameWritten) {
+                                headWaits.append("在途积压等待 ${backlogWaitedMs}ms(GATT 写回调未回);")
                             }
                             if (id != xzPushId) {
                                 Log.i(TAG, "小智 TTS 直通被打断:已发 $sent 帧")
@@ -1493,9 +1633,25 @@ class VoiceBridgeService : Service() {
                             }
                             // payload 已含 [SEQ][rate_khz][frame_ms](由 XiaozhiTtsRelay 组好),
                             // 这里只包 6B 帧头 —— 不解析、不重编码。
-                            ble.writeBytes(vbEncodeFrame(VbFrame.TYPE_TTS_OPUS, 0, item.payload))
+                            val frame = vbEncodeFrame(VbFrame.TYPE_TTS_OPUS, 0, item.payload)
+                            ble.writeBytes(frame)
                             sent++
                             lastFrames = sent
+                            if (!firstFrameWritten) {
+                                firstFrameWritten = true
+                                // 【取证一跳】上屏 → 首帧真的写进 BLE 串行写队列。
+                                // 往后的每一毫秒都不属于流水线(全是写队列/射频),所以这一跳是“文字先于声音”
+                                // 与“降级不抢跑”在真机上的可量化证据;hex 是自查用的逐字节样例
+                                // (固件解析器期望的就是 `A5 5A 06 00 <LEN:2B 大端> <SEQ> <rate_khz> <frame_ms> ...`)。
+                                val onScreenAt = xzTurnTextOnScreenAtMs
+                                val gap = if (onScreenAt > 0) "${System.currentTimeMillis() - onScreenAt}ms" else "?"
+                                Log.i(
+                                    TAG,
+                                    "首帧音频写出(距上屏 $gap): 帧=${frame.size}B type=0x06 payload=${item.payload.size}B" +
+                                        " hex=${frameHexPrefix(frame)}" +
+                                        if (headWaits.isEmpty()) " 上屏→首帧间无额外等待" else " 上屏→首帧间的等待: $headWaits",
+                                )
+                            }
                             // 逐帧取证(节流):这是「真的写进 BLE 写队列」的那一跳,
                             // 设备侧 TTS 计数为 0 时靠它与「已组帧」日志分层定位。
                             if (XiaozhiFrameLog.shouldLog(sent)) {
@@ -1509,7 +1665,8 @@ class VoiceBridgeService : Service() {
                     }
                 }
             } finally {
-                ble.setBulkWrite(false)   // 正常/打断/掉链都要恢复带响应写
+                // 正常/打断/掉链都回到本链路固定的带响应写(本段全程都应该是它)
+                ble.setBulkWrite(TtsWriteMode.XIAOZHI_DIRECT.bulkWrite)
             }
         }
 
@@ -1517,6 +1674,9 @@ class VoiceBridgeService : Service() {
         private fun finishXiaozhiTts(sent: Int) {
             xzStarted = false
             synchronized(xzLock) { xzFrames.clear() }
+            // 收尾用带响应写:整段音频本来就固定走带响应写(无响应写在本机/本固件上会静默丢帧,
+            // 见 [drainXiaozhiTts] 的结论注释),这里再确认一次,保证控制帧写类型与本段一致。
+            ble.setBulkWrite(TtsWriteMode.XIAOZHI_DIRECT.bulkWrite)
             sendControlJson(TtsControl.STOP_JSON)
             Log.i(TAG, "小智 TTS 直通下发完成: frames=$sent")
         }
@@ -1618,9 +1778,13 @@ class VoiceBridgeService : Service() {
             }
             // 先声明一段开始,再推音频:设备据此进入播放态(停采集、保持背光)
             if (!sendControlJson(TtsControl.START_JSON)) return
-            // 下行朗读切到批量写(WRITE_NO_RESPONSE):带响应写串行执行只有 11 帧/秒,
-            // 低于实时所需的 16.7 帧/秒 → 设备会饿死、听感一卡一卡。结束/中断时在 finally 里恢复。
-            ble.setBulkWrite(true)
+            // 下行朗读切到批量写(WRITE_NO_RESPONSE)。
+            // 【待真机复核】旧的依据「带响应写串行执行只有 11 帧/秒,低于实时 16.7 帧/秒 → 设备会饿死」
+            // 已被 2026-10 真机 A/B 推翻(带响应写实测 ≈18.5 帧/秒,比实时快;见 [drainXiaozhiTts]
+            // 的写模式结论注释)。而同一台手机 + 同一固件上,无响应写会把**小智直通**的音频帧静默丢掉
+            // (设备 TTS 计数恒为 0)—— 本机合成这条路很可能一样。本次**不改**这条路的写模式
+            // (它有自己的合成/编码节奏与真机验收),先按现状保留,列入待真机复核项。
+            ble.setBulkWrite(TtsWriteMode.LOCAL_SYNTHESIS.bulkWrite)
             // 【诊断】推送节奏覆盖(一次性):>0 = 固定每帧间隔(慢于实时),0 = 生产节奏。
             val gapMs = ttsPacingOverrideMs.also { ttsPacingOverrideMs = 0 }
             val startedAtMs = System.currentTimeMillis()

@@ -56,6 +56,16 @@ interface XiaozhiLlmSource {
     fun setLlmObserver(observer: ((String) -> Unit)?)
 
     /**
+     * 本轮正文的**结算说明**(日志与可读原因用):正常时说明取自哪一层(tts 句级文本 / llm.text 兜底),
+     * 为空时说明**哪一层为空**;null = 还没结算过。
+     *
+     * 为什么要有它:[XiaozhiGateway] 拿到空正文时要把「本轮确实没有可上屏正文」这个结论给用户,
+     * 而真机排查需要知道到底卡在哪一层(压根没收到文本 / 收到但清洗后只剩表情与工具模板)。
+     * 由 [XiaozhiSession.emitReply] 在交出正文前同步写入。
+     */
+    val lastReplyDetail: String?
+
+    /**
      * 仅当当前观察者**仍是** [observer] 时摘掉它。
      *
      * 为什么不能盲摘:网关实例会被设置页保存后的重建替换,而旧实例的 `close()` 可能晚于
@@ -88,6 +98,18 @@ interface XiaozhiTtsObserver {
      * `tts_abort` 先发,直通侧的 `tts_stop` 因此是空操作)。
      */
     fun onTurnStart()
+
+    /**
+     * 会话层已装配好**本轮正文**(清洗后的整段;空串 = 本轮确实没有可上屏正文)。
+     *
+     * 为什么需要它:直通侧的音频下发闸门是「正文已上屏」信号,而**不是**任何一个 `TEXT('A')` ——
+     * 服务侧还有版本提示、「无语音」、超时与失败原因等同样以 `'A'` 上屏的文本。直通侧用这里给出的
+     * 正文做**唯一**依据:只有随后上屏的那条 `'A'` 与本轮正文一致,才允许开播(见
+     * [com.shinku.aipassport.openclaw.tts.XiaozhiTtsRelay.onReplyTextDisplayed])。
+     *
+     * 调用时机:在本轮正文交出**之前**(`llm` 观察者之前),保证信号到时正文已经对得上号。
+     */
+    fun onReplyBody(body: String)
 
     /** 下行 TTS 状态:`start` / `sentence_start` / `sentence_end` / `stop`(带该句文本)。
      *  `stop` = 「整段正文齐了」(开播时机),**不是**本段的结束 —— 窗口保持打开,直通侧把已缓冲的帧
@@ -258,7 +280,7 @@ class XiaozhiSession(
      * 本轮正文装配器:`llm`/`tts` 两条下行按设计文档 §6 修订的规则拼成**一条整段正文**,
      * 在 `tts.state=stop`(或最后一句后短时间内无新增)时经 [emitReply] 一次性交出。
      */
-    private val replyText = XiaozhiReplyText(emit = { body -> emitReply(body) })
+    private val replyText = XiaozhiReplyText(emit = { outcome -> emitReply(outcome) })
 
     /** [replyText] 与空闲结算定时器的锁(WS 回调线程 / 定时器协程都会动它们)。 */
     private val replyLock = Any()
@@ -322,6 +344,14 @@ class XiaozhiSession(
      */
     @Volatile
     var unavailableReason: String? = null
+        private set
+
+    /**
+     * 最近一次本轮正文的结算说明(见 [XiaozhiLlmSource.lastReplyDetail]):正常时说明正文取自哪一层,
+     * 为空时说明哪一层为空。由 [emitReply] 在交出正文**之前**写入,供网关构造可读原因。
+     */
+    @Volatile
+    override var lastReplyDetail: String? = null
         private set
 
     override fun setLlmObserver(observer: ((String) -> Unit)?) {
@@ -1426,17 +1456,23 @@ class XiaozhiSession(
     /**
      * 本轮正文的唯一出口:非空 = 正文,空串 = 本轮没有可上屏正文(调用方据此给可读原因)。
      *
-     * 两条出口与改动前一致:
-     *  - 构造参数的 [onLlm](直连会话的调用方);
-     *  - [llmObserver](共用本会话的「小智 AI 网关」)。
+     * 三条出口与改动前一致(顺序有语义):
+     *  0. **先**把本轮正文告诉 TTS 直通观察者([XiaozhiTtsObserver.onReplyBody])—— 直通侧只认
+     *     「上屏文本 == 本轮正文」的信号,所以必须在正文交给网关/流水线之前对好号,
+     *     否则那一条 `TEXT('A')` 发出来时直通侧还不知道本轮正文是什么;
+     *  1. 构造参数的 [onLlm](直连会话的调用方);
+     *  2. [llmObserver](共用本会话的「小智 AI 网关」)。
      * **非正文字段(`emotion` 等)永不参与** —— 它根本不会进 [replyText]。
      */
-    private fun emitReply(body: String) {
+    private fun emitReply(outcome: XiaozhiReplyOutcome) {
+        val body = outcome.body
+        lastReplyDetail = outcome.detail
         if (body.isBlank()) {
-            Log.w(tag, "小智本轮没有可上屏正文(llm/tts 都没有文本):按失败语义给可读原因")
+            Log.w(tag, "小智本轮没有可上屏正文(${outcome.detail}):按失败语义给可读原因")
         } else {
-            Log.i(tag, "小智本轮正文已就绪(${body.length} 字): ${body.take(40)}")
+            Log.i(tag, "小智本轮正文已就绪(${body.length} 字,${outcome.detail}): ${body.take(40)}")
         }
+        ttsObserver?.onReplyBody(body)
         onLlm?.invoke(body)
         llmObserver?.invoke(body)
     }
