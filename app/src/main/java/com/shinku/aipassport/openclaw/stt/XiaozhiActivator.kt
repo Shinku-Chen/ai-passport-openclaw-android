@@ -60,6 +60,10 @@ class XiaozhiActivator(
         .connectTimeout(10, TimeUnit.SECONDS)
         .readTimeout(10, TimeUnit.SECONDS)
         .writeTimeout(10, TimeUnit.SECONDS)
+        // **硬超时**:callTimeout 覆盖一次请求的全过程(连接/重定向/写请求/读响应),不像
+        // connect/read/write 那样只卡某一段;设置页还会再套一层同值的 withTimeoutOrNull。
+        // 修的真机 bug:没有它时「查云端」可能长时间不返回,保存按钮永远停在「查询小智云端…」。
+        .callTimeout(CLOUD_QUERY_TIMEOUT_MS, TimeUnit.MILLISECONDS)
         .build()
 
     private val JSON = "application/json; charset=utf-8".toMediaType()
@@ -90,6 +94,9 @@ class XiaozhiActivator(
      *
      * 这是**保存「小智 AI」与手动激活共用的唯一查询入口**:用户点了保存就必须先真的问一次云端,
      * 不能拿本地 `bound_mac` 当依据(见 [XiaozhiBindGate])。
+     *
+     * **硬超时**:单次 OTA 由 `callTimeout`([CLOUD_QUERY_TIMEOUT_MS])封顶,调用方**还**在协程上套一层
+     * 同值的超时 —— 两层合起来保证这个方法不会无限期不返回(否则保存按钮会永远停在「查询小智云端…」)。
      */
     suspend fun queryCloud(): CloudQuery = withContext(Dispatchers.IO) {
         // 标识与识别通道是**同一套规则**([XiaozhiIdentity]):只有网关类型「小智 AI」才用已连接设备的
@@ -161,17 +168,19 @@ class XiaozhiActivator(
         // 若想走 v2,可构造 {algorithm,serial_number,challenge,hmac};这里先按 v1 简化。
         val body = payload.toString().toRequestBody(JSON)
 
-        val maxMillis = 60_000L   // 最多等 60s(用户绑定时间)
-        val interval = 3_000L     // 每 3s 轮询一次
+        val maxMillis = ACTIVATE_WAIT_MS   // 最多等 60s(用户绑定时间)
+        val interval = ACTIVATE_POLL_INTERVAL_MS     // 每 3s 轮询一次
         val headers = mapOf(
             "Activation-Version" to "1",   // 无 SN v1
             "Device-Id" to mac,
             "Client-Id" to clientId,
             "Content-Type" to "application/json",
         )
-        var elapsed = 0L
-        while (elapsed < maxMillis) {
-            val status = withTimeoutOrNull(10_000) {
+        // 用**真实墙钟**做 60s 预算(旧实现只把 interval 相加,单次请求阻塞多久都不计入,
+        // 弹窗里承诺的「最多等 60 秒」会名不副实)。
+        val deadlineAt = System.currentTimeMillis() + maxMillis
+        while (true) {
+            val status = withTimeoutOrNull(ACTIVATE_REQUEST_TIMEOUT_MS) {
                 postStatus(activateUrl, body, headers)
             } ?: -1
             Log.i(tag, "activate 轮询 status=$status")
@@ -179,11 +188,33 @@ class XiaozhiActivator(
                 Log.i(tag, "设备激活成功! 用户已绑定")
                 return true
             }
+            val remain = deadlineAt - System.currentTimeMillis()
+            if (remain <= 0) break
             // 202 = 仍在等用户绑定;其它 = 继续等
-            delay(interval)
-            elapsed += interval
+            delay(minOf(interval, remain))
         }
         return false
+    }
+
+    companion object {
+        /**
+         * 单次**云端查询(OTA)**的硬超时(毫秒)。
+         *
+         * 两个地方共用同一个值,保证「查云端」不可能无限期不返回:
+         *  - 本类 OkHttp 的 `callTimeout`(管住阻塞式的 HTTP 请求全过程);
+         *  - 设置页协程上的 `withTimeoutOrNull`(管住协程侧的调度/取消)。
+         * 超时后调用方**不落盘**,并给用户可读文案(见 `XiaozhiSaveStatus.QUERY_TIMEOUT_REASON`)。
+         */
+        const val CLOUD_QUERY_TIMEOUT_MS = 10_000L
+
+        /** 单次 activate 轮询请求的超时(协程侧兜底;HTTP 侧由 `callTimeout` 先兜住)。 */
+        private const val ACTIVATE_REQUEST_TIMEOUT_MS = 10_000L
+
+        /** 等待用户完成网页绑定的最长时长(墙钟)。 */
+        private const val ACTIVATE_WAIT_MS = 60_000L
+
+        /** 绑定时 activate 的轮询间隔。 */
+        private const val ACTIVATE_POLL_INTERVAL_MS = 3_000L
     }
 
     // ---- 底层请求 ----

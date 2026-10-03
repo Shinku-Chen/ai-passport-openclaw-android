@@ -886,6 +886,20 @@
             app:backgroundTint="@color/primary"
             app:cornerRadius="12dp" />
 
+        <!-- 「小智 AI」保存按钮下方的**绑定流程状态行**（常驻、随流程更新）：
+             弹窗可能被用户点掉，这行必须留下结论与下一步（绑定码 / 已保存 / 未保存 + 原因）。
+             非小智模式与空闲时整行隐藏（不查云端、不绑定，这一行没有意义，见 XiaozhiSaveStatus）。 -->
+        <TextView
+            android:id="@+id/xzBindStatus"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="6dp"
+            android:text=""
+            android:textSize="12sp"
+            android:textColor="#4FC3F7"
+            android:padding="6dp"
+            android:visibility="gone" />
+
         <TextView
             android:id="@+id/titleXiaozhi"
             android:layout_width="wrap_content"

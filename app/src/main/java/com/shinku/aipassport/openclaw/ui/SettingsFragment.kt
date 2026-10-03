@@ -39,6 +39,7 @@ import com.shinku.aipassport.openclaw.stt.XiaozhiActivator
 import com.shinku.aipassport.openclaw.stt.XiaozhiBindGate
 import com.shinku.aipassport.openclaw.stt.XiaozhiBinding
 import com.shinku.aipassport.openclaw.stt.XiaozhiIdentity
+import com.shinku.aipassport.openclaw.stt.XiaozhiSaveStatus
 import com.shinku.aipassport.openclaw.stt.XiaozhiSettings
 import com.shinku.aipassport.openclaw.tts.TtsSupport
 import kotlinx.coroutines.CancellationException
@@ -48,6 +49,7 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeoutOrNull
 
 /**
  * 设置页:网关类型(下拉)+ 三套网关配置(OpenClaw / Hermes / 自定义 OpenAI 兼容)+ 日志区。
@@ -73,6 +75,14 @@ import kotlinx.coroutines.launch
  * 查询失败/超时/无网 → 不落盘 + 可读原因,下次保存重试。设备未连 → 拦截(见 [XiaozhiBindGate])。
  * 其余网关不触发查询/绑定,也不会因「设备未连接」被拦 —— 它们只把小智
  * 当识别引擎(见 [XiaozhiIdentity])。
+ *
+ * 「查云端」有**硬超时**([XiaozhiActivator.CLOUD_QUERY_TIMEOUT_MS],OTA 请求的 `callTimeout`
+ * 与协程上的 `withTimeoutOrNull` 共用同一个值);保存按钮的复位写在 `finally` 里 ——
+ * 任何路径(成功/失败/超时/异常/页面销毁)都必须回到「[XiaozhiSaveStatus.IDLE_BUTTON_TEXT] + 可点」,
+ * 否则就是真机上的「点一次不返回就永远卡住」。
+ *
+ * 保存按钮**下方那行**是绑定流程状态的常驻出口(弹窗可能被用户关掉,这行留下结论与下一步):
+ * 可见性/文案/按钮都交给纯逻辑 [XiaozhiSaveStatus](非小智与空闲时整行隐藏,单测钉住)。
  *
  * 小智侧的标识(Device-Id)按**当前网关类型**解析:小智 AI = 已连接设备的真 MAC;
  * 其余网关 = 全零匿名标识(见 [XiaozhiIdentity]);「高级」里的设备 ID 行与实际在用的一致。
@@ -166,6 +176,11 @@ class SettingsFragment : Fragment() {
                 // Spinner 回填/首次布局也会触发一次选中回调,这里用实际值去重,避免误报「已切换」
                 if (type == lastSelectedType) return
                 lastSelectedType = type
+                // 换了网关类型 = 上一轮的绑定流程状态已不适用(可能还挂着「绑定失败」),回到空闲并隐藏。
+                // 流程正在跑时不清:按钮与状态行由那个流程的 finally 收尾,提前清会和终态打架。
+                if (!XiaozhiSaveStatus.isBusy(xzSaveStage)) {
+                    setXiaozhiSaveStage(XiaozhiSaveStatus.Stage.Idle)
+                }
                 log("网关类型已切换为 $type(点「保存网关设置」校验通过后生效)")
             }
 
@@ -234,6 +249,8 @@ class SettingsFragment : Fragment() {
                 binding.titleGateway, binding.labelGatewayType, binding.spinnerType,
                 binding.textCleartextHint,
                 binding.groupOpenclaw, binding.groupHermes, binding.groupOpenai, binding.btnSave,
+                // 保存按钮下方那行「绑定流程状态」：小智 AI 模式下的常驻提示（非小智/空闲整行隐藏）
+                binding.xzBindStatus,
                 // 「小智 AI」在这个页里只有下拉里的一项:识别/激活那整块 UI 属于「高级」，
                 // 这里再摆一份就是两套 UI 拨同一批控件（见类 KDoc）。
             ),
@@ -310,6 +327,8 @@ class SettingsFragment : Fragment() {
             if (type == GatewaySettings.TYPE_OPENAI) View.VISIBLE else View.GONE
         // 「小智 AI」在本页没有专属控件(它的识别/绑定 UI 在「高级」，见类 KDoc),
         // 所以这里不需要为它拨任何 visibility —— 否则就会再出现一份被两个 section 争抢的块。
+        // 但按钮下方那行「绑定流程状态」随类型变（切成别的类型就隐藏)，所以跟着重画一次。
+        renderXiaozhiSaveStatus()
     }
 
     /**
@@ -800,6 +819,80 @@ class SettingsFragment : Fragment() {
         approvalDialog = null
     }
 
+    // ---- 保存按钮 + 它下方那行「绑定流程状态」----
+
+    /**
+     * 保存按钮下方那行绑定流程状态的**当前阶段**(以及渲染它需要的数据)。
+     *
+     * 存阶段而不是直接存文案:切类型/重建视图时需要按当前类型与阶段重算一遍可见性与文案,
+     * 统一交给纯逻辑 [XiaozhiSaveStatus](单测钉住「空闲/非小智隐藏」与「任何终局都回到可点」)。
+     */
+    private var xzSaveStage: XiaozhiSaveStatus.Stage = XiaozhiSaveStatus.Stage.Idle
+    private var xzSaveMac: String? = null
+    private var xzSaveCode: String? = null
+    private var xzSaveReason: String? = null
+
+    /**
+     * 切换「绑定流程状态」行的阶段(同时按 [XiaozhiSaveStatus.button] 拨保存按钮)。
+     *
+     * 只有 [XiaozhiSaveStatus.Stage.QueryingCloud] / [XiaozhiSaveStatus.Stage.WaitingBind] 两个
+     * 进行中阶段会把按钮置灰(防重复点击),其余阶段(含全部终局)**一律回到可点** ——
+     * 流程必须有出口,否则就是真机上的「点一次不返回、永远卡住」。
+     */
+    private fun setXiaozhiSaveStage(
+        stage: XiaozhiSaveStatus.Stage,
+        mac: String? = null,
+        code: String? = null,
+        reason: String? = null,
+    ) {
+        xzSaveStage = stage
+        xzSaveMac = mac
+        xzSaveCode = code
+        xzSaveReason = reason
+        _binding?.let { b ->
+            val button = XiaozhiSaveStatus.button(stage)
+            b.btnSave.text = button.text
+            b.btnSave.isEnabled = button.enabled
+        }
+        renderXiaozhiSaveStatus()
+    }
+
+    /**
+     * 按**存下的阶段 + 当前选中的网关类型**重画那行状态(不动按钮)。
+     *
+     * 可见性交给 [XiaozhiSaveStatus.line]:非小智模式(不查云端、不绑定)与空闲时整行隐藏。
+     * 类型看下拉框的当前选择,而不是已落盘的类型 —— 保存时生效的是将要写入的那个类型。
+     */
+    private fun renderXiaozhiSaveStatus() {
+        val b = _binding ?: return
+        val line = XiaozhiSaveStatus.line(
+            selectedType(), xzSaveStage, xzSaveMac, xzSaveCode, xzSaveReason,
+        )
+        b.xzBindStatus.visibility = if (line.visible) View.VISIBLE else View.GONE
+        b.xzBindStatus.text = line.text
+        // 视图重建(切页/重进设置)会把按钮重新 inflate 成可点:流程还在跑就把置灰状态补回去,
+        // 免得同一个保存流程能并发启动两次。流程结束时终态不是忙碌阶段,按钮由 restoreSaveButton 复位。
+        if (XiaozhiSaveStatus.isBusy(xzSaveStage)) {
+            val button = XiaozhiSaveStatus.button(xzSaveStage)
+            b.btnSave.text = button.text
+            b.btnSave.isEnabled = button.enabled
+        }
+    }
+
+    /**
+     * 保存按钮复位:文案回 [XiaozhiSaveStatus.IDLE_BUTTON_TEXT]、恢复可点。
+     *
+     * **所有**路径(成功/失败/超时/异常/取消)都得走这里:旧实现只在正常路径的最后一行复位,
+     * 于是异常或超时就永远卡在「查询小智云端…」且点不动(真机反馈)。
+     * 视图已销毁时跳过 —— 重新创建时会重新 inflate 成空闲态。
+     */
+    private fun restoreSaveButton() {
+        _binding?.let { b ->
+            b.btnSave.isEnabled = true
+            b.btnSave.text = XiaozhiSaveStatus.IDLE_BUTTON_TEXT
+        }
+    }
+
     private fun saveSettings() {
         val form = snapshotForm()
         // 「小智 AI」没有任何可填的连接参数(ws/OTA 地址与 token 写死在 XiaozhiSettings,会话由识别通道提供),
@@ -818,6 +911,11 @@ class SettingsFragment : Fragment() {
             // 小智模式但设备没连(取不到真 MAC):拦住并给可读原因(不回退匿名标识,也不发任何请求)
             XiaozhiBindGate.BeforeSave.NoDevice -> {
                 log("小智 AI 保存被拦截:未连接设备(未保存任何字段)")
+                // 按钮下方那行也要说清结论与下一步(弹窗会被关掉,这行留下)
+                setXiaozhiSaveStage(
+                    XiaozhiSaveStatus.Stage.Failed,
+                    reason = XiaozhiIdentity.NO_DEVICE_REASON,
+                )
                 showSaveFailure(
                     "${XiaozhiIdentity.NO_DEVICE_REASON}\n" +
                         "请在「设备管理」里连接对讲设备后，再点「保存网关设置」。"
@@ -838,83 +936,95 @@ class SettingsFragment : Fragment() {
         // 用 applicationContext:重试循环可能跨页面销毁,不能持有 Fragment 的 view 生命周期上下文
         val ctx = requireContext().applicationContext
         scope.launch {
-            val deadlineAt = System.currentTimeMillis() + PAIRING_RETRY_TIMEOUT_MS
-            var reason: String? = null
-            var saved = false
-            var awaiting = false
-            var pairingTimedOut = false
-            var attempt = 0
-            while (true) {
-                attempt++
-                when (val result = validateOnce(ctx, draft)) {
-                    is SaveValidation.Ok -> {
-                        // 只在真正通过时落盘:校验不通过绝不落盘(含等待授权)
-                        persistForm(form)
-                        // 落盘后用 prefs 回填一遍表单:保证可见分组显示的就是已保存值
-                        // (不再是陈旧值,也避免下一个人手误改到别的分组)。
-                        // 视图可能已被销毁(重试循环跨页面),所以先判 view 是否还在。
-                        if (view != null) loadSettings()
-                        saved = true
-                    }
+            // 整段包在 try/finally 里:异常/取消路径也必须把按钮复位 ——
+            // 旧实现只在正常路径末尾复位,一旦抛异常就永远卡在「校验中…」且点不动。
+            try {
+                val deadlineAt = System.currentTimeMillis() + PAIRING_RETRY_TIMEOUT_MS
+                var reason: String? = null
+                var saved = false
+                var awaiting = false
+                var pairingTimedOut = false
+                var attempt = 0
+                while (true) {
+                    attempt++
+                    when (val result = validateOnce(ctx, draft)) {
+                        is SaveValidation.Ok -> {
+                            // 只在真正通过时落盘:校验不通过绝不落盘(含等待授权)
+                            persistForm(form)
+                            // 落盘后用 prefs 回填一遍表单:保证可见分组显示的就是已保存值
+                            // (不再是陈旧值,也避免下一个人手误改到别的分组)。
+                            // 视图可能已被销毁(重试循环跨页面),所以先判 view 是否还在。
+                            if (view != null) loadSettings()
+                            saved = true
+                        }
 
-                    is SaveValidation.AwaitingPairing -> {
-                        reason = result.reason
-                        awaiting = true
-                        // 需要授权就弹等待框（含 deviceId 与批准步骤），不用等超时才明白发生了什么
-                        showApprovalDialog(result.reason)
-                    }
+                        is SaveValidation.AwaitingPairing -> {
+                            reason = result.reason
+                            awaiting = true
+                            // 需要授权就弹等待框（含 deviceId 与批准步骤），不用等超时才明白发生了什么
+                            showApprovalDialog(result.reason)
+                        }
 
-                    is SaveValidation.Failed -> {
-                        reason = result.reason
-                        awaiting = false
+                        is SaveValidation.Failed -> {
+                            reason = result.reason
+                            awaiting = false
+                        }
+                    }
+                    if (saved) break
+                    // 不是「等待授权」:立刻停手(重试无意义,必须先让用户改配置)
+                    if (!awaiting) break
+                    if (System.currentTimeMillis() >= deadlineAt) {
+                        pairingTimedOut = true
+                        break
+                    }
+                    // 等待授权:按钮改文案并置灰,等一个间隔后自动继续校验(_binding 可能已置空)
+                    _binding?.let { b ->
+                        b.btnSave.isEnabled = false
+                        b.btnSave.text = "等待授权…"
+                    }
+                    log("等待网关授权…(第 $attempt 次校验未通过,${PAIRING_RETRY_INTERVAL_MS / 1000}s 后自动重试)")
+                    try {
+                        delay(PAIRING_RETRY_INTERVAL_MS)
+                    } catch (e: CancellationException) {
+                        // 用户取消(离开设置页/销毁):不落盘、不再重试;视图可能已销毁,只记日志
+                        log("已取消等待网关授权,未保存任何字段")
+                        throw e
                     }
                 }
-                if (saved) break
-                // 不是「等待授权」:立刻停手(重试无意义,必须先让用户改配置)
-                if (!awaiting) break
-                if (System.currentTimeMillis() >= deadlineAt) {
-                    pairingTimedOut = true
-                    break
-                }
-                // 等待授权:按钮改文案并置灰,等一个间隔后自动继续校验(_binding 可能已置空)
-                _binding?.let { b ->
-                    b.btnSave.isEnabled = false
-                    b.btnSave.text = "等待授权…"
-                }
-                log("等待网关授权…(第 $attempt 次校验未通过,${PAIRING_RETRY_INTERVAL_MS / 1000}s 后自动重试)")
-                try {
-                    delay(PAIRING_RETRY_INTERVAL_MS)
-                } catch (e: CancellationException) {
-                    // 用户取消(离开设置页/销毁):不落盘、不再重试;视图可能已销毁,只记日志
-                    log("已取消等待网关授权,未保存任何字段")
-                    throw e
-                }
-            }
-            // 视图可能已销毁(切页/离开设置页):落盘与重启服务仍然要完成(否则“批准后自动保存”会失效),
-            // 只把界面提示降级 —— log()/showSaveFailure() 自己会在无视图/无 context 时安全退出。
-            _binding?.let { b ->
-                b.btnSave.isEnabled = true
-                b.btnSave.text = "保存网关设置"
-            }
-            dismissApprovalDialog()
-            if (saved) {
-                // 第 1 次就通过 = 普通保存;多次才通过 = 等过授权的自动重试
-                if (attempt > 1) {
-                    log("授权完成,网关设置已保存(类型 ${form.type})")
-                    toast("授权完成,网关设置已保存")
+                dismissApprovalDialog()
+                if (saved) {
+                    // 第 1 次就通过 = 普通保存;多次才通过 = 等过授权的自动重试
+                    if (attempt > 1) {
+                        log("授权完成,网关设置已保存(类型 ${form.type})")
+                        toast("授权完成,网关设置已保存")
+                    } else {
+                        log("校验通过,网关设置已保存(类型 ${form.type})")
+                        toast("已保存")
+                    }
+                    applySavedServiceConfig()
+                } else if (pairingTimedOut) {
+                    val text = pairingTimeoutReason(reason)
+                    log("等待网关授权超时,未保存任何字段: $text")
+                    showSaveFailure(text)
                 } else {
-                    log("校验通过,网关设置已保存(类型 ${form.type})")
-                    toast("已保存")
+                    val text = reason ?: "连接校验失败(未取得失败原因,请检查网关配置)"
+                    log("校验失败,未保存任何字段: $text")
+                    showSaveFailure(text)
                 }
-                applySavedServiceConfig()
-            } else if (pairingTimedOut) {
-                val text = pairingTimeoutReason(reason)
-                log("等待网关授权超时,未保存任何字段: $text")
+            } catch (e: CancellationException) {
+                // 页面销毁/流程被取消:不落盘;视图可能已不存在,只记日志
+                log("保存流程已取消,未保存任何字段")
+                throw e
+            } catch (e: Exception) {
+                dismissApprovalDialog()
+                val text = "保存时出现异常(设置未改动):${e.message ?: e.javaClass.simpleName}"
+                log(text)
                 showSaveFailure(text)
-            } else {
-                val text = reason ?: "连接校验失败(未取得失败原因,请检查网关配置)"
-                log("校验失败,未保存任何字段: $text")
-                showSaveFailure(text)
+            } finally {
+                // 视图可能已销毁(切页/离开设置页):落盘与重启服务仍然要完成(否则“批准后自动保存”会失效),
+                // 只把界面提示降级 —— log()/showSaveFailure() 自己会在无视图/无 context 时安全退出。
+                // 按钮复位放在 finally:成功/失败/超时/异常都没有别的出口。
+                restoreSaveButton()
             }
         }
     }
@@ -1015,6 +1125,14 @@ class SettingsFragment : Fragment() {
 
         /** 查询失败 / 绑定失败或超时:不落盘 + 可读原因。 */
         data class Failed(val reason: String) : XzFlow
+
+        /**
+         * 查云端的**硬超时**:不落盘,文案见 [XiaozhiSaveStatus.QUERY_TIMEOUT_REASON]。
+         *
+         * 与 [Failed] 分开的原因:用户要做的下一步不同 —— 超时直接用重试即可,
+         * 不必去查配置;文案也必须说清「未保存」。
+         */
+        data object QueryTimeout : XzFlow
     }
 
     /**
@@ -1026,6 +1144,9 @@ class SettingsFragment : Fragment() {
      *
      * @param mac 已归一化的设备 MAC(调用方已过 [XiaozhiBindGate.beforeSave])
      * @param onCode 拿到 6 位绑定码后的 UI 回调（在主线程调用）
+     *
+     * 查云端套了**硬超时**（[XiaozhiActivator.CLOUD_QUERY_TIMEOUT_MS]）:超时返回 [XzFlow.QueryTimeout],
+     * **不落盘**且调用方给可读文案 —— 没有它时保存按钮会无限期停在「查询小智云端…」。
      */
     private suspend fun runXiaozhiFlow(
         mac: String,
@@ -1036,7 +1157,11 @@ class SettingsFragment : Fragment() {
             ?: return XzFlow.Failed("设置页已关闭,请重新打开后重试")
         val activator = XiaozhiActivator(ctx, GatewaySettings.TYPE_XIAOZHI, mac, xzSettings.otaUrl)
         // 保存与手动激活都是小智模式 + 已知 MAC，所以闸门一定会查云端。
-        val query = activator.queryCloud()
+        // **硬超时**（[XiaozhiActivator.CLOUD_QUERY_TIMEOUT_MS]，与 OTA 请求的 callTimeout 同值）：
+        // 查云端不能无限期不返回，否则保存按钮就永远停在「查询小智云端…」且点不动（真机反馈）。
+        // 超时 = 未落盘，由调用方给可读文案并复位按钮。
+        val query = withTimeoutOrNull(XiaozhiActivator.CLOUD_QUERY_TIMEOUT_MS) { activator.queryCloud() }
+            ?: return XzFlow.QueryTimeout
         return when (val decision = XiaozhiBindGate.decide(
             GatewaySettings.TYPE_XIAOZHI, mac, query.state, xzBinding.boundMac, query.detail,
         )) {
@@ -1071,48 +1196,104 @@ class SettingsFragment : Fragment() {
      * 于是既不给绑定码也不告诉用户任何事。现在本地记录只是提示,判据永远是云端。
      */
     private fun saveXiaozhiAfterCloudQuery(form: FormSnapshot, mac: String) {
-        binding.btnSave.isEnabled = false
-        binding.btnSave.text = "查询小智云端…"
+        // 按钮 + 按钮下方那行一起进「查询中」:只改按钮文案的话,用户不知道卡在哪一步、也不知道要不要等
+        setXiaozhiSaveStage(XiaozhiSaveStatus.Stage.QueryingCloud, mac = mac)
         log("小智 AI 保存:查询云端激活状态(设备 $mac)…")
         scope.launch {
-            val flow = runXiaozhiFlow(mac) { code, msg ->
-                scope.launch {
-                    _binding?.let { b ->
-                        b.xzActiveStatus.text =
-                            "请到 xiaozhi.me 登录→添加设备→输入绑定码:\n$code\n($msg)\n完成后自动检测…"
+            // null = 流程被取消(页面销毁):此时不落盘、也不弹任何结果
+            var outcome: XiaozhiSaveStatus.Outcome? = null
+            /** 云端已激活时的说明文案;由 [showXiaozhiActivatedDialog] 在流程结束后展示。 */
+            var activatedNotice: String? = null
+            try {
+                val flow = runXiaozhiFlow(mac) { code, msg ->
+                    scope.launch {
+                        _binding?.let { b ->
+                            b.xzActiveStatus.text =
+                                "请到 xiaozhi.me 登录→添加设备→输入绑定码:\n$code\n($msg)\n完成后自动检测…"
+                        }
+                        // 弹窗可能被用户点掉:按钮下方那行必须常驻绑定码与「正在等授权」,用户据此继续
+                        setXiaozhiSaveStage(XiaozhiSaveStatus.Stage.WaitingBind, mac = mac, code = code)
+                        // 保存动作可能是在「网关设置」页发起的，而绑定码专属于「高级」里的那块 UI；
+                        // 用对话框把 6 位绑定码直接摆到眼前，不用用户自己去找那一页。
+                        showXiaozhiBindDialog(code, msg)
+                        log("请到 xiaozhi.me 输入绑定码 $code")
                     }
-                    // 保存动作可能是在「网关设置」页发起的，而绑定码专属于「高级」里的那块 UI；
-                    // 用对话框把 6 位绑定码直接摆到眼前，不用用户自己去找那一页。
-                    showXiaozhiBindDialog(code, msg)
-                    log("请到 xiaozhi.me 输入绑定码 $code")
                 }
-            }
-            _binding?.let { b ->
-                b.btnSave.isEnabled = true
-                b.btnSave.text = "保存网关设置"
+                outcome = when (flow) {
+                    is XzFlow.Activated -> {
+                        // 云端已激活:保存允许，但必须先告诉用户(不静默)，并把本地记录同步成当前设备
+                        xzBinding.boundMac = mac
+                        persistXiaozhiAndApply(form, mac)
+                        activatedNotice = flow.notice
+                        log("小智设备 $mac 已在云端激活,网关设置已保存(无需重新绑定)")
+                        XiaozhiSaveStatus.Outcome.Saved(mac)
+                    }
+
+                    is XzFlow.Bound -> {
+                        // 绑定成功才记住这台设备 + 落盘；下次保存不会再绑一遍
+                        xzBinding.boundMac = mac
+                        persistXiaozhiAndApply(form, mac)
+                        XiaozhiSaveStatus.Outcome.Bound(mac)
+                    }
+
+                    is XzFlow.Failed -> XiaozhiSaveStatus.Outcome.Failed(flow.reason)
+
+                    // 查云端硬超时:未落盘 + 可读文案(不是静默)
+                    XzFlow.QueryTimeout -> XiaozhiSaveStatus.Outcome.QueryTimeout
+                }
+            } catch (e: CancellationException) {
+                // 页面销毁/流程被取消:不落盘;按钮由 finally 复位
+                log("已取消小智保存流程,未保存任何字段")
+                throw e
+            } catch (e: Exception) {
+                outcome = XiaozhiSaveStatus.Outcome.Failed(
+                    "保存小智 AI 时出错:${e.message ?: e.javaClass.simpleName}"
+                )
+            } finally {
+                // **任何**路径（成功/失败/超时/异常）都必须把按钮复位成「保存网关设置 + 可点」,
+                // 并把状态行落到终态：旧实现只在正常路径末尾复位,异常或超时就会永远卡在
+                // 「查询小智云端…」且点不动（真机反馈）。取消时视图已不存在,状态行写不进去也无妨。
+                restoreSaveButton()
+                outcome?.let { applyXiaozhiSaveOutcome(it) }
             }
             dismissApprovalDialog()
-            when (flow) {
-                is XzFlow.Activated -> {
-                    // 云端已激活:保存允许，但必须先告诉用户(不静默)，并把本地记录同步成当前设备
-                    xzBinding.boundMac = mac
-                    persistXiaozhiAndApply(form, mac)
-                    log("小智设备 $mac 已在云端激活,网关设置已保存(无需重新绑定)")
-                    showXiaozhiActivatedDialog(flow.notice)
+            // 走到这里 outcome 一定有值(被取消时已经在上面 rethrow);以防万一再兜一层
+            val result = outcome ?: return@launch
+            when (result) {
+                is XiaozhiSaveStatus.Outcome.Failed -> {
+                    log("小智 AI 未保存:${result.reason}")
+                    showSaveFailure("小智 AI 未保存(设置未改动,原配置继续生效)\n${result.reason}")
                 }
 
-                is XzFlow.Bound -> {
-                    // 绑定成功才记住这台设备 + 落盘；下次保存不会再绑一遍
-                    xzBinding.boundMac = mac
-                    persistXiaozhiAndApply(form, mac)
+                XiaozhiSaveStatus.Outcome.QueryTimeout -> {
+                    log("查询小智云端超时,未保存任何字段")
+                    showSaveFailure(XiaozhiSaveStatus.QUERY_TIMEOUT_REASON)
                 }
 
-                is XzFlow.Failed -> {
-                    log("小智设备未激活,未保存任何字段: ${flow.reason}")
-                    showSaveFailure("小智设备未激活(设置未改动,原配置继续生效)\n${flow.reason}")
-                }
+                // 已激活/绑定成功:落盘已经完成,弹框只负责「不静默」地告知结论(绑定成功的结论在状态行上)
+                is XiaozhiSaveStatus.Outcome.Saved ->
+                    activatedNotice?.let { showXiaozhiActivatedDialog(it) }
+
+                is XiaozhiSaveStatus.Outcome.Bound -> Unit
             }
         }
+    }
+
+    /**
+     * 把一次小智保存的终局摆到界面上:状态行给终态、保存按钮回可点（任何终局都不例外）。
+     *
+     * 终局→阶段 / 阶段→文案与按钮的映射全在纯逻辑 [XiaozhiSaveStatus]（单测钉住）。
+     */
+    private fun applyXiaozhiSaveOutcome(outcome: XiaozhiSaveStatus.Outcome) {
+        setXiaozhiSaveStage(
+            XiaozhiSaveStatus.stageOf(outcome),
+            mac = when (outcome) {
+                is XiaozhiSaveStatus.Outcome.Saved -> outcome.mac
+                is XiaozhiSaveStatus.Outcome.Bound -> outcome.mac
+                else -> null
+            },
+            reason = (outcome as? XiaozhiSaveStatus.Outcome.Failed)?.reason,
+        )
     }
 
     /**
@@ -1133,7 +1314,12 @@ class SettingsFragment : Fragment() {
             .show()
     }
 
-    /** 绑定码等待框:与 [showApprovalDialog] 共用同一个对话框槽位(两者不可能并发)。 */
+    /**
+     * 绑定码等待框:与 [showApprovalDialog] 共用同一个对话框槽位(两者不可能并发)。
+     *
+     * 弹窗只是**放大器**:关掉它之后，按钮下方那行([renderXiaozhiSaveStatus])仍带着绑定码与
+     * 「等待授权…」，用户不会因为随手点掉弹窗就不知道下一步做什么。
+     */
     private fun showXiaozhiBindDialog(code: String, message: String) {
         if (!isAdded || view == null) return
         dismissApprovalDialog()
@@ -1340,24 +1526,37 @@ class SettingsFragment : Fragment() {
                 binding.xzActiveStatus.text = "正在查询小智云端激活状态…"
                 log("小智激活:查询云端…(设备 ${gate.mac},网关类型 ${settings.type})")
                 scope.launch {
-                    val flow = runXiaozhiFlow(gate.mac) { code, msg ->
-                        // 拿到绑定码 → 主线程展示,让用户去 xiaozhi.me 绑定
-                        scope.launch {
-                            _binding?.let { b ->
-                                b.xzActiveStatus.text =
-                                    "请到 xiaozhi.me 登录→添加设备→输入绑定码:\n$code\n($msg)\n完成后自动检测…"
+                    // null = 被取消(页面销毁):不弹任何结果;按钮由 finally 复位
+                    var flow: XzFlow? = null
+                    try {
+                        flow = runXiaozhiFlow(gate.mac) { code, msg ->
+                            // 拿到绑定码 → 主线程展示,让用户去 xiaozhi.me 绑定
+                            scope.launch {
+                                _binding?.let { b ->
+                                    b.xzActiveStatus.text =
+                                        "请到 xiaozhi.me 登录→添加设备→输入绑定码:\n$code\n($msg)\n完成后自动检测…"
+                                }
+                                log("请到 xiaozhi.me 输入绑定码 $code")
                             }
-                            log("请到 xiaozhi.me 输入绑定码 $code")
                         }
+                    } catch (e: CancellationException) {
+                        log("已取消小智激活流程(未改动任何配置)")
+                        throw e
+                    } catch (e: Exception) {
+                        flow = XzFlow.Failed("激活小智设备时出错:${e.message ?: e.javaClass.simpleName}")
+                    } finally {
+                        // 任何路径(含超时/异常)都要恢复可点:否则按钮永久置灰 = 真机上的「卡住」
+                        _binding?.let { b -> b.btnActivateXz.isEnabled = true }
                     }
-                    _binding?.let { b -> b.btnActivateXz.isEnabled = true }
-                    when (flow) {
+                    // 走到这里 flow 一定有值(被取消时已经在上面 rethrow);以防万一再兜一层
+                    val result = flow ?: return@launch
+                    when (result) {
                         is XzFlow.Activated -> {
                             // 云端已激活:提示即可(不重新发码),并同步本地记录
                             xzBinding.boundMac = gate.mac
-                            _binding?.let { b -> b.xzActiveStatus.text = flow.notice }
+                            _binding?.let { b -> b.xzActiveStatus.text = result.notice }
                             log("小智设备 ${gate.mac} 已在云端激活,无需重新绑定")
-                            showXiaozhiActivatedDialog(flow.notice)
+                            showXiaozhiActivatedDialog(result.notice)
                         }
 
                         is XzFlow.Bound -> {
@@ -1369,9 +1568,16 @@ class SettingsFragment : Fragment() {
                         }
 
                         is XzFlow.Failed -> {
-                            _binding?.let { b -> b.xzActiveStatus.text = flow.reason }
-                            log("小智激活失败: ${flow.reason}")
-                            toast(flow.reason)
+                            _binding?.let { b -> b.xzActiveStatus.text = result.reason }
+                            log("小智激活失败: ${result.reason}")
+                            toast(result.reason)
+                        }
+
+                        XzFlow.QueryTimeout -> {
+                            // 与「查云端失败」分开:超时直接用重试,不必去查配置
+                            _binding?.let { b -> b.xzActiveStatus.text = XiaozhiSaveStatus.QUERY_TIMEOUT_REASON }
+                            log("小智激活:查询云端超时(未改动任何配置)")
+                            toast(XiaozhiSaveStatus.QUERY_TIMEOUT_REASON)
                         }
                     }
                 }
