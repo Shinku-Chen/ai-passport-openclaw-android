@@ -8,6 +8,7 @@ import com.shinku.aipassport.openclaw.stt.XiaozhiReplyText
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -1146,5 +1147,108 @@ class XiaozhiTtsRelayTest {
         r.onTtsState("sentence_start", "正文")
         r.onIdleTailStop(0)
         assertTrue(link.events.isEmpty())
+    }
+
+    // ---- ⑯ 句级对齐:句边界切分与「不切音频」(2026-10 作者时序) ----
+
+    /**
+     * 验收点①:音频帧本身**没有句界标记**,句界只能按「正文到达那一刻已收到的帧数」切 ——
+     * 第 N 句的音频起点 ≈ 交付第 N 条正文时本段已收到的帧数 × 60ms。
+     *
+     * 覆盖:多句、空句、噪声句(不交付 → 不记边界)、同一句被 `sentence_start`/`sentence_end` 各带一次
+     * (不产生第二条边界)、重复告知同一条正文(边界不往后挪)、缺 `sentence_start`(只靠交付记账)。
+     */
+    @Test
+    fun sentence_start_offsets_are_cut_by_the_frames_that_arrived_before_each_body() {
+        val link = FakeDownlink()
+        val r = relay(link)
+
+        r.onTtsState("start", "")
+        r.onTtsState("sentence_start", "")                          // 空句:不交付也不记边界
+        r.onTtsState("sentence_start", "第一句。")
+        r.onReplyBody("第一句。")                                     // 第 1 句交付:此刻 0 帧
+        r.onTtsAudio(opus(1), 24, 60)
+        r.onTtsAudio(opus(2), 24, 60)
+        r.onTtsAudio(opus(3), 24, 60)
+        r.onReplyBody("第一句。")                                     // 重复告知:边界不往后挪
+        r.onTtsState("sentence_end", "第一句。")                     // 同一句的后半条:不产生新交付
+        r.onTtsState("sentence_start", "% get_weather(location=\"上海\")")   // 噪声句:不交付 → 不记边界
+        r.onTtsAudio(opus(4), 24, 60)
+        r.onTtsState("sentence_start", "第二句。")
+        r.onReplyBody("第一句。第二句。")                             // 第 2 句交付:4 帧
+        r.onTtsAudio(opus(5), 24, 60)
+        // 缺 `sentence_start`:服务端直接给下一句文本,交付仍然记边界
+        r.onReplyBody("第一句。第二句。第三句。")                      // 第 3 句交付:5 帧
+
+        assertEquals("首句起点 ≈ 0(交付时一帧音频还没收到)", 0L, r.sentenceStartMs("第一句。"))
+        assertEquals("第 2 句起点 = 第 1 句那 3 帧 + 噪声句那 1 帧", 4 * 60L, r.sentenceStartMs("第一句。第二句。"))
+        assertEquals(5 * 60L, r.sentenceStartMs("第一句。第二句。第三句。"))
+        assertNull("没交付过的文本没有边界记录", r.sentenceStartMs("第二句。"))
+        assertEquals("首句仍是本轮第 1 次上屏(它不走句级对齐)", 1, r.replyScreenOrdinal('A', "第一句。") ?: -1)
+    }
+
+    /**
+     * 句级对齐**只在真的收到过可下发音频帧**时可用;`turn_start` 一并作废(旧轮起点不能用在新一轮,
+     * 否则新一轮的第一句字幕会被押到旧轮的时间点上)。
+     */
+    @Test
+    fun sentence_alignment_is_unavailable_without_audio_and_resets_each_turn() {
+        val link = FakeDownlink()
+        val r = relay(link)
+        r.onReplyBody("第一句。")
+        r.onReplyBody("第一句。第二句。")
+        assertNull("一帧可下发的音频都没收到:不提供句级对齐(不能把字幕拖到收尾)", r.sentenceStartMs("第一句。第二句。"))
+
+        // 有音频的一轮:边界可用……
+        r.onTurnStart()
+        r.onReplyBody("第一句。")
+        r.onTtsAudio(opus(1), 24, 60)
+        r.onReplyBody("第一句。第二句。")
+        assertEquals(60L, r.sentenceStartMs("第一句。第二句。"))
+        // ……但 turn_start 之后立刻作废
+        r.onTurnStart()
+        assertNull("新一轮:上一轮的句边界已作废", r.sentenceStartMs("第一句。第二句。"))
+    }
+
+    /**
+     * 验收点④:**句级对齐只改字幕落位时刻,不切音频** —— 多句的帧仍是一条连续流:
+     * 整段只有一个 `tts_start`、句界处没有 `tts_stop`(不留空档),SEQ 连续、顺序 = 到达顺序。
+     */
+    @Test
+    fun sentence_boundaries_do_not_break_the_continuous_audio_stream() {
+        val link = FakeDownlink()
+        val r = relay(link)
+
+        r.onTtsState("sentence_start", "第一句。")
+        r.onTtsAudio(opus(1), 24, 60)
+        r.onTtsAudio(opus(2), 24, 60)
+        r.onReplyBody("第一句。")
+        r.onReplyTextDisplayed(XiaozhiScreenSignal.REPLY_ROLE, "第一句。")   // 首句上屏 → 开播
+        assertEquals(listOf("start", "frame", "frame"), link.events)
+
+        // 第 2 句:字幕在它自己那句音频到点时上屏(单测直接发信号);句界处**没有** tts_stop,
+        // 也没有第二个 tts_start —— 改的只是字幕落位时刻。
+        r.onTtsState("sentence_start", "第二句。")
+        r.onReplyBody("第一句。第二句。")
+        r.onTtsAudio(opus(3), 24, 60)
+        r.onTtsAudio(opus(4), 24, 60)
+        r.onReplyTextDisplayed(XiaozhiScreenSignal.REPLY_ROLE, "第一句。第二句。")
+
+        r.onTtsState("stop", "")
+        r.onTtsAudio(opus(5), 24, 60)
+        r.onTtsAudio(opus(6), 24, 60)
+
+        assertEquals(
+            "一条连续流:只有一个 tts_start、句界处没有 tts_stop、也没有空档",
+            listOf("start", "frame", "frame", "frame", "frame", "frame", "frame"),
+            link.events,
+        )
+        assertEquals("SEQ 连续、不丢不重", listOf(0, 1, 2, 3, 4, 5), link.seqs())
+        assertEquals(
+            "帧顺序 = 到达顺序(句界没有把音频切段/重排)",
+            (1..6).map { opus(it).toList() },
+            link.opusBodies(),
+        )
+        assertEquals("第 2 句的音频起点 = 前 2 帧", 2 * 60L, r.sentenceStartMs("第一句。第二句。"))
     }
 }

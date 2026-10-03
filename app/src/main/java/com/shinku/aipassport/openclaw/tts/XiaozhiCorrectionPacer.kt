@@ -16,6 +16,10 @@ import kotlin.math.roundToInt
  * @param inflightFrames **在途**帧数:已交给 BLE、还没拿到 GATT 写回调的帧。
  * @param msSinceLastFrameWrite 距上一帧音频写进 BLE 写队列的毫秒数(-1 = 本段还没写出过帧)。
  * @param queueFrames 服务侧待发队列的长度(帧)。
+ * @param pushedAudioMs **已推送音频时长**(ms):已交给 BLE 写队列的帧数 × 帧长 —— 句级字幕对齐的
+ *   「推送时钟」。见 [XiaozhiCorrectionPacer.SENTENCE_PRELOAD_MS]。
+ * @param playedAudioMs **设备播放进度估计**(ms):推送时钟 − 垫底([leadMs]) = 自 `tts_start` 起的实时时长;0 = 还没开播。
+ *   句级字幕对齐用它(而不是推送时钟):否则字幕会比它那句的声音早整整一个垫底量。
  */
 data class XiaozhiAudioPacing(
     val active: Boolean,
@@ -24,6 +28,8 @@ data class XiaozhiAudioPacing(
     val inflightFrames: Int,
     val msSinceLastFrameWrite: Long,
     val queueFrames: Int,
+    val pushedAudioMs: Long = 0,
+    val playedAudioMs: Long = 0,
 )
 
 /**
@@ -47,16 +53,28 @@ data class XiaozhiAudioPacing(
  * ## 状态机
  * ```
  * onTurnStart()            清空(上一轮的待补正文作废)
- * offer(正文, now, pacing) 补正到达:SEND_NOW(立刻上屏) / HOLD(攒起来,覆盖上一条)
- * tick(now, pacing)        音频推进时调用:攒够条件 / 超过兜底时限就吐出待补正文
+ * offer(正文, now, pacing, 句音频起点)  补正到达:按句级对齐 + 让路判定 SEND_NOW / HOLD(攒起来,覆盖上一条)
+ * tick(now, pacing)        音频推进时调用:句到点 / 攒够条件 / 超过兜底时限就吐出待补正文
  * flush(now)               本段音频推完/收尾:无条件吐出待补正文(最终完整正文)
  * ```
+ *
+ * ## 两道门(顺序有意义)
+ *  1. **句级对齐(本轮的主时机,作者 2026-10 定)**:第 N(≥2)句的字幕**不上屏太早**,而是在它自己
+ *     那句音频**即将开播**时上屏(「先一上句字幕 → 再上一句音频 → 播完 → 再上下一句字幕/音频」)。
+ *     判定用**设备播放进度估计**与**该句音频起点**([offer] 的 `sentenceStartMs`):
+ *     `playedAudioMs < startMs − SENTENCE_PRELOAD_MS` → 攒着。没有可对齐的音频(非小智/开关关闭/
+ *     服务端只给文本)时 `sentenceStartMs` 为 null → 此门不生效。
+ *  2. **补正让路(兜底,§4.6)**:音频紧(垫底见底 / 在途积压 / 距上次补正太近)→ 不插队。
+ *     正常句界上屏时音频通常不紧,这一门很少触发;它保证的是「时刻到了但声音正紧」时不打断声音。
+ *
+ * 首句**不走这里**(它在服务侧就被放行,必须立刻上屏并开播)。
  *
  * @param leadHoldMs 「音频垫底」低于它就算**紧**(见 [LEAD_HOLD_MS])
  * @param inflightHoldFrames 在途达到它就算**写队列在积压**(见 [INFLIGHT_HOLD_FRAMES])
  * @param minGapMs 两次补正上屏之间的最小间隔(见 [MIN_CORRECTION_GAP_MS])
  * @param maxCorrections 一轮里最多**主动**补正几次,之后一律攒到收尾(见 [MAX_CORRECTIONS_PER_TURN])
  * @param maxHoldMs 兜底:攒这么久还没等到机会也要补上(见 [MAX_HOLD_MS])
+ * @param sentencePreloadMs 句级对齐的提前量(见 [SENTENCE_PRELOAD_MS])
  */
 class XiaozhiCorrectionPacer(
     private val leadHoldMs: Long = LEAD_HOLD_MS,
@@ -64,6 +82,7 @@ class XiaozhiCorrectionPacer(
     private val minGapMs: Long = MIN_CORRECTION_GAP_MS,
     private val maxCorrections: Int = MAX_CORRECTIONS_PER_TURN,
     private val maxHoldMs: Long = MAX_HOLD_MS,
+    private val sentencePreloadMs: Long = SENTENCE_PRELOAD_MS,
 ) {
 
     /** 一次补正的处置结果。 */
@@ -81,6 +100,14 @@ class XiaozhiCorrectionPacer(
     /** [pending] 第一次被攒起来的时刻(算兜底时限用)。 */
     private var pendingSinceMs = 0L
 
+    /**
+     * [pending] 对应的**该句音频起点**(ms);null = 这条正文没有可对齐的音频(见 [offer] 的参数)。
+     *
+     * 为什么跟 [pending] 一起换:[pending] 是「最新最完整」的那条正文(多次补正合并),
+     * 它的音频起点也必须是**最新那条**的起点,否则会把字幕押到上一句的时间点上。
+     */
+    private var pendingStartMs: Long? = null
+
     /** 上一次**真的上屏**的补正时刻(算最小间隔用);[NO_SEND_YET] = 本轮还没发过。 */
     private var lastSentAtMs = NO_SEND_YET
 
@@ -89,6 +116,9 @@ class XiaozhiCorrectionPacer(
 
     /** 当前攒着的正文(只读;服务侧用它决定要不要跑一次 [tick])。 */
     val pendingBody: String? get() = pending
+
+    /** 当前待补正文的**句音频起点**(ms;null = 未知/无) —— 只用于日志。 */
+    val pendingSentenceStartMs: Long? get() = pendingStartMs
 
     /** 本轮已主动补正的次数(只读,日志用)。 */
     val sentCount: Int get() = sent
@@ -103,6 +133,7 @@ class XiaozhiCorrectionPacer(
     fun onTurnStart() {
         pending = null
         pendingSinceMs = 0L
+        pendingStartMs = null
         lastSentAtMs = NO_SEND_YET
         sent = 0
     }
@@ -111,14 +142,23 @@ class XiaozhiCorrectionPacer(
      * 一条**补正**正文到达(首句**不**走这里,它在服务侧就被放行了)。
      *
      * 同一轮会多次调用:每次都用新正文**覆盖**待补的那条(合并 —— 屏幕要的是「最新最完整」,
-     * 中间那些短版本没有单独显示的价值)。
+     * 中间那些短版本没有单独显示的价值),**音频起点也一并换成最新那条**的。
      *
-     * @return [Decision.SEND_NOW] = 立刻上屏([canSendNow] 全过);[Decision.HOLD] = 攒起来。
+     * @param sentenceStartMs 这条正文对应的**该句音频起点**(ms;来自
+     *   [com.shinku.aipassport.openclaw.tts.XiaozhiTtsRelay.sentenceStartMs]);
+     *   null = 没有可对齐的音频(非小智 / 开关关闭 / 服务端只给文本)→ 只看让路门。
+     * @return [Decision.SEND_NOW] = 立刻上屏(句已到点且 [canSendNow] 全过);[Decision.HOLD] = 攒起来。
      */
-    fun offer(body: String, nowMs: Long, pacing: XiaozhiAudioPacing?): Decision {
+    fun offer(
+        body: String,
+        nowMs: Long,
+        pacing: XiaozhiAudioPacing?,
+        sentenceStartMs: Long? = null,
+    ): Decision {
         if (body.isBlank()) return Decision.SEND_NOW
         if (pending == null) pendingSinceMs = nowMs
         pending = body
+        pendingStartMs = sentenceStartMs
         if (!canSendNow(nowMs, pacing)) return Decision.HOLD
         take(nowMs)
         return Decision.SEND_NOW
@@ -150,6 +190,8 @@ class XiaozhiCorrectionPacer(
      *
      * - 没有在播的音频([XiaozhiAudioPacing.active] 为假 / 快照为 null)→ **可以**:
      *   没有声音要被保护,再拦就只是让文字白白变晚(含「设备朗读开关关着」这一整类);
+     * - **该句的音频还没到「即将开播」那一刻**([scheduleBlocks])→ **不发**(句级对齐:字幕落位
+     *   贴着该句音频起点,而不是一收到文本就上屏);
      * - 本轮主动补正已达 [maxCorrections] → **不发**(攒到收尾一次补全文);
      * - 距上一次补正不足 [minGapMs] → **不发**(两次渲染停顿不许挤在一起);
      * - 在途 ≥ [inflightHoldFrames] → **不发**(写队列在积压,现在插一条正文帧要排在它们后面);
@@ -157,6 +199,9 @@ class XiaozhiCorrectionPacer(
      */
     private fun canSendNow(nowMs: Long, pacing: XiaozhiAudioPacing?): Boolean {
         if (pacing == null || !pacing.active) return true
+        // ① 句级对齐:这条补正的那一句音频还没到点 → 攒着(唯一由「音频时钟」决定的门,走在让路之前)。
+        if (scheduleBlocks(pacing)) return false
+        // ② 补正让路(兑底)。
         if (sent >= maxCorrections) return false
         if (lastSentAtMs != NO_SEND_YET && nowMs - lastSentAtMs < minGapMs) return false
         if (pacing.inflightFrames >= inflightHoldFrames) return false
@@ -164,11 +209,27 @@ class XiaozhiCorrectionPacer(
         return true
     }
 
+    /**
+     * 这条待补正文是不是卡在**句级对齐**上(该句音频还没到「起点 − 提前量」)。
+     *
+     * 只读、只用于日志措辞;判定与 [canSendNow] 用**同一个**表达式(不会出现「日志说等音频、
+     * 代码却因为让路在等」的误导)。
+     */
+    fun waitingForSentenceStart(pacing: XiaozhiAudioPacing?): Boolean = scheduleBlocks(pacing)
+
+    /** 句级对齐的唯一判定:有该句起点、且音频在播、**且播放进度还没到「起点 − 提前量」**。 */
+    private fun scheduleBlocks(pacing: XiaozhiAudioPacing?): Boolean {
+        val startMs = pendingStartMs ?: return false
+        if (pacing == null || !pacing.active) return false
+        return pacing.playedAudioMs < startMs - sentencePreloadMs
+    }
+
     /** 记账并取出待补正文(不变量:取出来的那一刻就等于「它上屏了」)。 */
     private fun take(nowMs: Long): String? {
         val body = pending ?: return null
         pending = null
         pendingSinceMs = 0L
+        pendingStartMs = null
         markSent(nowMs)
         return body
     }
@@ -230,6 +291,27 @@ class XiaozhiCorrectionPacer(
          * (没有在播音频时 [canSendNow] 本来就放行,所以它实际几乎不会生效)。
          */
         const val MAX_HOLD_MS = 10_000L
+
+        /**
+         * **句级对齐的提前量**:第 N(≥2)句的字幕在它那句音频**起点前**这么多毫秒上屏。取 **800ms**。
+         *
+         * 这是作者 2026-10 的时序要求:「先上字幕 → 紧接着就是该句的声音」(声音仍是连续流,
+         * 句间不停、不切段、不重发 `tts_start`;改的只是**字幕落位时刻**)。判定见 [waitingForSentenceStart]。
+         *
+         * 为什么要提前量(而不能恰好卡在起点):
+         *  - 这条 `TEXT('A')` 与音频帧**共用一条 BLE 串行写队列**,插入时会排在**已交给 BLE、还没拿到写回调**
+         *    的音频帧之后 —— 在途上限是 [TtsFlowControl.MAX_INFLIGHT_FRAMES] = 8 帧 ≈ **480ms**;
+         *  - 再加上设备侧一次多行正文的渲染(几十毫秒)与调度抖动;
+         *  两项合计 ≈ **0.5–0.6s**,取 **800ms**(作者给出的 0.5–0.8s 区间的上界)留余量 ——
+         *  字幕宁可早一点(声音还没到)也不可晚(声音已到字幕还没上),而 800ms 仍远小于一整句音频,不会
+         *  把上一句的听感盖掉。
+         *
+         * 为什么用**播放进度**([XiaozhiAudioPacing.playedAudioMs])而不是**推送时钟**([XiaozhiAudioPacing.pushedAudioMs])判定:
+         * 流控会让推送时钟**领先**设备播放一个垫底量(目标 [TtsFlowControl.TARGET_LEAD_MS] = 1200ms、硬上限 2000ms),
+         * 若拿推送时钟与「起点 − 800ms」比,字幕会比它那句的声音早出好几百毫秒(甚至早过一整句),
+         * 反而破坏「一句一句来」的节奏。播放进度 = 推送时钟 − 垫底,才是「设备现在听到哪里」的最近似量。
+         */
+        const val SENTENCE_PRELOAD_MS = 800L
     }
 }
 
@@ -243,16 +325,19 @@ object XiaozhiPacingLog {
     /**
      * @param ordinal 本轮第几次**正文上屏**(1 = 首句;≥2 = 补正)
      * @param pacing 音频侧快照;null = 直通未接线(非小智路径)
+     * @param sentenceStartMs 这条字幕**对应那一句的音频起点**(ms;null = 未知/没有可对齐的音频)
      */
-    fun line(ordinal: Int, pacing: XiaozhiAudioPacing?): String {
-        if (pacing == null) return "第 $ordinal 次上屏/补正 | 音频侧无状态(小智直通未接线)"
+    fun line(ordinal: Int, pacing: XiaozhiAudioPacing?, sentenceStartMs: Long? = null): String {
+        if (pacing == null) return "第 $ordinal 句字幕上屏(第 $ordinal 次上屏/补正) | 音频侧无状态(小智直通未接线)"
         val frames = pacing.leadFrames.roundToInt()
         val since = if (pacing.msSinceLastFrameWrite < 0L) {
             "无(本段还没写出过音频帧)"
         } else {
             "${pacing.msSinceLastFrameWrite}ms"
         }
-        return "第 $ordinal 次上屏/补正 | 音频垫底≈$frames 帧(≈${pacing.leadMs}ms) | " +
+        val start = if (sentenceStartMs == null) "未知" else "≈${sentenceStartMs}ms"
+        return "第 $ordinal 句字幕上屏(第 $ordinal 次上屏/补正) | 已推送音频≈${pacing.pushedAudioMs}ms | " +
+            "该句起点$start | 音频垫底≈$frames 帧(≈${pacing.leadMs}ms) | " +
             "在途=${pacing.inflightFrames} | 距上一音频帧写入 $since | 队列=${pacing.queueFrames}"
     }
 }

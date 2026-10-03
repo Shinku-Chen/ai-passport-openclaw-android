@@ -13,13 +13,15 @@ import org.junit.Test
  *
  * 被测契约(见 `docs/design/xiaozhi-ai-gateway.md` §4.5、§6.5 与 [XiaozhiCorrectionPacer] 的类注释):
  *  1. **首句不经这里**(它在服务侧就被放行)—— 本类的每个入口都只在「补正」上被调用;
- *  2. **音频不紧才发**:垫底 < 阈值 / 在途积压 / 距上次补正太近 → **暂缓**;
- *  3. **合并**:同一轮的多次补正攒成**最新的一条**,时机到了只发一次;
- *  4. **最多 N 次**主动补正,之后一律等收尾;
- *  5. **收尾那次无条件**:本段音频推完([XiaozhiCorrectionPacer.flush])一定把最终完整正文交出去
- *     («文字最终一定完整»这条硬约束);兜底时限到也一样;
- *  6. **新一轮丢弃**:`turn_start` 攒着的文案作废,绝不带到下一轮;
- *  7. 没有在播音频(直通没接线 / 开关关着)→ **一秒都不拦**。
+ *  2. **句级对齐(本轮的主时机)**:第 N(≥2)句的字幕**不提前上屏** —— 等到「该句音频起点 −
+ *     `SENTENCE_PRELOAD_MS`」才发;音频还没到那时一刻就不提前,即使音频很宽裕;
+ *  3. **音频不紧才发**:垫底 < 阈值 / 在途积压 / 距上次补正太近 → **暂缓**;
+ *  4. **合并**:同一轮的多次补正攒成**最新的一条**，时机到了只发一次(音频起点也跟着最取新那条);
+ *  5. **最多 N 次**主动补正,之后一律等收尾;
+ *  6. **收尾那次无条件**:本段音频推完([XiaozhiCorrectionPacer.flush])一定把最终完整正文交出去
+ *     («文字最终一定完整»这条硬约束);兜底时限到也一样 —— 即使该句音频从未走到它的起点;
+ *  7. **新一轮丢弃**:`turn_start` 攒着的文案作废,绝不带到下一轮;
+ *  8. 没有在播音频 / 没有可对齐的音频(非小智、开关关着、服务端只给文本)→ **一秒都不拦**。
  */
 class XiaozhiCorrectionPacerTest {
 
@@ -30,6 +32,8 @@ class XiaozhiCorrectionPacerTest {
         inflight: Int = 0,
         sinceWrite: Long = 60L,
         queue: Int = 100,
+        pushedAudioMs: Long = 0L,
+        playedAudioMs: Long = 0L,
     ) = XiaozhiAudioPacing(
         active = active,
         leadMs = leadMs,
@@ -37,6 +41,8 @@ class XiaozhiCorrectionPacerTest {
         inflightFrames = inflight,
         msSinceLastFrameWrite = sinceWrite,
         queueFrames = queue,
+        pushedAudioMs = pushedAudioMs,
+        playedAudioMs = playedAudioMs,
     )
 
     /** 参数取值本身要站得住(阈值/间隔/上限/兜底都必须落在文档给出的安全范围里)。 */
@@ -55,6 +61,114 @@ class XiaozhiCorrectionPacerTest {
         // 主动补正次数:有限且 >= 1;兜底时限:必须长于任何一种「正常等法」的量级
         assertTrue(XiaozhiCorrectionPacer.MAX_CORRECTIONS_PER_TURN in 1..5)
         assertTrue(XiaozhiCorrectionPacer.MAX_HOLD_MS >= 3 * XiaozhiTailStop.TAIL_IDLE_MS)
+        // 句级对齐提前量:必须 >= 在途上限(BLE 队列里要插在它们后面)的量级,
+        // 又必须远远小于一整句音频(否则会把上一句的听感盖掉)
+        assertTrue(
+            XiaozhiCorrectionPacer.SENTENCE_PRELOAD_MS >=
+                TtsFlowControl.MAX_INFLIGHT_FRAMES * TtsFlowControl.FRAME_MS,
+        )
+        assertTrue(XiaozhiCorrectionPacer.SENTENCE_PRELOAD_MS <= 1_000L)
+    }
+
+    // ---- 句级对齐(2026-10 作者时序:第 N 句的字幕贴着它自己那句的音频起点) ----
+
+    /**
+     * 验收点②:第 N(≥2)句的字幕**不提前上屏** —— 等到「该句音频起点 − 提前量」才发;
+     * 音频还没到那时一刻就不提前(即使音频很宽裕、也没有在途积压)。
+     */
+    @Test
+    fun sentence_alignment_holds_until_the_sentence_audio_is_about_to_start() {
+        val pacer = XiaozhiCorrectionPacer()
+        val startMs = 2_400L          // 第 2 句的音频起点(≈ 第 1 句 40 帧 × 60ms)
+        val dueMs = startMs - XiaozhiCorrectionPacer.SENTENCE_PRELOAD_MS
+
+        assertEquals(
+            "播放进度还没到「起点 − 提前量」:攒着(即使音频很宽裕、也没有在途积压)",
+            XiaozhiCorrectionPacer.Decision.HOLD,
+            pacer.offer("第一句。第二句。", nowMs = 1_000L, pacing = pacing(playedAudioMs = 0L), sentenceStartMs = startMs),
+        )
+        assertTrue("此刻卡的就是句级对齐", pacer.waitingForSentenceStart(pacing(playedAudioMs = 0L)))
+        assertEquals("还差 1ms:继续攒", null, pacer.tick(nowMs = 1_100L, pacing = pacing(playedAudioMs = dueMs - 1)))
+        assertEquals(
+            "播放进度到「起点 − 提前量」:上屏(字幕刚好落在该句声音之前)",
+            "第一句。第二句。",
+            pacer.tick(nowMs = 1_200L, pacing = pacing(playedAudioMs = dueMs)),
+        )
+        assertEquals(1, pacer.sentCount)
+    }
+
+    /** 句级对齐只在**有可对齐的音频**时生效:没有起点(非小智 / 开关关闭 / 只给文本)→ 一秒都不拦。 */
+    @Test
+    fun sentence_alignment_does_not_block_when_there_is_no_audio_to_align_with() {
+        val pacer = XiaozhiCorrectionPacer()
+        assertEquals(
+            "sentenceStartMs = null(本轮没有音频可对齐):照旧立刻上屏",
+            XiaozhiCorrectionPacer.Decision.SEND_NOW,
+            pacer.offer("第一句。第二句。", nowMs = 1_000L, pacing = pacing(playedAudioMs = 0L), sentenceStartMs = null),
+        )
+    }
+
+    /**
+     * 验收点②的「第一句立即」:首句本来就**不走这里**(服务侧 `replyScreenOrdinal ≤ 1` 直接放行);
+     * 即使有人把它改成走这里,**句起点 ≈ 0** 时提前量也推不出一个未来的时刻
+     * (`0 − 800ms < 0 ≤ 播放进度`),门同样拦不住它 —— 「首句立即上屏 + 立即开播」双保险。
+     */
+    @Test
+    fun the_first_sentence_is_never_delayed_by_the_alignment_gate() {
+        val pacer = XiaozhiCorrectionPacer()
+        assertEquals(
+            XiaozhiCorrectionPacer.Decision.SEND_NOW,
+            pacer.offer("第一句。", nowMs = 0L, pacing = pacing(playedAudioMs = 0L), sentenceStartMs = 0L),
+        )
+    }
+
+    /** 该句音频已经到点/已经过去(音频晚到)→ 不再按句级对齐等,立刻上屏。 */
+    @Test
+    fun sentence_alignment_sends_immediately_once_the_audio_clock_passed_the_due_point() {
+        val pacer = XiaozhiCorrectionPacer()
+        assertEquals(
+            XiaozhiCorrectionPacer.Decision.SEND_NOW,
+            pacer.offer("第一句。第二句。", nowMs = 1_000L, pacing = pacing(playedAudioMs = 9_000L), sentenceStartMs = 2_400L),
+        )
+    }
+
+    /** 合并时**音频起点也跟着换成最新那条**:否则字幕会被押到上一句的时间点上。 */
+    @Test
+    fun coalescing_updates_the_alignment_point_to_the_latest_body() {
+        val pacer = XiaozhiCorrectionPacer()
+        assertEquals(
+            XiaozhiCorrectionPacer.Decision.HOLD,
+            pacer.offer("一。二。", nowMs = 1_000L, pacing = pacing(playedAudioMs = 0L), sentenceStartMs = 1_200L),
+        )
+        assertEquals(
+            XiaozhiCorrectionPacer.Decision.HOLD,
+            pacer.offer("一。二。三。", nowMs = 1_100L, pacing = pacing(playedAudioMs = 1_300L), sentenceStartMs = 3_000L),
+        )
+        assertEquals("待补正文的句起点已换成最新那条的", 3_000L, pacer.pendingSentenceStartMs)
+        assertEquals(
+            "旧起点(1200ms)早已过去、新起点(3000ms)还没到:仍然攒着",
+            null,
+            pacer.tick(nowMs = 1_200L, pacing = pacing(playedAudioMs = 1_300L)),
+        )
+        assertEquals(
+            "到新起点 − 提前量:吐出的是最新最完整的那条",
+            "一。二。三。",
+            pacer.tick(
+                nowMs = 1_300L,
+                pacing = pacing(playedAudioMs = 3_000L - XiaozhiCorrectionPacer.SENTENCE_PRELOAD_MS),
+            ),
+        )
+    }
+
+    /** 验收点③:音频那一路压根没走到该句起点(链路断了 / 句子被截)时,收尾仍无条件补全文。 */
+    @Test
+    fun tail_flush_delivers_even_when_the_sentence_audio_never_reached_its_start() {
+        val pacer = XiaozhiCorrectionPacer()
+        assertEquals(
+            XiaozhiCorrectionPacer.Decision.HOLD,
+            pacer.offer("最终完整正文", nowMs = 1_000L, pacing = pacing(playedAudioMs = 0L), sentenceStartMs = 9_000L),
+        )
+        assertEquals("收尾无条件补全(«文字最终一定完整»)", "最终完整正文", pacer.flush(nowMs = 1_100L))
     }
 
     /** 没有在播的音频(直通没接线 / 本轮还没开段 / 开关关着)→ 一次都不拦。 */
@@ -235,14 +349,21 @@ class XiaozhiCorrectionPacerTest {
         assertNull(pacer.pendingBody)
     }
 
-    /** 取证日志行:格式钉死(真机上作者就是按这一行核对「文字动时垫底是否见底」)。 */
+    /** 取证日志行:格式钉死(真机就是按这一行核对「字幕落位时刻 / 该句起点 / 垫底」)。 */
     @Test
     fun pacing_log_line_has_the_agreed_shape() {
         val line = XiaozhiPacingLog.line(
             ordinal = 2,
-            pacing = pacing(leadMs = 600L, inflight = 1, sinceWrite = 54L, queue = 37),
+            pacing = pacing(
+                leadMs = 600L, inflight = 1, sinceWrite = 54L, queue = 37,
+                pushedAudioMs = 1_800L, playedAudioMs = 1_200L,
+            ),
+            sentenceStartMs = 2_400L,
         )
-        assertTrue("要有第几次上屏/补正:$line", line.contains("第 2 次上屏/补正"))
+        assertTrue("要有第几句字幕上屏:$line", line.contains("第 2 句字幕上屏"))
+        assertTrue("要保留第几次上屏/补正:$line", line.contains("第 2 次上屏/补正"))
+        assertTrue("要有已推送音频:$line", line.contains("已推送音频≈1800ms"))
+        assertTrue("要有该句起点:$line", line.contains("该句起点≈2400ms"))
         assertTrue("要有垫底帧数与毫秒数:$line", line.contains("音频垫底≈10 帧(≈600ms)"))
         assertTrue("要有在途:$line", line.contains("在途=1"))
         assertTrue("要有距上一音频帧写入:$line", line.contains("距上一音频帧写入 54ms"))
@@ -251,6 +372,8 @@ class XiaozhiCorrectionPacerTest {
         // 本段还没写出过帧 → 明确写「无」,不要伪装成 0ms(那会看起来像「刚刚写过」)
         val head = XiaozhiPacingLog.line(1, pacing(sinceWrite = -1L))
         assertTrue(head.contains("距上一音频帧写入 无"))
+        // 没有可对齐的音频 → 写「未知」,不编造一个 0
+        assertTrue(XiaozhiPacingLog.line(3, pacing()).contains("该句起点未知"))
         // 直通未接线(非小智路径)→ 不能编造一个 0
         assertFalse(XiaozhiPacingLog.line(1, null).contains("垫底≈0"))
         assertTrue(XiaozhiPacingLog.line(1, null).contains("未接线"))

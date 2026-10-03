@@ -990,25 +990,28 @@ class VoiceBridgeService : Service() {
     // ---- 数据出口 ----
 
     private fun sendTextFrame(role: Char, text: String) {
-        // 【补正让路】先过一遍门:音频紧时的「正文补正」暂缓下发(首句/非本轮正文一律不受影响)。
+        // 【补正上屏的门】句级对齐 + 让路(首句/非本轮正文一律不受影响)。
         // 放在最前面是有意的:被暂缓的这一条不会写进 BLE 队列、也不会发「正文已上屏」信号。
         if (deferCorrectionWhileAudioIsTight(role, text)) return
         writeTextFrame(role, text)
     }
 
     /**
-     * **补正让路**:同一轮里第 2 次及以后的正文上屏(**补正**)在音频紧的时候暂缓下发。
+     * **补正上屏的两道门**:① **句级对齐**(本轮的主时机,作者 2026-10 定)—— 第 N(≥2)句的字幕
+     * 不上屏太早,而是在它自己那句音频**即将开播**时上屏(「先上字幕 → 紧接着该句声音」;
+     * 声音仍是连续流,句间不停、不切段、不重发 `tts_start`);② **补正让路**—— 音频紧时不插队。
      *
-     * 为什么要在这里拦:正文帧与音频帧**共用一条 BLE 串行写队列**(见 [XiaozhiTtsRelay]),而且
+     * 为什么要拦:正文帧与音频帧**共用一条 BLE 串行写队列**(见 [XiaozhiTtsRelay]),而且
      * 正文帧到达设备那一刻会触发一次**多行文本渲染** —— 设备的 BLE RX drain 与 LVGL 渲染在同一个
      * 应用任务里,那几十毫秒里 RX 排不空,解码队列就见底(真机 `欠载=23`)。设备侧那一半不改固件,
-     * 手机侧就只剩一件事可做:**别在音频紧的时候去动文字**。
+     * 手机侧能做的是:**在正确的时候(该句音频到点前)才去动文字,且不在音频紧时插队**。
      *
      * 只拦小智直通的补正(判定复用 [XiaozhiTtsRelay.replyScreenOrdinal],与日志里的「首次/补正」
      * 是**同一套规则**,不会分叉):
-     *  - 首句(序号 1)是「正文先于声音」的开播信号,必须立刻上屏;
+     *  - 首句(序号 1)是「正文先于声音」的开播信号,必须立刻上屏(**不受句级对齐与让路任何影响**);
      *  - 非本轮正文(序号 0)与本轮还没交付正文(null)不进这个通道;
-     *  - 其它四种网关没有直通音频在播,让路无意义 —— 一行也不改。
+     *  - 其它四种网关没有直通音频在播,让路无意义 —— 一行也不改(句级对齐也自然不生效:
+     *    [XiaozhiTtsRelay.sentenceStartMs] 对非小智 / 开关关闭 / 服务端只给文本一律返回 null)。
      *
      * @return true = 已暂缓(调用方**不要**再写这条 TEXT);false = 照旧立刻上屏
      */
@@ -1018,15 +1021,24 @@ class VoiceBridgeService : Service() {
         val ordinal = relay.replyScreenOrdinal(role, text) ?: return false
         if (ordinal <= 1) return false
         val pacing = if (::deviceTtsPush.isInitialized) deviceTtsPush.audioPacing() else null
-        return when (correctionPacer.offer(text, System.currentTimeMillis(), pacing)) {
+        // 【句级对齐】这条补正对应的**它自己那一句的音频起点**(ms);null = 没有可对齐的音频
+        // (非小智 / 开关关闭 / 服务端只给文本),这时照旧立即上屏。
+        val sentenceStartMs = relay.sentenceStartMs(text)
+        return when (correctionPacer.offer(text, System.currentTimeMillis(), pacing, sentenceStartMs)) {
             XiaozhiCorrectionPacer.Decision.SEND_NOW -> false
             XiaozhiCorrectionPacer.Decision.HOLD -> {
                 val pending = correctionPacer.pendingBody ?: text
+                // 两种“攒着”的原因分开说(真机一眼看出是「等该句音频到点」还是「音频紧不插队」)。
+                val reason = if (correctionPacer.waitingForSentenceStart(pacing)) {
+                    "等这一句字幕的音频到点,不提前上屏"
+                } else {
+                    "音频紧,不插队"
+                }
                 Log.i(
                     TAG,
-                    "补正让路:暂缓第 $ordinal 次正文上屏(音频紧,不插队) | " +
-                        XiaozhiPacingLog.line(ordinal, pacing) +
-                        " | 攒起来(最新全文 ${pending.length} 字),等垫底恢复或本段推完再补全文",
+                    "补正让路:暂缓第 $ordinal 次正文上屏($reason) | " +
+                        XiaozhiPacingLog.line(ordinal, pacing, sentenceStartMs) +
+                        " | 攒起来(最新全文 ${pending.length} 字),等该句音频到点、垫底恢复或本段推完再补全文",
                 )
                 true
             }
@@ -1058,7 +1070,7 @@ class VoiceBridgeService : Service() {
         if (correctionPacer.pendingBody == null) return
         val text = correctionPacer.tick(System.currentTimeMillis(), pacingOrNull()) ?: return
         // 具体「垫底/在途/队列」由 [notifyXiaozhiReplyOnScreen] 的取证行在同一点打出来,这里只说原因。
-        Log.i(TAG, "补正让路:垫底已恢复或兜底时限到,补上正文(全文 ${text.length} 字)")
+        Log.i(TAG, "补正让路:该句音频已到点(或垫底恢复/时限到),补上正文(全文 ${text.length} 字)")
         writeTextFrame(XiaozhiScreenSignal.REPLY_ROLE, text)
     }
 
@@ -1176,10 +1188,10 @@ class VoiceBridgeService : Service() {
         // 首句 = 本轮的第一条正文:上一轮万一还攒着一条待补正文,一并作废
         // (正常路径由 abort() 清;这里再确认一次,任何绕过 abort 的路径也不会把旧文案带到新一轮)。
         if (ord <= 1) correctionPacer.onTurnStart()
-        // 【取证行】作者要的那一行:文字动的**那一刻**音频侧到底紧不紧。
+        // 【取证行】作者要的那一行:字幕落位那一刻,音频侧到底走到哪里、该句起点在哪。
         // 钉在「已写入 BLE 写队列、即将开播」这一点上:首句时它应该是「垫底≈0 帧、队列=0」,
-        // 补正时它直接回答「那次补正是不是在垫底见底的时候插的队」。
-        Log.i(TAG, XiaozhiPacingLog.line(ord, pacingOrNull()))
+        // 补正时它直接回答「这次补正是不是贴着它那句的音频起点上的 / 有没有被让路拖后」。
+        Log.i(TAG, XiaozhiPacingLog.line(ord, pacingOrNull(), relay.sentenceStartMs(text)))
         // 【取证一跳】正文已全部入队、闸门即将打开:把当前 BLE 写模式一并打出来。
         // 为什么要打:正文分片与音频帧同一条串行写队列,而 drain 一开段会把队列切到无响应写
         // (Write Command)—— 若正文分片是在那个模式下真实写出的(或此刻尚未写出),
@@ -1576,6 +1588,12 @@ class VoiceBridgeService : Service() {
             val started = xzSentAtMs > 0L
             val elapsed = if (started) System.currentTimeMillis() - xzSentAtMs else 0L
             val leadMs = TtsFlowControl.leadMs(lastFrames, elapsed)
+            // 【句级字幕对齐的两个时钟】
+            //  · 推送时钟 = 已交给 BLE 写队列的帧数 × 帧长;
+            //  · 播放进度估计 = 推送时钟 − 垫底 = 自 `tts_start` 起的实时时长。
+            // 字幕的句级对齐用**播放进度**(见 [XiaozhiCorrectionPacer.SENTENCE_PRELOAD_MS]):
+            // 拿推送时钟比会硬生生早出一个垫底量(目标 1200ms、硬上限 2000ms)。
+            val pushedAudioMs = lastFrames.toLong() * TtsFlowControl.FRAME_MS
             val delivered = if (::ble.isInitialized) {
                 (ble.deliveredFrameCount() - xzDeliveredBase).toInt().coerceAtLeast(0)
             } else {
@@ -1593,6 +1611,8 @@ class VoiceBridgeService : Service() {
                     -1L
                 },
                 queueFrames = synchronized(xzLock) { xzFrames.size },
+                pushedAudioMs = pushedAudioMs,
+                playedAudioMs = (pushedAudioMs - leadMs).coerceAtLeast(0L),
             )
         }
 

@@ -323,6 +323,33 @@ class XiaozhiTtsRelay(
     private var screenSignals = 0
 
     /**
+     * **句边界记账**:本轮每条已交付正文 → **交付那一刻已收到的音频帧数**(= 该句的音频起点估计)。
+     *
+     * 为什么需要它:小智是一句一句来的(文本先到、音频随后),而音频帧本身**不带句界标记**
+     * (`[SEQ][rate_khz][frame_ms] + opus`,见 `docs/wire-protocol.md`)。App 唯一能测的句界就是
+     * 「这一句的正文到达那一刻,本段音频已经收到了多少帧」—— 于是第 N 句的音频起点 ≈
+     * 「第 1..N−1 句的音频总长」,服务侧据此把这条字幕安排在**它自己那句音频即将开播**时上屏
+     * ([sentenceStartMs] → `XiaozhiCorrectionPacer` 的句级对齐)。
+     *
+     * **误差来源**(见设计文档 §5/§6.5):音频略**滞后**于文本(服务端先发文本、再合成并流式推音频),
+     * 所以交付时刻收到的帧数会**低估**该句起点 → 字幕偏**早**(安全方向:字幕一定先于它那句的声音);
+     * 这种低估通常只有一小段音频的量级,而提前量也留了余量。
+     *
+     * 键是**清洗后的正文**(与 `onReplyBody`/`sendTextFrame('A')` 转手的同一串文本逐字一致);
+     * 噪声句(只拿到模板/emoji,不产生交付)**不记**边界(它本来就没有字幕)。
+     */
+    private val sentenceStartFrames = LinkedHashMap<String, Int>()
+
+    /**
+     * 本轮是否收到过**可下发的**音频帧(直通门放行且校验通过)。
+     *
+     * 为什么需要它:非小智网关 / 设备朗读开关关闭 / 服务端只给文本不给音频时,本轮**不会有声音**,
+     * 也就没有「按句落位」可言 —— 这时 [sentenceStartMs] 返回 null,补正照旧**立刻**上屏
+     * (不能因为等一个永远不会来的音频到点而把文案拖到收尾/兜底时限)。
+     */
+    private var audioFramesSeen = false
+
+    /**
      * **本会话是否见过任何 `tts` 状态报文**(start/sentence_start/sentence_end/stop 之一)。
      *
      * 为什么按「会话级」而不是「本轮」记账:这是**服务端行为**的特征 ——
@@ -373,6 +400,9 @@ class XiaozhiTtsRelay(
         // 上一轮的正文记录一并作废:旧轮的迟到「上屏信号」绝不能再把新一轮的闸门打开。
         expectedReplyBodies.clear()
         screenSignals = 0
+        // 句边界与「本轮有没有音频」同样按轮清:上一轮的音频起点绝不能用来安排新一轮的字幕。
+        sentenceStartFrames.clear()
+        audioFramesSeen = false
         buffered.clear()
         pushedFrames = 0
         droppedFrames = 0
@@ -387,6 +417,14 @@ class XiaozhiTtsRelay(
      */
     override fun onReplyBody(body: String) {
         if (body.isNotBlank() && !expectedReplyBodies.contains(body)) expectedReplyBodies.add(body)
+        // 句边界:本条正文交付那一刻已收到的音频帧数(见 [sentenceStartFrames])。
+        // 先到者为准(`containsKey`):同一条正文重复告知不该把边界往后挪。
+        if (body.isNotBlank()) {
+            val key = body.trim()
+            if (!sentenceStartFrames.containsKey(key)) {
+                sentenceStartFrames[key] = pushedFrames + buffered.size
+            }
+        }
         Log.i(
             tag,
             if (body.isBlank()) {
@@ -435,6 +473,22 @@ class XiaozhiTtsRelay(
     /** 本条 `TEXT` 是不是**本轮任何一条**已交付的正文(判定仍用同一套纯函数,不会分叉)。 */
     private fun acceptsLocked(role: Char, text: String): Boolean =
         expectedReplyBodies.any { XiaozhiScreenSignal.accepts(role, text, it) }
+
+    /**
+     * **这条正文的音频起点估计(ms)**:它交付那一刻本段已收到的音频帧数 × 帧长(见 [sentenceStartFrames])。
+     *
+     * 用途:服务侧把**第 N 句(≥2)的字幕**安排在「它自己那句音频即将开播」时上屏
+     * (字幕落位贴着该句音频起点,而不是一收到文本就上屏;见 `XiaozhiCorrectionPacer.SENTENCE_PRELOAD_MS`)。
+     * 首句(第 1 句)不走这条判定 —— 它上屏即开播,时机一点不变。
+     *
+     * @return null = **本类不提供句级对齐**(本轮一帧可下发的音频都没收到,或这条正文没有边界记录):
+     *   调用方应照旧立刻上屏,不要为了等一个不会到来的音频到点而把文案拖到收尾。
+     */
+    fun sentenceStartMs(body: String): Long? {
+        if (!audioFramesSeen) return null
+        val frames = sentenceStartFrames[body.trim()] ?: return null
+        return frames.toLong() * FRAME_MS_DEFAULT
+    }
 
     /**
      * **「本轮正文已上屏」信号**(服务侧在整段正文 `TEXT('A')` 已写进 BLE 串行写队列之后调用)。
@@ -586,6 +640,8 @@ class XiaozhiTtsRelay(
                     "${rateKhz}kHz/${frameMs}ms,${opus.size}B)",
             )
         }
+        // 收到过一帧**可下发的**音频:本轮的句级字幕对齐从此可用(见 [sentenceStartMs])。
+        audioFramesSeen = true
         val frame = BufferedFrame(rateKhz, frameMs, opus)
         if (textScreenPassed && segmentOpen) {
             // 正文已上屏、且本段窗口开着:组帧后立刻推 —— 只有服务侧流水线里必要的 BLE 串行写队列,
