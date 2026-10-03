@@ -40,14 +40,20 @@ import javax.crypto.spec.SecretKeySpec
  *   小智云按这个值登记/绑定设备,所以既不能用手机侧标识代替,取不到时也只能停手报错 ——
  *   退回全零匿名 MAC 会把两台设备登记成同一台,绑定结果对当前设备无效。
  *   非小智模式下这个值不参与绑定(压根不绑)。
+ * @param deviceFirmwareVersionProvider 设备固件版本(设备 hello 的 `fw`,如 `1.13`)的来源回调:
+ *   OTA 上报的 `version` **优先**用它(设备真的在跑什么版本),取不到再回退 App 的 `versionName`,
+ *   都没有才用 [XiaozhiOtaRequest.FALLBACK_VERSION]。默认 = 取不到。
  *
- * [queryCloud] 返回 websocket url/token 与绑定码,供调用方落盘/展示引导。
+ * [queryCloud] 返回 websocket url/token 与绑定码:绑定码用于展示引导,
+ * **url/token 是识别通道的凭据**,调用方必须落盘(见 [XiaozhiCredentialStore])—— 真 MAC 的识别链路
+ * 靠它握手,丢掉它就会「绑定之后反而识别不到」。
  */
 class XiaozhiActivator(
     private val context: Context,
     private val gatewayType: String,
     private val deviceAddress: String?,
     private val otaUrl: String,   // 默认 https://api.tenclass.net/xiaozhi/ota/
+    private val deviceFirmwareVersionProvider: () -> String? = { null },
 ) {
 
     private val tag = "XiaozhiActivator"
@@ -66,7 +72,25 @@ class XiaozhiActivator(
         .callTimeout(CLOUD_QUERY_TIMEOUT_MS, TimeUnit.MILLISECONDS)
         .build()
 
+    /** activate 轮询请求体的 media type(OTA 查激活的请求体已移到 [XiaozhiOtaRequest])。 */
     private val JSON = "application/json; charset=utf-8".toMediaType()
+
+    /**
+     * 本 App 的 `versionName`(运行时读取,不依赖 BuildConfig —— AGP 8 默认不生成它);读不到返回 null。
+     */
+    private fun appVersionName(): String? = try {
+        context.packageManager.getPackageInfo(context.packageName, 0).versionName
+    } catch (e: Exception) {
+        Log.w(tag, "读取 App 版本号失败:${e.message}")
+        null
+    }
+
+    /**
+     * 本次 OTA 上报的版本号(**唯一**解析点见 [XiaozhiOtaRequest.version]):
+     * 设备固件版本 → App `versionName` → [XiaozhiOtaRequest.FALLBACK_VERSION]。
+     */
+    private fun clientVersion(): String =
+        XiaozhiOtaRequest.version(deviceFirmwareVersionProvider(), appVersionName())
 
     /**
      * 一次 OTA 查询的结果(纯数据):云端激活状态 + 绑定码/ws 信息 + 失败原因。
@@ -123,6 +147,19 @@ class XiaozhiActivator(
         val activation = ota.getAsJsonObject("activation")
         val wsUrl = ota.getAsJsonObject("websocket")?.get("url")?.asString
         val wsToken = ota.getAsJsonObject("websocket")?.get("token")?.asString
+
+        // 取证:把两类响应(未激活含 activation / 已激活无 activation)的**键名与结构**都打进日志。
+        // 凭据类字段(token/password…)只打长度与前 4 位,明文绝不进日志(见 [XiaozhiOtaRequest.summarize])。
+        Log.i(
+            tag,
+            "OTA 响应结构(${if (activation == null) "已激活:无 activation 段" else "未激活:含 activation 段"}):\n" +
+                XiaozhiOtaRequest.summarize(ota),
+        )
+        Log.i(
+            tag,
+            "OTA 下发 websocket: url=${wsUrl ?: "未下发"}" +
+                " token=${XiaozhiOtaRequest.describeSecret(wsToken)}",
+        )
 
         if (activation == null || !activation.has("challenge")) {
             // 无 activation = 设备已授权,直接可用
@@ -220,38 +257,43 @@ class XiaozhiActivator(
     // ---- 底层请求 ----
 
     private fun postOta(baseUrl: String, mac: String, clientId: String): JsonObject? {
-        val board = JsonObject().apply {
-            addProperty("type", "lancelot")
-            addProperty("name", "Passport")
-            addProperty("ip", "127.0.0.1")
-            addProperty("mac", mac)
-        }
-        val app = JsonObject().apply {
-            addProperty("version", "0.1.0")
-            addProperty("elf_sha256", "0000000000000000")
-        }
-        val body = JsonObject().apply {
-            add("application", app)
-            add("board", board)
-        }
-        val req = Request.Builder()
-            .url(baseUrl)
-            .addHeader("Device-Id", mac)
-            .addHeader("Client-Id", clientId)
-            .addHeader("Content-Type", "application/json")
-            .addHeader("User-Agent", "lancelot/passport-0.1.0")
-            .addHeader("Accept-Language", "zh-CN")
-            .post(body.toString().toRequestBody(JSON))
-            .build()
+        // 请求体/User-Agent/版本号只有一处实现(见 [XiaozhiOtaRequest]):name=ai-passport、
+        // version=当前版本(设备固件版本优先),不再各写一份写死的 0.1.0/Passport。
+        val version = clientVersion()
+        val req = XiaozhiOtaRequest.request(baseUrl, mac, clientId, version)
+        Log.i(
+            tag,
+            "OTA 请求 device=$mac name=${XiaozhiOtaRequest.APP_NAME} version=$version" +
+                " User-Agent=${XiaozhiOtaRequest.userAgent(version)}",
+        )
         return try {
             client.newCall(req).execute().use { resp ->
+                val text = resp.body?.string().orEmpty()
                 if (resp.isSuccessful) {
-                    JsonParser.parseString(resp.body?.string() ?: "").asJsonObject
-                } else null
+                    JsonParser.parseString(text).asJsonObject
+                } else {
+                    // 非 200 也要留证据(旧实现直接返回 null,查不出是 401 还是 5xx);
+                    // 响应体同样**不原样进日志**:能解析就只打键名/结构(凭据字段已脱敏),否则只打长度。
+                    Log.w(tag, "OTA 失败 HTTP ${resp.code}: ${describeFailureBody(text)}")
+                    null
+                }
             }
         } catch (e: Exception) {
             Log.e(tag, "OTA 失败", e)
             null
+        }
+    }
+
+    /**
+     * 非 200 响应体的日志描述:能解析成 JSON 就给键名/结构(凭据字段已脱敏),
+     * 否则只给长度 —— 失败响应的正文也不把 token 明文写进日志。
+     */
+    private fun describeFailureBody(text: String): String {
+        if (text.isBlank()) return "(空响应体)"
+        return try {
+            "长度 ${text.length},\n" + XiaozhiOtaRequest.summarize(JsonParser.parseString(text).asJsonObject)
+        } catch (e: Exception) {
+            "非 JSON 响应体(长度 ${text.length})"
         }
     }
 

@@ -145,10 +145,18 @@ interface XiaozhiTtsObserver {
  * @param onTtsState TTS 状态分流(`state`, `text`);共用本会话的 TTS 直通用 [setTtsObserver]。
  * @param onTtsAudio 下行 TTS 音频分流(`opus`, `rateKhz`, `frameMs`)。
  *   `rateKhz`/`frameMs` 取自服务器 hello 的 `audio_params`(小智为 24 kHz/60 ms),**0 = 尚未上报**。
+ * @param linkAuthProvider 本次建链的**鉴权来源**(URL + `Authorization`),按 Device-Id 解析
+ *   (见 [XiaozhiCredentialGate]):小智 AI 用绑定得到的凭据,其余网关用匿名地址 + 占位 token。
+ *   `null` = 用构造参数里的 `serverUrl` + `token`([serverUrl]/[token] 的原行为,单测与直连会话照旧)。
+ *   返回 [XiaozhiLinkAuth.Unavailable] 时**不建链**,原因进 [unavailableReason] 供状态文案。
  */
 class XiaozhiSession(
     private val serverUrl: String,          // 如 wss://api.tenclass.net/xiaozhi/v1/
-    private val token: String,              // 如 test-token
+    /**
+     * **匿名通道**的占位 token(如 `test-token`):只在 [linkAuthProvider] 为 null(单测/直连会话)
+     * 或非小智网关(全零 MAC)时原样作为 `Authorization` 头使用;小智 AI 模式改用绑定凭据。
+     */
+    private val token: String,
     /**
      * 小智 Device-Id 的**按需解析**回调(每次建链时调用一次;取值规则见 [XiaozhiIdentity])。
      *
@@ -175,6 +183,14 @@ class XiaozhiSession(
      * 默认 false = 不发(未接线的调用方/单测保持原行为)。
      */
     private val sttAbortAfterEndTurn: () -> Boolean = { false },
+    /**
+     * 本次建链的鉴权来源(URL + `Authorization`),按 Device-Id 解析;见 [XiaozhiCredentialGate]。
+     *
+     * 为什么是回调而不是定值:凭据是「这台已连接设备的」,而且用户可能刚绑定完(凭据刚落盘)、
+     * 也可能中途换了网关类型(从小智 AI 切回匿名)—— 只有建链那一刻按当时的事实取值才对。
+     * 默认 null = 不注入,行为与改动前逐字一致(单测/直连会话)。
+     */
+    private val linkAuthProvider: ((String) -> XiaozhiLinkAuth)? = null,
 ) : XiaozhiLlmSource {
 
     private val tag = "XiaozhiStt"
@@ -222,6 +238,17 @@ class XiaozhiSession(
 
     /** 对外暴露热连接状态(通知栏「语音」行用)。 */
     override fun isWarmReady(): Boolean = warmReady
+
+    /**
+     * 识别通道**当前不可用**的可读原因(如小智模式尚未取得绑定凭据、小智模式没连设备);可用时为 null。
+     *
+     * 为什么要有它:链路压根没建起来时,上一层的状态文案不能只说「未识别到语音」—— 那看起来像
+     * 麦克风/网络坏了,而实际原因是「这台设备还没绑到本机」。流水线用这个原因当状态文案
+     * (见 `VoicePipeline` 的「本轮没识别到」分支)。
+     */
+    @Volatile
+    var unavailableReason: String? = null
+        private set
 
     override fun setLlmObserver(observer: ((String) -> Unit)?) {
         synchronized(llmObserverLock) { llmObserver = observer }
@@ -791,10 +818,28 @@ class XiaozhiSession(
         // 设备一连上,服务的预热巡检(prewarm)会带着真实 Device-Id 重新走到这里。
         val deviceId = deviceIdProvider().trim()
         if (deviceId.isEmpty()) {
+            unavailableReason = XiaozhiIdentity.NO_DEVICE_REASON
             Log.w(tag, "小智 Device-Id 未就绪(小智网关需先连接设备),跳过建链")
             onReady(false)
             return
         }
+        // 鉴权只有一处决策([XiaozhiCredentialGate]):小智 AI 必须用**绑定得到的凭据**;
+        // 没有凭据就不建链(绝不用占位 token 硬撞),原因写进 unavailableReason 给上层文案。
+        val auth = linkAuthProvider?.invoke(deviceId)
+            ?: XiaozhiLinkAuth.Ok(serverUrl, token.ifBlank { XiaozhiSettings.ANONYMOUS_PLACEHOLDER_TOKEN })
+        if (auth is XiaozhiLinkAuth.Unavailable) {
+            unavailableReason = auth.reason
+            Log.w(tag, "小智识别通道不可用,本轮不建链:${auth.reason}")
+            onReady(false)
+            return
+        }
+        unavailableReason = null
+        val ok = auth as XiaozhiLinkAuth.Ok
+        Log.i(
+            tag,
+            "识别通道建链:url=${ok.url} deviceId=$deviceId" +
+                " Authorization=${if (ok.authorization.isNullOrEmpty()) "无" else "len=${ok.authorization.length}"}",
+        )
         val alreadyWarm: Boolean
         synchronized(linkLock) {
             if (connecting) {
@@ -809,7 +854,7 @@ class XiaozhiSession(
                 // 必须先存回调再建 socket:hello 可能在 newWebSocket 返回后极快到达,
                 // 存晚了就会丢掉本次调用方(→ 冷路径永远收不到 onReady、设备收不到 turn_ready)。
                 onHelloCallback = onReady
-                ws = client.newWebSocket(buildRequest(deviceId), listener())
+                ws = client.newWebSocket(buildRequest(deviceId, ok), listener())
             }
         }
         if (alreadyWarm) {
@@ -818,17 +863,25 @@ class XiaozhiSession(
         }
     }
 
-    /** @param deviceId 本次建链使用的 Device-Id(已由 [connectAndHello] 解析并校验非空)。 */
-    private fun buildRequest(deviceId: String): Request = Request.Builder()
-        .url(serverUrl)
-        // 小智:必须先带 Device-Id/Client-Id/Protocol-Version 握手头 + 发 hello,否则立即 close
-        // Device-Id 按当前网关类型解析(小智 AI=已连接设备真 MAC,与 OTA/绑定同一个值;其余网关=全零匿名)。
-        // Client-Id 每次 App 启动随机生成(进程内稳定,重启换新)。
-        .addHeader("Authorization", token.ifBlank { "test-token" })
-        .addHeader("Protocol-Version", "1")
-        .addHeader("Device-Id", deviceId)
-        .addHeader("Client-Id", clientId)
-        .build()
+    /**
+     * @param deviceId 本次建链使用的 Device-Id(已由 [connectAndHello] 解析并校验非空)
+     * @param auth 本次建链的鉴权([XiaozhiCredentialGate] 解析结果:绑定凭据或匿名占位)
+     */
+    private fun buildRequest(deviceId: String, auth: XiaozhiLinkAuth.Ok): Request {
+        val builder = Request.Builder()
+            .url(auth.url)
+            // 小智:必须先带 Device-Id/Client-Id/Protocol-Version 握手头 + 发 hello,否则立即 close
+            // Device-Id 按当前网关类型解析(小智 AI=已连接设备真 MAC,与 OTA/绑定同一个值;其余网关=全零匿名)。
+            // Client-Id 每次 App 启动随机生成(进程内稳定,重启换新)。
+            // Authorization:小智 AI = OTA 下发的凭据(Bearer token,与官方固件同一规则);
+            // 匿名通道 = 原有占位 token 原样(行为不变)。
+            .addHeader("Protocol-Version", "1")
+            .addHeader("Device-Id", deviceId)
+            .addHeader("Client-Id", clientId)
+        auth.authorization?.takeIf { it.isNotEmpty() }
+            ?.let { builder.addHeader("Authorization", it) }
+        return builder.build()
+    }
 
     private fun listener(): WebSocketListener = object : WebSocketListener() {
         override fun onOpen(webSocket: WebSocket, response: Response) {

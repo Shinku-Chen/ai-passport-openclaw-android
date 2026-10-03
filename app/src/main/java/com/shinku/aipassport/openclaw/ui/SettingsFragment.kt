@@ -38,7 +38,11 @@ import com.shinku.aipassport.openclaw.service.VoiceBridgeService
 import com.shinku.aipassport.openclaw.stt.XiaozhiActivator
 import com.shinku.aipassport.openclaw.stt.XiaozhiBindGate
 import com.shinku.aipassport.openclaw.stt.XiaozhiBinding
+import com.shinku.aipassport.openclaw.stt.XiaozhiCredential
+import com.shinku.aipassport.openclaw.stt.XiaozhiCredentialGate
+import com.shinku.aipassport.openclaw.stt.XiaozhiCredentialStore
 import com.shinku.aipassport.openclaw.stt.XiaozhiIdentity
+import com.shinku.aipassport.openclaw.stt.XiaozhiOtaRequest
 import com.shinku.aipassport.openclaw.stt.XiaozhiSaveStatus
 import com.shinku.aipassport.openclaw.stt.XiaozhiSettings
 import com.shinku.aipassport.openclaw.tts.TtsSupport
@@ -1120,8 +1124,8 @@ class SettingsFragment : Fragment() {
         /** 云端已激活:允许保存/已可用。[notice] 必须展示给用户(不静默)。 */
         data class Activated(val mac: String, val notice: String) : XzFlow
 
-        /** 云端未激活,但用户已完成 6 位码绑定:允许保存/已可用。 */
-        data class Bound(val mac: String) : XzFlow
+        /** 云端未激活,但用户已完成 6 位码绑定:允许保存/已可用。[notice] = 绑定成功但没取到凭据等需要告知的事(空 = 无需额外提示)。 */
+        data class Bound(val mac: String, val notice: String = "") : XzFlow
 
         /** 查询失败 / 绑定失败或超时:不落盘 + 可读原因。 */
         data class Failed(val reason: String) : XzFlow
@@ -1155,7 +1159,17 @@ class SettingsFragment : Fragment() {
         // 激活器不需要 Fragment 视图;页面已销毁时用 application context 把流程跑完（与保存其它分支一致）
         val ctx = context?.applicationContext
             ?: return XzFlow.Failed("设置页已关闭,请重新打开后重试")
-        val activator = XiaozhiActivator(ctx, GatewaySettings.TYPE_XIAOZHI, mac, xzSettings.otaUrl)
+        // 版本号优先用**设备固件版本**(hello.fw):设备真的在跑什么版本;服务没跑/设备没上报时
+        // 回退 App 的 versionName(见 [XiaozhiOtaRequest.version])—— 不再写死 0.1.0。
+        val activator = XiaozhiActivator(
+            ctx,
+            GatewaySettings.TYPE_XIAOZHI,
+            mac,
+            xzSettings.otaUrl,
+            deviceFirmwareVersionProvider = { VoiceBridgeService.lastKnownFirmwareVersion() },
+        )
+        // 绑定得到的识别凭据(OTA 的 websocket url/token):**这次要落盘**——识别通道靠它握手。
+        val credentials = XiaozhiCredentialStore(ctx)
         // 保存与手动激活都是小智模式 + 已知 MAC，所以闸门一定会查云端。
         // **硬超时**（[XiaozhiActivator.CLOUD_QUERY_TIMEOUT_MS]，与 OTA 请求的 callTimeout 同值）：
         // 查云端不能无限期不返回，否则保存按钮就永远停在「查询小智云端…」且点不动（真机反馈）。
@@ -1165,13 +1179,42 @@ class SettingsFragment : Fragment() {
         return when (val decision = XiaozhiBindGate.decide(
             GatewaySettings.TYPE_XIAOZHI, mac, query.state, xzBinding.boundMac, query.detail,
         )) {
-            is XiaozhiBindGate.Decision.Activated -> XzFlow.Activated(decision.mac, decision.notice)
+            is XiaozhiBindGate.Decision.Activated -> {
+                // 云端已激活 = 设备已可用。凭据可能还没在本机(换手机/清过数据/以前只判了「已激活」就把
+                // OTA 响应丢掉):先把这次 OTA 的凭据落盘;没有就**再取一次** OTA(见 B4 自愈),
+                // 仍拿不到只能明确告诉用户「删除后重新绑定」——否则识别会一直「无语音」。
+                var saved = saveCredential(credentials, mac, query)
+                if (!saved) {
+                    val retry = withTimeoutOrNull(XiaozhiActivator.CLOUD_QUERY_TIMEOUT_MS) {
+                        activator.queryCloud()
+                    }
+                    if (retry != null) saved = saveCredential(credentials, mac, retry)
+                }
+                if (!saved) log("云端已激活但未取到识别凭据:${XiaozhiCredentialGate.MISSING_CREDENTIAL_NOTICE}")
+                XzFlow.Activated(
+                    decision.mac,
+                    if (saved) decision.notice else decision.notice + "\n" + XiaozhiCredentialGate.MISSING_CREDENTIAL_NOTICE,
+                )
+            }
 
             is XiaozhiBindGate.Decision.NeedBind -> {
                 onCode(query.code.orEmpty(), query.message.orEmpty())
                 val ok = activator.pollActivate(mac, query.challenge.orEmpty())
                 when (XiaozhiBindGate.afterBind(ok)) {
-                    XiaozhiBindGate.AfterBind.Persist -> XzFlow.Bound(mac)
+                    XiaozhiBindGate.AfterBind.Persist -> {
+                        // 绑定成功后云端才会给出可用的识别凭据:再取一次 OTA 并存下。
+                        // 取不到 = 这次绑定没换回凭据,只能重新绑一遍(明确提示,不静默)。
+                        val fresh = withTimeoutOrNull(XiaozhiActivator.CLOUD_QUERY_TIMEOUT_MS) {
+                            activator.queryCloud()
+                        }
+                        val saved = fresh != null && saveCredential(credentials, mac, fresh)
+                        if (!saved) log("绑定成功但未取到识别凭据:${XiaozhiCredentialGate.MISSING_CREDENTIAL_NOTICE}")
+                        XzFlow.Bound(
+                            mac,
+                            notice = if (saved) "" else XiaozhiCredentialGate.MISSING_CREDENTIAL_NOTICE,
+                        )
+                    }
+
                     XiaozhiBindGate.AfterBind.KeepOldConfig -> XzFlow.Failed(
                         query.detail
                             ?: "小智绑定超时:请确认已在 xiaozhi.me 输入绑定码 ${query.code.orEmpty()} 后重试。"
@@ -1187,6 +1230,28 @@ class SettingsFragment : Fragment() {
 
             XiaozhiBindGate.Decision.NoDevice -> XzFlow.Failed(XiaozhiIdentity.NO_DEVICE_REASON)
         }
+    }
+
+    /**
+     * 把这一次 OTA 下发的识别凭据落盘(小智 AI 模式)。
+     *
+     * 只有 url 与 token **都**拿到的完整凭据才存(见 [XiaozhiCredential.fromOta]);
+     * token 明文**不进日志**(只打长度与前 4 位)。
+     *
+     * @return 是否存下:false = 这次 OTA 没有完整凭据(调用方据此自愈重取或提示重新绑定)
+     */
+    private fun saveCredential(
+        credentials: XiaozhiCredentialStore,
+        mac: String,
+        query: XiaozhiActivator.CloudQuery,
+    ): Boolean {
+        val credential = XiaozhiCredential.fromOta(query.wsUrl, query.wsToken) ?: return false
+        credentials.save(mac, credential)
+        log(
+            "已保存小智识别凭据(设备 $mac):ws=${credential.url}" +
+                " token=${XiaozhiOtaRequest.describeSecret(credential.token)}"
+        )
+        return true
     }
 
     /**
@@ -1233,9 +1298,13 @@ class SettingsFragment : Fragment() {
                         // 绑定成功才记住这台设备 + 落盘；下次保存不会再绑一遍
                         xzBinding.boundMac = mac
                         persistXiaozhiAndApply(form, mac)
+                        // 绑定成功但没换回识别凭据:必须明确告知「删除后重新绑定」(不能静默)
+                        if (flow.notice.isNotBlank()) {
+                            log("小智绑定成功,但:${flow.notice}")
+                            showXiaozhiActivatedDialog(flow.notice)
+                        }
                         XiaozhiSaveStatus.Outcome.Bound(mac)
                     }
-
                     is XzFlow.Failed -> XiaozhiSaveStatus.Outcome.Failed(flow.reason)
 
                     // 查云端硬超时:未落盘 + 可读文案(不是静默)
@@ -1562,9 +1631,17 @@ class SettingsFragment : Fragment() {
                         is XzFlow.Bound -> {
                             // 手动激活成功 = 这台设备已可用:记下绑定,之后「保存网关设置」不必再绑一遍。
                             xzBinding.boundMac = gate.mac
-                            _binding?.let { b -> b.xzActiveStatus.text = "激活成功!小智识别已可用" }
-                            log("小智激活成功,设备 ${gate.mac} 已绑定")
-                            toast("激活成功,请重启语音桥服务")
+                            // 绑定成功但没换回凭据时把下一步直接写在状态行上(同时 toast)
+                            val warn = result.notice.trim().takeIf { it.isNotEmpty() }
+                            _binding?.let { b ->
+                                b.xzActiveStatus.text = "激活成功!小智识别已可用" +
+                                    (warn?.let { "\n$it" } ?: "")
+                            }
+                            log(
+                                "小智激活成功,设备 ${gate.mac} 已绑定" +
+                                    (warn?.let { ";但 $it" } ?: "")
+                            )
+                            toast(warn ?: "激活成功,请重启语音桥服务")
                         }
 
                         is XzFlow.Failed -> {

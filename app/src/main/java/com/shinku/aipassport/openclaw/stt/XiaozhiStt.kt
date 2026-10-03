@@ -23,7 +23,7 @@ package com.shinku.aipassport.openclaw.stt
  */
 class XiaozhiStt(
     serverUrl: String,                      // 如 wss://api.tenclass.net/xiaozhi/v1/
-    token: String,                          // 如 test-token
+    token: String,                          // 匿名通道占位 token(如 test-token)
     /** 小智 Device-Id 的按需解析回调(每次建链时按当时的网关类型 + 已连接设备解析;见 [XiaozhiIdentity])。 */
     deviceIdProvider: () -> String,
     onPartial: ((String) -> Unit)? = null,
@@ -36,6 +36,13 @@ class XiaozhiStt(
      * 默认 false = 不发(未接线的调用方/单测保持原行为)。
      */
     sttAbortAfterEndTurn: () -> Boolean = { false },
+    /**
+     * 本次建链的鉴权来源(URL + `Authorization`),按 Device-Id 解析;见 [XiaozhiCredentialGate]。
+     *
+     * [SttFactory] 按当前网关类型注入:小智 AI → 绑定得到的凭据(没有就不建链);
+     * 其余网关 → 匿名地址 + 占位 token。`null` = 不注入(单测/直连会话),行为与改动前一致。
+     */
+    linkAuthProvider: ((String) -> XiaozhiLinkAuth)? = null,
 ) : SttEngine {
 
     /**
@@ -49,7 +56,8 @@ class XiaozhiStt(
         onPartial: ((String) -> Unit)? = null,
         recovery: TurnRecovery.Budget = TurnRecovery.Budget(),
         sttAbortAfterEndTurn: () -> Boolean = { false },
-    ) : this(serverUrl, token, { deviceId }, onPartial, recovery, sttAbortAfterEndTurn)
+        linkAuthProvider: ((String) -> XiaozhiLinkAuth)? = null,
+    ) : this(serverUrl, token, { deviceId }, onPartial, recovery, sttAbortAfterEndTurn, linkAuthProvider)
 
     /** 流式中间结果回调(构造参数原样保留):会话层的 `onStt` 与对外 [onPartial] 共用同一个实例。 */
     private val partialCallback: ((String) -> Unit)? = onPartial
@@ -67,6 +75,7 @@ class XiaozhiStt(
         deviceIdProvider = deviceIdProvider,
         recovery = recovery,
         sttAbortAfterEndTurn = sttAbortAfterEndTurn,
+        linkAuthProvider = linkAuthProvider,
         // 唯一保留的一条路:stt → 文本(其余 llm/tts/音频分流本适配器不接;
         // llm 正文由共用本会话的「小智 AI 网关」用观察者取走,见 XiaozhiGateway)。
         onStt = { text -> partialCallback?.invoke(text) },
@@ -84,6 +93,15 @@ class XiaozhiStt(
 
     /** 对外暴露热连接状态(通知栏「语音」行用)。 */
     override fun isWarmReady(): Boolean = session.isWarmReady()
+
+    /**
+     * 识别通道**当前不可用**的可读原因(如小智模式尚未取得绑定凭据);可用时为 null。
+     *
+     * 流水线在「本轮没识别到」时优先显示它(见 `VoicePipeline`),用户据此知道要先绑定,
+     * 而不是以为麦克风/网络坏了。
+     */
+    override val unavailableReason: String?
+        get() = session.unavailableReason
 
     override fun prewarm() = session.prewarm()
 

@@ -11,8 +11,13 @@ class XiaozhiSettings {
     /** 小智 websocket 地址(写死官方)。 */
     val serverUrl: String = "wss://api.tenclass.net/xiaozhi/v1/"
 
-    /** 小智识别 token(写死官方共享 test-token)。 */
-    val token: String = "test-token"
+    /**
+     * 小智识别 token:匿名通道(非小智网关 / 未绑定)用的**共享占位 token**。
+     *
+     * 只有匿名通道用它:小智 AI 模式用绑定得到的凭据(见 [XiaozhiCredential]),没有凭据就不建链
+     * —— 绝不拿这个占位值去撞真 MAC 的识别链路。
+     */
+    val token: String = ANONYMOUS_PLACEHOLDER_TOKEN
 
     /** 小智 OTA 激活地址(写死官方)。 */
     val otaUrl: String = "https://api.tenclass.net/xiaozhi/ota/"
@@ -22,4 +27,9 @@ class XiaozhiSettings {
 
     /** 始终启用小智识别。 */
     fun enabled(): Boolean = true
+
+    companion object {
+        /** 匿名通道的占位 token(**唯一**字面量:默认值与回退都取它,不再各写一份)。 */
+        const val ANONYMOUS_PLACEHOLDER_TOKEN = "test-token"
+    }
 }

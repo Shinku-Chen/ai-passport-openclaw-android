@@ -34,6 +34,9 @@ object SttFactory {
         val serverUrl = xz.serverUrl
         val wsToken = xz.token
         val gateway = GatewaySettings(context)
+        // 绑定得到的识别凭据(OTA 的 websocket url/token)只从本机读;没读到时不给凭据 ——
+        // [XiaozhiCredentialGate] 对小智 AI 会返回可读原因,绝不拿占位 token 硬撞真 MAC 的链路。
+        val credentials = XiaozhiCredentialStore(context)
         // 「非小智网关模式」= 小智通道只做识别:云端拿到识别文本后会接着跑走它自己的 LLM + TTS,
         // 那段回复没人用(回复来自 App 自己的网关) → 识别结束后要补发一次中止。
         // 判定来源只有一处:复用 [XiaozhiIdentity.isXiaozhi] 的既有判定,不在这里再写一份字符串比较;
@@ -52,6 +55,16 @@ object SttFactory {
             },
             onPartial = onPartial,
             sttAbortAfterEndTurn = abortAfterEndTurn,
+            // 建链鉴权只有一处决策([XiaozhiCredentialGate]):小智 AI 必须用这台设备**绑定得到的凭据**
+            // (OTA 的 websocket url/token,没凭据就不建链并给可读原因),其余网关仍走匿名地址 + 占位 token。
+            linkAuthProvider = { deviceId ->
+                XiaozhiCredentialGate.linkAuth(
+                    gatewayType = gateway.type,
+                    credential = credentials.get(deviceId),
+                    defaultUrl = serverUrl,
+                    placeholderToken = wsToken,
+                )
+            },
         )
     }
 }

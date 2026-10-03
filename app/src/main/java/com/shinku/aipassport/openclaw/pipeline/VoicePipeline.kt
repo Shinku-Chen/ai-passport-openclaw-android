@@ -469,8 +469,11 @@ class VoicePipeline(
             val text = stt.endTurn()
             if (myTurn != turnId) return@launch   // 已被新一轮打断
             if (text.isNullOrBlank()) {
-                Log.d(tag, "未识别到语音")
-                onState("未识别到语音")
+                // 识别通道**压根不可用**时(如小智 AI 尚未取得绑定凭据)优先显示可读原因:
+                // 「未识别到语音」看起来像麦克风/网络坏了,而实际原因(去绑定设备)是用户能直接动手修的。
+                val reason = stt.unavailableReason?.trim()?.takeIf { it.isNotEmpty() }
+                Log.d(tag, "未识别到语音" + (reason?.let { "($it)" } ?: ""))
+                onState(reason ?: "未识别到语音")
                 // 反馈硬件:未识别到语音 → 设备屏显示"无语音"
                 ConversationStore.add("agent", "无语音", ConversationStore.SOURCE_VOICE)
                 sendText('A', "无语音")

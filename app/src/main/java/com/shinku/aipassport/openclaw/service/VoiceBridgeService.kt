@@ -299,6 +299,19 @@ class VoiceBridgeService : Service() {
                 Intent(context, VoiceBridgeService::class.java).setAction(ACTION_RELOAD_SETTINGS),
             )
         }
+
+        /** 最近一次收到的设备固件版本(`hello.fw`,如 `1.13`);服务没跑 / 设备没上报 → null。 */
+        @Volatile
+        private var lastDeviceFw: String? = null
+
+        /**
+         * 设备页/设置页(绑定 OTA)用的**固件版本**读法。
+         *
+         * 为什么要这个静态读法:绑定请求要上报「当前版本号」,优先用**设备固件版本**(见
+         * [com.shinku.aipassport.openclaw.stt.XiaozhiActivator]);而固件版本只存在于服务里的流水线
+         * ([VoicePipeline.deviceFirmwareVersion]),没有实例可拿,所以随状态广播一起记一份。
+         */
+        fun lastKnownFirmwareVersion(): String? = lastDeviceFw
     }
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
@@ -1642,6 +1655,10 @@ class VoiceBridgeService : Service() {
         Log.i(TAG, status)
         lastStatusText = status
         refreshConnectedDevice()
+        // 固件版本(设备 hello 的 `fw`):服务在跑且设备报过才有;广播的同时记一份静态读法,
+        // 供设置页的绑定 OTA 请求报「当前版本号」(见 [lastKnownFirmwareVersion])。
+        val deviceFw = if (::pipeline.isInitialized) pipeline.deviceFirmwareVersion.orEmpty() else ""
+        lastDeviceFw = deviceFw.takeIf { it.isNotBlank() }
         // 广播可能从 BLE 回调线程发出;通知/广播本身线程安全,无需切线程
         updateNotification(status)
         sendBroadcast(
@@ -1653,10 +1670,7 @@ class VoiceBridgeService : Service() {
                 .putExtra(EXTRA_DEVICE_ADDR, lastDeviceAddr)
                 .putExtra(EXTRA_DEVICE_STATE, deviceLinkState)
                 // 固件版本:只有设备 hello 报过才有(老固件不上报 → 空串,设备页就不显示)
-                .putExtra(
-                    EXTRA_DEVICE_FW,
-                    if (::pipeline.isInitialized) pipeline.deviceFirmwareVersion.orEmpty() else "",
-                )
+                .putExtra(EXTRA_DEVICE_FW, deviceFw)
         )
     }
 

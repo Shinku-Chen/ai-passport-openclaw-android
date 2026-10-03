@@ -22,7 +22,7 @@
 | 位置 | 现有职责 | 与本设计的关系 |
 | --- | --- | --- |
 | `stt/XiaozhiStt.kt`（73 行，薄适配器）+ `stt/XiaozhiSession.kt`（828 行，**已抽出的 WS 会话层**） | 会话层负责 hello 握手、上行 opus（16 kHz/60 ms 单声道）、预热（`WarmLink`）、断线重连重放（`TurnRecovery`），并把 `stt`/`llm`/`tts` 三类消息分流；适配器只保留「`{"type":"stt"}` → 文本」 | ✅ 已抽离（2026-10-03）；下一步在会话层之上实现 LLM/TTS |
-| `stt/XiaozhiActivator.kt`（208 行） | 官方 OTA → 手持绑定码 → `activate` 轮询 → 授权（`lancelot` + HMAC） | 直接复用，激活状态是「小智 AI」能否可用的前提 |
+| `stt/XiaozhiActivator.kt`（208 行） | 官方 OTA → 手持绑定码 → `activate` 轮询 → 授权（`lancelot` + HMAC） | 直接复用；激活状态**与 OTA 下发的识别凭据**（`websocket.url/token`）都是「小智 AI」能否可用的前提（见 §7.3） |
 | `stt/XiaozhiSettings.kt` | 小智开关（当前恒为 true） | 扩展为「小智 AI」的配置入口 |
 | `pipeline/VoicePipeline.kt` | 一轮的编排：`turn_start` → 音频喂 STT → `endTurn()` 出文本 → 网关 `chatMulti` → 上屏（`sendText`）→ 设备朗读（`DeviceTtsSession`） | 新增「小智直连」模式的分支 |
 | `tts/DeviceTtsSession` + `TtsFraming` + `TtsFlowControl` | 下行 TTS：本地合成 PCM → 编 Opus → `TTS_OPUS` 帧，含领先量/在途上限/`tts_abort` | **复用其下行与流控**，跳过本地合成 |
@@ -150,6 +150,24 @@
 - 「高级 → 小智识别」的设备 ID 行与实际在用的一致：小智模式显示真 MAC，非小智模式显示
   `00:00:00:00:00:00（匿名）` + 「用小智 AI 作为网关时会改用设备 MAC」。
 - 本节取代 §7.1 中「Device-Id 一律用设备真 MAC」的表述。
+
+### 7.3 修订（识别通道必须带「绑定得到的凭据」）
+
+- **OTA 不只是「查激活状态」**：绑定成功后小智云会为该设备下发识别通道凭据（响应里的 `websocket.url` /
+  `websocket.token`）。识别 WS 握手必须带它（`Authorization: Bearer <token>`，与官方固件
+  `websocket_protocol.cc` 同一规则），否则真 MAC 的整轮识别静默失败（App 只能回「无语音」）。
+- 凭据落盘：`stt/XiaozhiCredentialStore`（独立 prefs `xiaozhi_credential`，键 `cred_mac` / `cred_ws_url` /
+  `cred_ws_token`，只存本机、不入库、不进日志 —— 日志只打长度与前 4 位）。凭据带自己的设备 MAC，
+  换设备取不到旧凭据（不会拿别的设备的 token 去握手）。
+- 建链鉴权唯一决策点：`stt/XiaozhiCredentialGate.linkAuth(网关类型, 凭据, 默认地址, 占位 token)` ——
+  小智 AI 用凭据；**没有凭据就不建链**并给可读原因（`MISSING_CREDENTIAL_REASON`，经新增的
+  `SttEngine.unavailableReason` 进状态卡文案），**绝不**用占位 token 硬撞云端；
+  非小智网关仍走匿名地址 + 占位 token（行为不变）。
+- 「云端已激活但本地没有凭据」：保存/激活时**再取一次** OTA 并落盘；仍没有 → 提示
+  「云端已激活，但本次 OTA 没有下发识别凭据（websocket.token）：请在 xiaozhi.me 删除该设备后重新绑定一次。」
+  （绑定成功但没换回凭据时同样提示）。
+- OTA 请求字段单一来源：`stt/XiaozhiOtaRequest`（`name=ai-passport`、`version` = 设备固件版本 → App
+  `versionName` → 显式回退、`User-Agent` 同源）；OTA 响应按未激活/已激活两种把键名与结构打进日志用于取证。
 
 ## 8. 异常与回退
 

@@ -74,6 +74,15 @@ interface SttEngine {
      */
     fun isWarmReady(): Boolean = false
 
+    /**
+     * 识别通道**当前不可用**的可读原因(如小智模式尚未取得绑定凭据、没连设备);可用时为 null。
+     *
+     * 为什么要有它:链路压根没建起来时,状态文案不能只说「未识别到语音」—— 那看起来像麦克风/网络
+     * 坏了,而实际原因(如「这台设备还没绑到本机」)是用户能直接动手修的。默认 null = 不区分。
+     */
+    val unavailableReason: String?
+        get() = null
+
     /** 释放资源。 */
     fun release()
 
