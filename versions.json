@@ -1,10 +1,10 @@
 {
   "schema": 1,
-  "updated": "2026-10-03T18:18:36Z",
+  "updated": "2026-10-03T18:25:00Z",
   "app": {
     "version": "1.13.1",
     "url": "https://github.com/Shinku-Chen/ai-passport-openclaw-android/releases/latest",
-    "notes": ""
+    "notes": "新增小智 AI 网关：可用小智的识别与声音；语音按句播放，字幕跟着上一句播完再出；长回答第一句就出声，不用再等整段生成"
   },
   "firmware": {
     "version": "1.13",
