@@ -1,10 +1,10 @@
 {
   "schema": 1,
-  "updated": "2026-10-02T16:50:56Z",
+  "updated": "2026-10-03T18:18:36Z",
   "app": {
-    "version": "1.13",
+    "version": "1.13.1",
     "url": "https://github.com/Shinku-Chen/ai-passport-openclaw-android/releases/latest",
-    "notes": "短按唤醒不再出现「无语音」；识别零延迟；设备屏新消息停首行、滚到底末条贴底"
+    "notes": ""
   },
   "firmware": {
     "version": "1.13",
