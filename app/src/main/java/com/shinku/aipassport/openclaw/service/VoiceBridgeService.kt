@@ -1450,10 +1450,11 @@ class VoiceBridgeService : Service() {
                                 Log.i(TAG, "小智 TTS 直通被打断:已发 $sent 帧")
                                 return
                             }
-                            // 推送途中掉线:与本地合成同一判定(该设备可能扛不住下行音频),停手并关开关。
+                            // 推送途中掉线:音频来自小智云端(**不是**本机合成出来的),
+                            // 因此只停手 + 提示,不去动用户的「设备朗读」开关(见 onDeviceTtsLookedTooHeavy)。
                             if (!ble.isConnected()) {
                                 val remaining = synchronized(xzLock) { xzFrames.size }
-                                onDeviceTtsLookedTooHeavy(sent, sent + remaining)
+                                onDeviceTtsLookedTooHeavy(sent, sent + remaining, autoDisableSwitch = false)
                                 return
                             }
                             // payload 已含 [SEQ][rate_khz][frame_ms](由 XiaozhiTtsRelay 组好),
@@ -1506,11 +1507,25 @@ class VoiceBridgeService : Service() {
          * 即设备没崩,是 BLE 被拖垮;而且掉一次后设备 BLE 会持续降级(重连也超时),要复位才恢复。
          *
          * 代价不对称:误判(其实是环境掉线)只是让用户重新打开开关;不判则设备反复重启。
+         *
+         * @param autoDisableSwitch 是否把 `tts_enabled` 自动置 false。
+         *   **只在本机合成那条路为 true** —— 那个判定针对的是「设备扛不住**手机合成出来的**下行音频」。
+         *   小智直通(音频由小智云端下发,本机不合成)传 **false**:仍记日志 + 状态提示,
+         *   但**不动用户的开关**(否则又一次不经用户同意把小智音色关掉)。
          */
-        private fun onDeviceTtsLookedTooHeavy(sent: Int, total: Int) {
+        private fun onDeviceTtsLookedTooHeavy(sent: Int, total: Int, autoDisableSwitch: Boolean) {
+            if (!autoDisableSwitch) {
+                Log.e(
+                    TAG,
+                    "小智直通途中设备掉线(已发 $sent/$total 帧):音频来自小智云端,无法归因到本机合成," +
+                        "保留用户的设备朗读开关(本轮已停止下发)",
+                )
+                publishStatus("小智语音播报途中设备掉线(已发 $sent/$total 帧):已停止本轮下发,开关保持打开")
+                return
+            }
             Log.e(
                 TAG,
-                "设备朗读途中设备掉线(已发 $sent/$total 帧):判定该设备扛不住下行音频,自动关闭设备朗读",
+                "设备朗读途中设备掉线(已发 $sent/$total 帧):判定该设备扛不住本机合成的下行音频,自动关闭设备朗读",
             )
             try {
                 settings.ttsEnabled = false
@@ -1608,9 +1623,9 @@ class VoiceBridgeService : Service() {
                 }
                 // 设备在**推送途中**掉线:真机实测这是 TTS 推送带来的 BLE 副作用的典型表现——
                 // 开始推后约 5.2s 监督超时(status=8),之后设备 BLE 半死(重连也超时),要复位才恢复。
-                // 所以立刻停手、关掉开关并把原因播出来。
+                // 所以立刻停手、关掉开关并把原因播出来(本机合成这条路才归因到设备扛不住)。
                 if (!ble.isConnected()) {
-                    onDeviceTtsLookedTooHeavy(sent, plan.packets.size)
+                    onDeviceTtsLookedTooHeavy(sent, plan.packets.size, autoDisableSwitch = true)
                     return
                 }
                 ble.writeBytes(vbEncodeTtsOpusFrame(seq, plan.rateKhz, plan.frameMs, packet))

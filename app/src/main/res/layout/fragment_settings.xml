@@ -317,6 +317,47 @@
             android:padding="6dp"
             android:visibility="gone" />
 
+        <!-- 小智 AI:该类型没有可填的连接参数(ws/OTA 地址与 token 写死在 XiaozhiSettings),
+             本页只有这一行「播放小智语音」开关。
+             它与「对话设置 → 设备朗读」是**同一个设置**(GatewaySettings.ttsEnabled,切换即落盘),
+             两处双向同步显示(见 SettingsFragment.renderTtsSwitches / DeviceTtsSwitches);
+             关闭时一个字节的小智音频都不下发,且**不回退**成本地合成(小智自带音频,
+             见 GatewayAdapter.providesDeviceTtsAudio)。其它四种网关下这一行隐藏。 -->
+        <LinearLayout
+            android:id="@+id/groupXiaozhi"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="10dp"
+            android:background="@drawable/bg_card"
+            android:orientation="vertical"
+            android:padding="12dp"
+            android:visibility="gone">
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="小智 AI"
+                android:textStyle="bold"
+                android:textColor="#4FC3F7" />
+
+            <com.google.android.material.materialswitch.MaterialSwitch
+                android:id="@+id/checkXiaozhiTts"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="6dp"
+                android:text="播放小智语音"
+                android:textColor="#DDDDDD" />
+
+            <TextView
+                android:id="@+id/xzTtsHint"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="4dp"
+                android:text="用小智的声音在设备上朗读；与「对话设置 → 设备朗读」是同一个开关；音频由小智下发，不需要本机合成"
+                android:textColor="#9E9E9E"
+                android:textSize="12sp" />
+        </LinearLayout>
+
         <!-- OpenClaw:WebSocket + Ed25519 设备鉴权;各套配置各自持久化,切换类型不丢 -->
         <LinearLayout
             android:id="@+id/groupOpenclaw"
@@ -851,7 +892,9 @@
         <!-- 设备朗读(下行 TTS):网关回复上屏之后**再念一遍**。
              设备优先(需设备在 hello 里报 caps:["tts_opus"],固件只在 Opus 解码器就绪时报);
              设备播不了(老固件/未连接)才退回手机自己念;关闭时两边都不出声。
-             默认【关】—— 打开前请确认这台手机的 TTS 引擎可用(没装引擎时会显示可读原因并跳过,不会报错)。 -->
+             默认【开】(tts_enabled 默认 true)。本机没有可用的合成引擎时,这一行**只置灰、不改值**,
+             且**小智 AI 下仍可开启** —— 小智的音源由云端下发,不经本机合成
+             (提示与可点与否见 SettingsFragment.applyTtsAvailability 与 ui/DeviceTtsSwitches)。 -->
         <com.google.android.material.materialswitch.MaterialSwitch
             android:id="@+id/checkTtsEnabled"
             android:layout_width="match_parent"

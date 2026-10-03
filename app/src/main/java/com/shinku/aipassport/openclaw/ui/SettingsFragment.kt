@@ -101,6 +101,14 @@ import kotlinx.coroutines.withTimeoutOrNull
  *
  * 设备朗读(下行 TTS)默认开(`tts_enabled` 默认 true,固件播放通路已真机验收);
  * `tts_engine` 保留在 prefs(默认 android),当前只有系统 TTS 一种实现。
+ *
+ * 「设备朗读」有**两个入口**:「对话设置 → 设备朗读」与「网关设置 → 小智 AI → 播放小智语音」。
+ * 两者读写的是**同一个** `tts_enabled`(小智模式下的音源就是小智下发的 opus,没有本地合成,
+ * 所以那里的「设备朗读」就是「用小智的声音播」):任一处置位后另一处立刻同步成同一个值,
+ * 渲染状态与可见性交给纯逻辑 [DeviceTtsSwitches](单测钉住「两处同源」「只在「小智 AI」下出现」)。
+ * 本机合成不可用时**只置灰、不改值**,且小智 AI 下仍可点(见 [applyTtsAvailability])。
+ *
+ * 小智 AI 在网关设置里至今**只有这么一行专属控件**(识别/激活那整块 UI 仍只在「高级」)。
  */
 class SettingsFragment : Fragment() {
 
@@ -121,6 +129,22 @@ class SettingsFragment : Fragment() {
 
     /** 「前台服务被系统拒绝」状态:决定警告与修复按钮是否可见(见 applyKeepAliveVisibility)。 */
     private var keepAliveDenied = false
+
+    /**
+     * 本机系统 TTS 探测结论(见 [applyTtsAvailability]):false = 正在探测或本机合成不可用。
+     *
+     * 两处「朗读」开关(**同一个设置**,见 [DeviceTtsSwitches])共用一个门控 —— 但**只决定是否可点**,
+     * 不参与开关的值:不可用时两处一起置灰(小智 AI 下例外,它不经本机合成,见 [DeviceTtsSwitches.switchEnabled])。
+     */
+    private var ttsAvailable = false
+
+    /**
+     * 正在把状态回写到两处开关(见 [renderTtsSwitches])。
+     *
+     * 回写 isChecked 会触发另一个开关的监听器,用它把那次回调与「用户拨动」区分开,
+     * 避免两处开关互相回拨。
+     */
+    private var applyingTtsSwitches = false
 
     /**
      * 当前语音桥服务实际使用的网关类型(页面加载时的落盘值)。
@@ -252,11 +276,13 @@ class SettingsFragment : Fragment() {
             Section.GATEWAY to listOf(
                 binding.titleGateway, binding.labelGatewayType, binding.spinnerType,
                 binding.textCleartextHint,
+                // 「小智 AI」在本页的**唯一**专属控件:那行「播放小智语音」开关(它与「对话设置 → 设备朗读」
+                // 是同一个设置,见 DeviceTtsSwitches)。识别/激活那整块 UI 仍只在「高级」，
+                // 这里再摆一份就是两套 UI 拨同一批控件（见类 KDoc）。
+                binding.groupXiaozhi,
                 binding.groupOpenclaw, binding.groupHermes, binding.groupOpenai, binding.btnSave,
                 // 保存按钮下方那行「绑定流程状态」：小智 AI 模式下的常驻提示（非小智/空闲整行隐藏）
                 binding.xzBindStatus,
-                // 「小智 AI」在这个页里只有下拉里的一项:识别/激活那整块 UI 属于「高级」，
-                // 这里再摆一份就是两套 UI 拨同一批控件（见类 KDoc）。
             ),
             Section.DEVICE to listOf(binding.groupDevice),
             Section.CHAT to listOf(
@@ -320,7 +346,13 @@ class SettingsFragment : Fragment() {
 
     // ---- 网关类型下拉 ----
 
-    /** 按当前选中的类型显示/隐藏三套字段分组(Echo 不需要任何字段)。 */
+    /**
+     * 按当前选中的类型显示/隐藏各字段分组(Echo 不需要任何字段;小智 AI 只有那行朗读开关)。
+     *
+     * 「小智 AI」在本页**只有**那行「播放小智语音」开关(识别/绑定 UI 在「高级」，见类 KDoc):
+     * 它只在选到小智 AI 时出现,切到其它四种类型(或选回小智 AI)都立即跟着切换。
+     * 「是不是小智 AI」的判定在纯逻辑 [DeviceTtsSwitches.xiaozhiRowVisible] 里(与识别通道同源,单测钉住)。
+     */
     private fun applyTypeVisibility() {
         val type = selectedType()
         binding.groupOpenclaw.visibility =
@@ -329,9 +361,9 @@ class SettingsFragment : Fragment() {
             if (type == GatewaySettings.TYPE_HERMES) View.VISIBLE else View.GONE
         binding.groupOpenai.visibility =
             if (type == GatewaySettings.TYPE_OPENAI) View.VISIBLE else View.GONE
-        // 「小智 AI」在本页没有专属控件(它的识别/绑定 UI 在「高级」，见类 KDoc),
-        // 所以这里不需要为它拨任何 visibility —— 否则就会再出现一份被两个 section 争抢的块。
-        // 但按钮下方那行「绑定流程状态」随类型变（切成别的类型就隐藏)，所以跟着重画一次。
+        binding.groupXiaozhi.visibility =
+            if (DeviceTtsSwitches.xiaozhiRowVisible(type)) View.VISIBLE else View.GONE
+        // 按钮下方那行「绑定流程状态」随类型变（切成别的类型就隐藏)，所以跟着重画一次。
         renderXiaozhiSaveStatus()
     }
 
@@ -483,21 +515,18 @@ class SettingsFragment : Fragment() {
             log("开机自动启动：${if (checked) "开" else "关"}")
         }
 
-        // 设备朗读（下行 TTS，默认关）：与网关无关，切换即落盘。
+        // 设备朗读（下行 TTS，默认开）：与网关无关，切换即落盘。
         // 打开后回复上屏之后再念一遍 —— 设备优先（需设备 hello 报 caps:["tts_opus"]，
         // 固件只在 Opus 解码器就绪时报），设备播不了才退回手机朗读；关闭时两边都不出声。
         // 服务启动时已打开则预热一次引擎，日志里会列出这台机器的可用音色与最终选用项。
-        binding.checkTtsEnabled.isChecked = settings.ttsEnabled
-        binding.checkTtsEnabled.setOnCheckedChangeListener { _, checked ->
-            settings.ttsEnabled = checked
-            log("设备朗读(TTS)：${if (checked) "开" else "关"}")
-            // 打开时立刻预热合成引擎:马上把「引擎能不能用 + 有哪些可用音色」写进日志,
-            // 不用等第一条回复(也方便在没有网关时先确认 TTS 是否可用)。
-            if (checked) context?.let { VoiceBridgeService.prewarmTts(it) }
-        }
-        // 设备朗读默认开(GatewaySettings.ttsEnabled 默认 true):这里只回填一次,
-        // 用户手动关掉后 prefs 里就是 false,不会再被改写回 true。
-        // 手机自己都合不成语音时,这个开关没有任何意义:关掉并置灰(见 applyTtsAvailability)。
+        //
+        // 这个设置**两处入口**:本页「对话设置 → 设备朗读」与「网关设置 → 小智 AI → 播放小智语音」
+        // （小智模式下的音源就是小智下发的 opus,没有本地合成,所以两处就是同一件事）。
+        // 两处读写同一个 `tts_enabled`、走同一个落盘/同步路径 [onTtsSwitchToggled],
+        // 任一处置位后另一处立即同步 —— 见 [DeviceTtsSwitches] 与 [renderTtsSwitches]。
+        bindTtsSwitches()
+        // 手机自己合不成语音时,本机朗读那条路置灰并说明原因;
+        // 但**不改** tts_enabled,且小智 AI 下这个开关仍可点(见 applyTtsAvailability)。
         applyTtsAvailability()
 
         // 版本更新（App 新版 / 设备固件新版）：显示上次结论，点一下立刻检查。
@@ -553,27 +582,116 @@ class SettingsFragment : Fragment() {
     /**
      * 「设备朗读(TTS)」开关的可用性门控。
      *
-     * 用户要求:先检测手机是否支持语音合成,不支持就把开关关闭且不允许打开。
-     * 探测要构造一次系统 TTS 引擎(异步回调),因此先禁用开关避免这期间被点开;
-     * 结果只在页面还活着时回写(_binding 判空),不支持时同时把 tts_enabled 落盘成 false。
+     * 探测的是**本机系统 TTS 能不能用**(即「手机合成 → 下发」那条路);结果只决定开关**是否可点**,
+     * **不决定开关的值** ——
+     *  - 不可用时**不改** `tts_enabled`(既不写 false,也不恢复 true),开关保持用户/默认的值并置灰;
+     *  - 当前网关是小智 AI 时**不置灰**(小智的音频由云端下发,不经本机合成,本机能力限制不到它);
+     *  - 置灰时的提示会把原因与「小智 AI 下仍可开启」一起说出来(见 [DeviceTtsSwitches.unsupportedHint])。
+     *
+     * 为什么曾经是错的:旧实现探测到本机不支持合成就把 `tts_enabled` 落盘成 false 并置灰,
+     * 真机上把用户的小智音色一并关掉了 —— 直通门打出 `enabled=false → 拦截`,小智音频一句没下发。
+     *
+     * 两处「朗读」开关是**同一个设置**(见 [DeviceTtsSwitches]),所以探测中/不可用时
+     * 两处一起置灰(小智模式下则一起可点),不出现一灰一亮的分叉。
      */
     private fun applyTtsAvailability() {
         val appContext = context?.applicationContext ?: return
         val normalHint = binding.ttsHint.text
-        binding.checkTtsEnabled.isEnabled = false
+        // 探测期间两处开关都置灰(同一个设置,不能一处可点一处不可点);值不动
+        ttsAvailable = false
+        renderTtsSwitches()
         scope.launch {
             val reason = TtsSupport.unsupportedReason(appContext)
             val b = _binding ?: return@launch
             if (reason == null) {
-                b.checkTtsEnabled.isEnabled = true
+                ttsAvailable = true
                 b.ttsHint.text = normalHint
+                b.xzTtsHint.text = DeviceTtsSwitches.xiaozhiHint(null)
+                renderTtsSwitches()
                 return@launch
             }
-            if (settings.ttsEnabled) settings.ttsEnabled = false
-            b.checkTtsEnabled.isChecked = false
-            b.checkTtsEnabled.isEnabled = false
-            b.ttsHint.text = "\u26a0\ufe0f 本机不支持设备朗读：$reason。开关已关闭且不可打开。"
-            log("设备朗读不可用：$reason")
+            ttsAvailable = false
+            // 只置灰、**不写** tts_enabled:本机合不成语音不等于用户关掉了朗读
+            // (小智 AI 的音源来自云端,压根不走本机合成)。
+            b.ttsHint.text = DeviceTtsSwitches.unsupportedHint(reason)
+            b.xzTtsHint.text = DeviceTtsSwitches.xiaozhiHint(reason)
+            renderTtsSwitches()
+            log("本机不支持合成语音：$reason（仅置灰本机朗读；小智 AI 下仍可开启）")
+        }
+    }
+
+    // ---- 两处「朗读」开关(设备朗读 ⇄ 播放小智语音,同一个设置)----
+
+    /**
+     * 两处开关的初始化:回填同一个状态、挂同一个监听器。
+     *
+     * 两个开关读写的都是 [GatewaySettings.ttsEnabled](切换即落盘,不参与网关校验闸门,
+     * 与既有「设备朗读」语义一致);默认开由设置项自己的默认值给出 ——
+     * 这里只回填一次,用户手动关掉后 prefs 里就是 false,不会再被改写回 true。
+     */
+    private fun bindTtsSwitches() {
+        // 标题/说明来自纯逻辑常量(单测钉住「写明与设备朗读是同一个开关」),不在布局里再写一份
+        binding.checkXiaozhiTts.text = DeviceTtsSwitches.XIAOZHI_TITLE
+        binding.xzTtsHint.text = DeviceTtsSwitches.xiaozhiHint(null)
+        binding.checkTtsEnabled.setOnCheckedChangeListener { _, checked ->
+            onTtsSwitchToggled(checked, DeviceTtsSwitches.ENTRY_CHAT)
+        }
+        binding.checkXiaozhiTts.setOnCheckedChangeListener { _, checked ->
+            onTtsSwitchToggled(checked, DeviceTtsSwitches.ENTRY_XIAOZHI)
+        }
+        renderTtsSwitches()
+    }
+
+    /**
+     * 两处「朗读」开关的**唯一**拨动入口:切换即落盘,并把另一处同步成同一个值。
+     *
+     * 不走「保存网关设置」的校验闸门(那个闸门只管网关连接是否可用),与既有「设备朗读」行为一致;
+     * 服务侧读的是同一份 SharedPreferences(`GatewaySettings.ttsEnabled`;小智直通门每帧实时读),
+     * 所以这里落盘后**立即生效** —— 不需要重启服务、也不需要点「保存网关设置」。
+     *
+     * @param entry 用户拨的是哪一处入口(只进日志,便于对照「两处是同一个设置」)
+     */
+    private fun onTtsSwitchToggled(checked: Boolean, entry: String) {
+        // 回写另一处开关触发的回调:不是用户操作,状态已经在同一个值上,直接忽略
+        if (applyingTtsSwitches) return
+        settings.ttsEnabled = checked
+        log("$entry(TTS)：${if (checked) "开" else "关"}（设备朗读 / 播放小智语音是同一个开关，两处已同步）")
+        renderTtsSwitches()
+        // 打开时立刻预热合成引擎:马上把「引擎能不能用 + 有哪些可用音色」写进日志,
+        // 不用等第一条回复(也方便在没有网关时先确认 TTS 是否可用)。
+        if (checked) context?.let { VoiceBridgeService.prewarmTts(it) }
+    }
+
+    /**
+     * 两处开关的**唯一**渲染出口(双向同步就发生在这里)。
+     *
+     * 勾选状态取同一个来源 [GatewaySettings.ttsEnabled](见 [DeviceTtsSwitches]),
+     * 所以任一处拨动后调一次这里,另一处(若当前渲染着)立刻变成同一个值 ——
+     * 不存在「网关一处、对话一处」两套状态。回写 isChecked 会触发另一个开关的监听器,
+     * 用 [applyingTtsSwitches] 挡住,避免两处来回回拨。
+     *
+     * 「可点与否」与「勾选状态」是**两条独立的线**:可点由「本机合成是否可用」与「当前是不是小智 AI」
+     * 决定(小智 → 一定可点),置灰**不会**动 checked(真机 bug:置灰时顺手把值写成 false,
+     * 把小智音色也一并关掉了)。
+     *
+     * @param ttsSupported 本机系统 TTS 是否可用(探测中/不可用且非小智时两处一起置灰;
+     *   只影响 `isEnabled`,不影响 `isChecked`。网关类型按下拉框当前选中值 [selectedType])
+     */
+    private fun renderTtsSwitches(ttsSupported: Boolean = ttsAvailable) {
+        val b = _binding ?: return
+        val view = DeviceTtsSwitches.view(selectedType(), settings.ttsEnabled, ttsSupported)
+        applyingTtsSwitches = true
+        try {
+            // 只回写「勾选 / 可点」两种状态,**不**动 groupXiaozhi 的可见性:
+            // 那一行的可见性归 section 机制 + 网关类型(见 applyTypeVisibility),
+            // 在这里拨会把它漏到别的 section 上(比如在「对话设置」里拨一下设备朗读)。
+            // 只在真的不一致时才写:既少一次回调,也不把正在拖动的开关打断
+            if (b.checkTtsEnabled.isChecked != view.checked) b.checkTtsEnabled.isChecked = view.checked
+            if (b.checkXiaozhiTts.isChecked != view.checked) b.checkXiaozhiTts.isChecked = view.checked
+            b.checkTtsEnabled.isEnabled = view.enabled
+            b.checkXiaozhiTts.isEnabled = view.enabled
+        } finally {
+            applyingTtsSwitches = false
         }
     }
 

@@ -1,9 +1,11 @@
 package com.shinku.aipassport.openclaw.tts
 
+import com.shinku.aipassport.openclaw.gateway.XiaozhiGateway
 import com.shinku.aipassport.openclaw.protocol.decodeTtsOpusPayload
 import com.shinku.aipassport.openclaw.stt.XiaozhiIdentity
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -22,7 +24,10 @@ import org.junit.Test
  *  6. **服务端只推二进制音频、一条 `tts` JSON 都没有时，首帧兜底开段**
  *     （真机 bug 的回归测试：不会发状态的实现下，旧代码把整段音频都挡在「未开窗口」外，
  *     表现为 App 收到几十帧、设备侧 `TTS=0`）；
- *  7. **直通门**（网关类型 / `tts_enabled` / 设备 `caps:["tts_opus"]`）三项组合的放行与拦截。
+ *  7. **直通门**（网关类型 / `tts_enabled` / 设备 `caps:["tts_opus"]`）三项组合的放行与拦截;
+ *  8. **小智模式下关掉开关 = 安静,不回退成本地合成**:小智自带音频
+ *     ([XiaozhiGateway.providesDeviceTtsAudio] = true,流水线因此不做本地合成/手机朗读),
+ *     关闭只是把这条唯一的音频通路拦下(拦截原因是开关而不是设备能力),没有任何替代通道。
  */
 class XiaozhiTtsRelayTest {
 
@@ -252,6 +257,38 @@ class XiaozhiTtsRelayTest {
         assertTrue("设备未报能力时不能下发任何帧", noCaps.events.isEmpty())
     }
 
+    /**
+     * 「关闭播放小智语音」= 拦下小智音频,而**不是**回退成本地合成。
+     *
+     * 小智模式的音频来源只有一条:它自己随会话下发的 opus
+     * ([XiaozhiGateway.providesDeviceTtsAudio] = true —— 流水线 `speakReply` 对这种网关直接返回,
+     * 既不做本地合成也不回退手机朗读)。
+     * 因此关闭开关的结果就是「设备安静」:直通门拦下每一帧,且拦下的原因是开关本身。
+     */
+    @Test
+    fun xiaozhi_disabled_does_not_fall_back_to_local_synthesis() {
+        // ① 小智网关自带音频 → 本地合成那条路在流水线里被 providesDeviceTtsAudio 挡住(不会补一份本地合成)
+        assertTrue(
+            "小智网关自带下行音频:关闭开关不能变成回退本地合成",
+            XiaozhiGateway(null).providesDeviceTtsAudio,
+        )
+
+        // ② 关闭开关 → 唯一的音频通路被拦,且原因就是开关(不是设备不支持)
+        val gate = openGate(ttsEnabled = false)
+        assertFalse("关闭后不能放行任何小智音频", gate.allowed)
+        assertEquals("设备朗读开关(tts_enabled)关闭", gate.blockedReason)
+
+        // ③ 拦截就是全部:relay 依旧不下发任何帧/控制(没有第二条本地合成通路)
+        val link = FakeDownlink()
+        val r = relay(link) { gate }
+        r.onTtsState("start", "")
+        r.onTtsAudio(ByteArray(4), 24, 60)
+        r.onTtsState("sentence_start", "你好")
+        r.onTtsAudio(ByteArray(4), 24, 60)
+        r.onTtsState("stop", "")
+        assertTrue("关闭时设备必须是安静的(不下发、也不本地合成)", link.events.isEmpty())
+    }
+
     /** 门从拦截变为放行(设备重连后补报 caps / 用户打开开关):后面的帧立刻能走。 */
     @Test
     fun gate_opens_mid_flight_when_capability_arrives() {
@@ -263,6 +300,33 @@ class XiaozhiTtsRelayTest {
         assertTrue("能力未到时报的帧一律不下发", link.events.isEmpty())
 
         capable = true
+        r.onTtsState("sentence_start", "你好")
+        r.onTtsAudio(ByteArray(4), 24, 60)
+        assertEquals(listOf("start", "frame"), link.events)
+    }
+
+    /**
+     * 真机 bug 的回归:开关被（错误地）存成 false 时直通门全拦；用户在小智 AI 下手动打开后必须立刻放行。
+     *
+     * 真机日志形态：`直通门: type=xiaozhi enabled=false caps=true → 拦截(设备朗读开关(tts_enabled)关闭)`
+     * → 设备侧 `TTS=0`。直通门实时读设置（不需要重启服务），所以打开开关后下一帧就要能走。
+     */
+    @Test
+    fun gate_allows_xiaozhi_audio_once_device_tts_is_turned_on() {
+        var enabled = false
+        val link = FakeDownlink()
+        val r = relay(link) { openGate(ttsEnabled = enabled) }
+
+        // 开关关着:整段拦下，原因就是开关本身（不是设备能力/网关类型）
+        r.onTtsState("start", "")
+        r.onTtsAudio(ByteArray(4), 24, 60)
+        assertTrue("开关关闭时不能下发任何帧", link.events.isEmpty())
+        assertFalse(openGate(ttsEnabled = false).allowed)
+
+        // 用户在小智 AI 下打开开关 → 立刻放行（同一轮内实时生效）
+        enabled = true
+        assertTrue("ttsEnabled=true 时直通门必须放行", openGate(ttsEnabled = true).allowed)
+        assertEquals(null, openGate(ttsEnabled = true).blockedReason)
         r.onTtsState("sentence_start", "你好")
         r.onTtsAudio(ByteArray(4), 24, 60)
         assertEquals(listOf("start", "frame"), link.events)
