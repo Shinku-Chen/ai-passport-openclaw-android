@@ -128,10 +128,13 @@ class VoiceBridgeService : Service() {
         /**
          * 小智 TTS 直通的待发队列上限(帧)。
          *
-         * 14s 音频:小智按句推、下游按流控实时发,正常绝不会积到这个量;
-         * 设上限只是防链路异常时内存无限涨。
+         * 为什么是 400(24s):小智直通下**正文上屏时开播**,一次性把已缓冲的帧灌进队列
+         * (见 `XiaozhiTtsRelay`),所以「队列一次攒进一大段音频」是正常形态而不是异常 ——
+         * 上限必须**大于** `XiaozhiTtsRelay.MAX_BUFFER_FRAMES`(300),否则开播时的 flush 会把队列灌满,
+         * 收尾的 `tts_stop` 排不进去(要走「清队列直接 stop」的降级路径而丢掉尾部音频)。
+         * 内存:每帧 ≤ 515B,400 帧 ≤ 约 206KB,链路异常时也涨不上去。
          */
-        const val MAX_XIAOZHI_TTS_QUEUE_FRAMES = 240
+        const val MAX_XIAOZHI_TTS_QUEUE_FRAMES = 400
 
         /** 小智 TTS 直通 drain 协程在空队列时的轮询间隔(句间间隙)。 */
         const val XIAOZHI_TTS_IDLE_POLL_MS = 10L
@@ -139,10 +142,10 @@ class VoiceBridgeService : Service() {
         /**
          * 小智 TTS 直通空队列多久后降频轮询(ms)。
          *
-         * 超过它仍无新帧也没有 `tts_stop`,基本就是 `stop` 丢了(或服务端异常)。
-         * 这里**不**主动发 `tts_stop`:句子间的生成间隙本来就可能有几秒,
-         * 提前收尾会让后面的句子因为没有 `tts_start` 而被丢(听感上“后半段没声音”)。
-         * 改为降频等待,由下一轮 `turn_start` 的 `tts_abort` 或迟到的 `stop` 终止。
+         * 播放窗口在 `tts.state=stop` 之后仍开着(服务端会继续推本段的迟到帧,见 `XiaozhiTtsRelay`),
+         * 所以队列空一会儿也不代表本段完了。这里**不**主动发 `tts_stop`:提前收尾会把还没到的尾音
+         * 关在门外(听感上“后半段没声音”)。改为降频等待,由直通侧的窗口收尾(新一轮 / barge /
+         * 设备 `turn_cancel` / 设备回报本段播放结束)+ `tts_abort` 终止。
          */
         const val XIAOZHI_TTS_SLOW_POLL_AFTER_MS = 5_000L
 
@@ -537,6 +540,12 @@ class VoiceBridgeService : Service() {
         deviceTts = DeviceTtsSession(enabled = { this.settings.ttsEnabled }, downlink = deviceTtsPush)
         // 小智 TTS 直通(增量 3):只挂观察者,不建连接 —— 音频在小智会话里已经下来,
         // 直接按 [SEQ][rate_khz][frame_ms]+opus 组 TTS_OPUS 帧转发给设备(不本地合成/不重编码)。
+        // 时序(2026-10-04 作者修正版):音频先只在 relay 侧缓冲,**正文整段上屏之后**才下发
+        // `tts_start` + 按到达顺序连续推帧;`tts.state=stop` 之后到达的迟到帧照常下发(一边播一边
+        // 缓冲),窗口在收尾条件(新一轮 / barge / 设备 `turn_cancel` / 设备回报本段播完)才 `tts_stop`。
+        // 「正文先于首帧」由构造保证:relay 的开播要等 [notifyXiaozhiReplyOnScreen] 这个信号
+        // (在 `TEXT('A')` 分片已写入 BLE 串行写队列之后发出),而那个信号又只在收到
+        // `tts.state=stop` 后才真正开播 —— 详见 `XiaozhiTtsRelay`。
         //
         // 直通门的三项逐项进日志(见 [XiaozhiTtsGate]):
         //  ① 当前网关类型是小智 AI —— 小智服务端并不知道 App 用哪个后端,任何类型下它都会推自己的
@@ -978,6 +987,7 @@ class VoiceBridgeService : Service() {
             val frame = vbEncodeFrame(VbFrame.TYPE_TEXT, VbFrame.FLAG_LAST, payload)
             Log.i(TAG, "sendTextFrame role=$role(空) 分片0/1")
             ble.writeBytes(frame)
+            notifyXiaozhiReplyOnScreen(role)
             return
         }
         // 分片回退到 UTF-8 边界(见 splitTextPayload),不切坏汉字/emoji
@@ -997,6 +1007,23 @@ class VoiceBridgeService : Service() {
             Log.i(TAG, "sendTextFrame role=$role text=${text.take(30)} 分片$chunkIdx/$totalChunks 字节=${frame.size} flags=$flags")
             ble.writeBytes(frame)
         }
+        notifyXiaozhiReplyOnScreen(role)
+    }
+
+    /**
+     * 「小智回复正文已上屏」信号:整段回复的 `TEXT('A')` 分片**已全部写进 BLE 串行写队列**之后调用,
+     * 告诉小智 TTS 直通([xiaozhiTtsRelay])可以开播了。
+     *
+     * 为什么要到这一层才发(而不是会话层收到 `tts.state=stop` 就开播):设备屏上的气泡与音频帧走的是
+     * **同一个** BLE 串行写队列,而正文与音频分别在两个线程/协程里就绪 —— 只要不等这个信号,用户就会
+     * 先听到声音、后看到字。在这里触发后，「正文帧已入队」在「首帧入队」之前**由构造保证**
+     * (`XiaozhiTtsRelay.onReplyTextDisplayed` 只会在收到 `tts.state=stop` 后才真正开播)。
+     *
+     * 只对 `'A'`(网关回复)发信号:`'U'`(识别原文)与本轮回复无关,`'R'` 是系统提示。
+     */
+    private fun notifyXiaozhiReplyOnScreen(role: Char) {
+        if (role != 'A') return
+        xiaozhiTtsRelay?.onReplyTextDisplayed()
     }
 
     // 下发当前时间给设备:CONTROL 帧 {"ev":"time","epoch":<秒>}。
@@ -1281,6 +1308,11 @@ class VoiceBridgeService : Service() {
         //  - 写队列:同样的 [BleCentral.writeBytes] + 批量写(WRITE_NO_RESPONSE);
         //  - 对账:同一份 lastFrames 与设备 tts_playback_* 回报日志。
         // 唯一区别:**不合成、不编码** —— 小智给的 opus 包直接进 [VbFrame.TYPE_TTS_OPUS]。
+        //
+        // 时序(见 [XiaozhiTtsRelay]):正文上屏后 relay 才发 [start],并一次性把已缓冲的帧经
+        // [pushFrame] 递过来 —— 即 `start()` 一被调用,队列里很快就会攒进一大段帧(不再是逐句慢慢滴
+        // 进来),因此待发队列上限([MAX_XIAOZHI_TTS_QUEUE_FRAMES])必须容得下这一段;之后 `stop` 之后
+        // 到达的迟到帧继续以实时节奏递过来,直到窗口收尾才 [stop]。
 
         /** 待发队列:一帧音频,或「一段结束」标记(见 [XiaozhiTtsItem],定义在文件级 —— inner class 内不允许嵌套接口)。 */
         private val xzFrames = ArrayDeque<XiaozhiTtsItem>()
@@ -1385,9 +1417,11 @@ class VoiceBridgeService : Service() {
         /**
          * 逐项出队下发(流控与本地合成那条路同一套规则)。
          *
-         * 队列空时等 [XIAOZHI_TTS_IDLE_POLL_MS] 再查(小智按句推,句间可能有几十 ms 到几秒的生成间隙);
+         * 正文上屏时队列会被 relay **一次性**灌满(已缓冲的那一段),所以这里的循环通常一上来
+         * 就有几十到几百帧要推;流控([TtsFlowControl])负责把它们按“不领先设备超过目标领先量”的节奏
+         * **连续**送出去。队列空时等 [XIAOZHI_TTS_IDLE_POLL_MS] 再查(`stop` 之后迟到帧是正常形态);
          * 超过 [XIAOZHI_TTS_SLOW_POLL_AFTER_MS] 仍无新项则降频等待 —— 不主动收尾(见该常量注释),
-         * 由下一轮 `abort`/`stop` 终止。
+         * 由 relay 的窗口收尾(`stop` 项)或下一轮 `abort` 终止。
          */
         private suspend fun drainXiaozhiTts(id: Int) {
             if (!::ble.isInitialized || !ble.isConnected()) {
@@ -1493,6 +1527,10 @@ class VoiceBridgeService : Service() {
                 TAG,
                 "${ttsPlaybackLogLine(report)} — 本地已发送 frames=$lastFrames dropped=$lastDropped",
             )
+            // 小智直通的播放窗口以「设备回报本段结束」为正常收尾点:窗口在 tts.state=stop 之后是开着的
+            // (迟到帧照常下发),而服务端不会再给「音频发完没有」的信号 —— 只有设备知道自己把队列播完了。
+            // 直通侧会丢弃剩余缓冲并 tts_stop(幂等;未开段时的迟到回报会被它忽略)。
+            xiaozhiTtsRelay?.onDevicePlaybackFinished()
             if (report.ev == TtsPlaybackReport.ABORTED) {
                 lastFrames = 0
                 lastDropped = 0

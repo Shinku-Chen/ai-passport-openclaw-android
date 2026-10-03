@@ -17,6 +17,11 @@ package com.shinku.aipassport.openclaw.stt
  *  3. 两者都没有 → 交出一个**空串**,表示「本轮确实没有可上屏正文」。调用方据此给可读原因,
  *     **绝不**把表情(`emotion`)或空串当正文上屏(非正文字段本类根本收不到:调用方只喂 `text`)。
  *
+ * **上屏前先清洗**(见 [XiaozhiReplySanitizer],纯函数):装配好的整段正文里可能夹着服务端工具
+ * 模板残留(`% get_weather…` / `<tool_call>…</tool_call>` / `{{…}}` 占位等),必须在上屏前剔掉 ——
+ * 清洗只针对这些模板/占位与多余空白,不碰正文标点。**清洗后为空串**时按「本轮没有可上屏正文」
+ * 交出空串(与「只有 emoji」同一条可读原因路径,不产生空气泡)。
+ *
  * 结算(把整段一次性交出)的时机,对齐设计文档 §6 的方案 A(一条回复一个气泡,不做逐句碎气泡):
  *  - `tts.state=stop`(一段朗读结束;真机上 `sentence_end` 到 `stop` 只差毫秒级,所以不拖);
  *  - 或**最后一句之后 `sentenceIdleGraceMs` 内没有新增**([pendingIdleGraceMs]/[onIdle],兜住不发 `stop`
@@ -25,8 +30,9 @@ package com.shinku.aipassport.openclaw.stt
  * 线程语义:本类不持有线程/定时器,**由调用方**([XiaozhiSession])在 WS 回调线程喂事件、并按
  * [pendingIdleGraceMs] 安排一次延迟结算;所有状态都在内部锁里,可被多线程调用。
  *
- * @param emit 交出正文的唯一出口:非空 = 本轮正文;空串 = 本轮没有可上屏正文。可能在调用方的
- *   任意线程上被调用,实现必须线程安全且不得阻塞(出口下游是网关的等待槽位与观察者)。
+ * @param emit 交出正文的唯一出口:非空 = 本轮**已清洗**的正文;空串 = 本轮没有可上屏正文
+ *   (真的没有文本,或清洗后全是模板/占位)。可能在调用方的任意线程上被调用,实现必须线程安全
+ *   且不得阻塞(出口下游是网关的等待槽位与观察者)。
  * @param sentenceIdleGraceMs 已有 tts 文本时,「最后一句之后无新增」的判定时长。
  * @param llmOnlyGraceMs 整轮**没有任何 tts 报文**(纯 `llm` 服务端)时,兜底正文的等待时长。
  *   为什么明显长于 [sentenceIdleGraceMs]:这段时间正是「表情 llm 已到、tts 首条还没到」的窗口,
@@ -164,10 +170,13 @@ class XiaozhiReplyText(
         settleWithLocked(ttsTextLocked() ?: llmText ?: "")
     }
 
-    /** 结算的唯一出口:标记已结算后调用 [emit](空串 = 本轮没有可上屏正文)。 */
+    /**
+     * 结算的唯一出口:标记已结算后先**清洗**(剔服务端工具模板残留)再调用 [emit]
+     * (空串 = 本轮没有可上屏正文:真的没有文本,或文本全是模板/占位)。
+     */
     private fun settleWithLocked(body: String) {
         settled = true
-        emit(body)
+        emit(XiaozhiReplySanitizer.clean(body))
     }
 
     /** 本轮 tts 拼接结果;null = 一条非空句级文本都没有。 */

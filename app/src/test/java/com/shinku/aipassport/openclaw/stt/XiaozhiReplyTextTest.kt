@@ -184,4 +184,34 @@ class XiaozhiReplyTextTest {
         r.reply.onTtsState("stop", "")
         assertEquals(listOf("这一句。"), r.emitted)
     }
+
+    /**
+     * 验收点:上屏正文要剔掉服务端工具模板残留(`% get_weather…`、`<tool_call>…</tool_call>`、占位)。
+     *
+     * 真机形态:模板可能**跨句级事件**到达(`sentence_start` 给开标签、`sentence_end` 给闭标签)——
+     * 所以清洗必须发生在「整段拼接完成之后」,按整段文本处理([XiaozhiReplySanitizer])。
+     */
+    @Test
+    fun server_tool_template_residue_is_stripped_before_emitting() {
+        val r = Recorder()
+        r.reply.onTurnStart()
+        r.reply.onLlm("😊")
+        r.reply.onTtsState("sentence_start", "<tool_call>")
+        r.reply.onTtsState("sentence_end", "{\"name\":\"get_weather\"}</tool_call>")
+        r.reply.onTtsState("sentence_start", "北京今天晴，二十度。")
+        r.reply.onTtsState("sentence_end", "% get_weather(city=\"北京\")")
+        r.reply.onTtsState("stop", "")
+        assertEquals(listOf("北京今天晴，二十度。"), r.emitted)
+    }
+
+    /** 整段只剩模板/占位 → 交空串(走「本轮没有可上屏正文」的可读原因路径,不上屏噪声)。 */
+    @Test
+    fun noise_only_turn_emits_empty_body() {
+        val r = Recorder()
+        r.reply.onTurnStart()
+        r.reply.onTtsState("sentence_end", "<tool_call>{\"name\":\"get_weather\"}</tool_call>")
+        r.reply.onTtsState("sentence_end", "% get_weather(city=\"北京\")")
+        r.reply.onTtsState("stop", "")
+        assertEquals(listOf(""), r.emitted)
+    }
 }

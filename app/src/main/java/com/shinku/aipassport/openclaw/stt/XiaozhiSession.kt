@@ -77,15 +77,21 @@ interface XiaozhiLlmSource {
 interface XiaozhiTtsObserver {
 
     /**
-     * 会话开始新一轮(设备 PTT 按下):把上一轮的朗读记账作废。
+     * 会话开始新一轮(设备 PTT 按下)**或本轮被取消(barge / 设备 `turn_cancel`)/链路断开**:
+     * 把上一段的朗读记账作废,并**关闭直通侧的播放窗口**。
      *
      * 为什么必须由会话层通知:打断(barge)时服务端不一定回 `tts.stop`,若直通方还认为
      * 「本段朗读仍在进行」,下一轮的音频就会缺一个 `tts_start` 而直接甩给设备。
-     * 设备侧的 `tts_abort` 由流水线另行下发(两条路径互不替代)。
+     * 又因为小智的 `tts.stop` 只是「整段正文齐了、可以开播」而**不是**段落结束(窗口在它之后仍
+     * 开着,见 [XiaozhiTtsRelay]),`barge` / `turn_cancel` 必须在这里把窗口收干净 —— 否则设备会一直
+     * 停在播放态。设备侧的 `tts_abort` 由流水线另行下发(两条路径互不替代;`turn_start` 路径上
+     * `tts_abort` 先发,直通侧的 `tts_stop` 因此是空操作)。
      */
     fun onTurnStart()
 
-    /** 下行 TTS 状态:`start` / `sentence_start` / `sentence_end` / `stop`(带该句文本)。 */
+    /** 下行 TTS 状态:`start` / `sentence_start` / `sentence_end` / `stop`(带该句文本)。
+     *  `stop` = 「整段正文齐了」(开播时机),**不是**本段的结束 —— 窗口保持打开,直通侧把已缓冲的帧
+     *  连续交给设备、之后到达的帧即时下发,直到本轮收尾(见 [XiaozhiTtsRelay])。 */
     fun onTtsState(state: String, text: String)
 
     /**
@@ -106,8 +112,10 @@ interface XiaozhiTtsObserver {
  * 而 [XiaozhiStt] 以前只用了第一件,导致其余三件无处安放 —— 抽出来供「小智 AI 网关」共用同一会话:
  *  1. **上行**:设备音频 → App → 小智(opus 16 kHz/60 ms;见 [feedOpus]/[feedPcm]);
  *  2. **识别**:`{"type":"stt","text":…}` → [onStt](现有 STT 只用这一条,[XiaozhiStt] 因此退化为薄适配器);
- *  3. **回复**:`{"type":"llm","text":…}` 与 `{"type":"tts","text":…}` → 装配成**本轮正文** → [onLlm];
- *  4. **语音**:`{"type":"tts","state":…}`(JSON)→ [onTtsState],以及**二进制 opus 帧** → [onTtsAudio]。
+ *  3. **回复**:`{"type":"llm","text":…}` 与 `{"type":"tts","text":…}` → 装配成**本轮正文** → [onLlm]
+ *     (整段文本在 `tts.state=stop` 时**一次性**交出);
+ *  4. **语音**:`{"type":"tts","state":…}`(JSON)→ [onTtsState],以及**二进制 opus 帧** → [onTtsAudio]
+ *     (小智模式:正文上屏之前先缓冲,之后开播并边播边缓冲,见 [XiaozhiTtsObserver])。
  *
  * 后三组回调是**接入面**:STT 路径的行为、日志文案与级别、超时数值、线程语义与抽离前逐字一致。
  * 「小智 AI 网关」(增量 2)通过 [setLlmObserver] 取 `llm.text` 作为本轮回复;
@@ -161,6 +169,9 @@ interface XiaozhiTtsObserver {
  *   `llm.text` 兜底;`emotion` 一类非正文字段**永不**参与。
  *   共用本会话的网关不靠它,而是用 [setLlmObserver] 挂观察者(两条出口互不覆盖)。
  * @param onTtsState TTS 状态分流(`state`, `text`);共用本会话的 TTS 直通用 [setTtsObserver]。
+ *   `tts.state=stop` = 「整段正文齐了、可以开播了」(正文在这里一次性交出):音频直通侧把它当作
+ *   开播时机,窗口仍保持打开直到本轮收尾(见 [XiaozhiTtsObserver] 与
+ *   `docs/design/xiaozhi-ai-gateway.md` §4.4)。
  * @param onTtsAudio 下行 TTS 音频分流(`opus`, `rateKhz`, `frameMs`)。
  *   `rateKhz`/`frameMs` 取自服务器 hello 的 `audio_params`(小智为 24 kHz/60 ms),**0 = 尚未上报**。
  * @param linkAuthProvider 本次建链的**鉴权来源**(URL + `Authorization`),按 Device-Id 解析
@@ -788,6 +799,9 @@ class XiaozhiSession(
         turnSeq++             // 本轮作废:在途的重连重放立即放弃,不插队到新一轮
         clearTurnFrames()     // 本轮音频不再需要(重放只服务于本轮的识别结果)
         resetReply()          // 本轮正文记账同理作废(打断后上一轮的文本不再上屏)
+        // 直通侧的播放窗口也一并关闭(barge / 设备 turn_cancel:窗口在 tts.stop 之后是开着的,
+        // 不关就会把本轮的音频继续推给设备、并让设备一直停在播放态)。
+        ttsObserver?.onTurnStart()
         if (wasListening) stopListening()
         pcmLen = 0   // 丢掉不满一帧的余量,不跨轮拼接
     }
@@ -1355,9 +1369,13 @@ class XiaozhiSession(
                     val sentence = obj.stringOrNull("text").orEmpty()
                     Log.d(tag, "收到小智 tts[$state]: ${sentence.take(200)}")
                     onTtsState?.invoke(state, sentence)
-                    ttsObserver?.onTtsState(state, sentence)
-                    // 正文装配:句级文本是本轮正文的**首选来源**(用户听到的就是它)。
+                    // 正文装配优先喂:`tts.state=stop` 同时意味着「整段正文齐了」与「可以开播了」——
+                    // 先走正文(一次性上屏),再让 TTS 直通记账。
+                    // 两阶段的**顺序保证**不靠这里的先后:直通侧要等一个明确的「正文已上屏」信号
+                    // (`XiaozhiTtsRelay.onReplyTextDisplayed`,由服务侧在 `TEXT('A')` 已写进 BLE
+                    // 串行写队列之后发出),所以首帧一定晚于正文帧(见 `docs/design/xiaozhi-ai-gateway.md` §4.4)。
                     feedReply { replyText.onTtsState(state, sentence) }
+                    ttsObserver?.onTtsState(state, sentence)
                 }
                 "error" -> Log.w(tag, "小智端错误: ${obj.toString()}")
                 else -> Unit
