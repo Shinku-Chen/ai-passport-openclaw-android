@@ -1,6 +1,8 @@
 # Changelog
 
-## Unreleased
+## 1.13.1 - 2026-10-04
+
+配套固件仍是 **v1.13-intercom**（本次改动全部在 App 侧：固件一行未改、无需刷固件）。
 
 - 修复（小智 AI，作者要求：**App 端多段显示只显示最新的一段，而不是 A+B+C** —— 设备屏已经是每段一条（A/B/C），App 侧却只剩最后一段）：根因是**网关补正回调的签名只有字符串**，App 侧不知道「这是新的一段还是本段的更新」，于是把每一段都当成「替换同一个正文气泡」（第一条之后的每一段都把前一段覆盖掉）。现在把装配器 `stt/XiaozhiReplyText` 已经知道的**段号 + 「新段 / 本段更新」** 一路带到 UI：`XiaozhiReplyOutcome` 新增 `isNewSegment`（`deliverOpenLocked` 按「本段此前是否已上屏」给出；整轮兜底那一条也是新段）→ `XiaozhiLlmSource.setLlmObserver` 改交付整个 outcome（段号 `deliveryIndex` + `isNewSegment`）→ `XiaozhiGateway` 以新增的 `gateway/BodyDelivery`（`isNewSegment` + `segmentOrdinal`）经 `GatewayAdapter.chatMulti` 的 `onBodyCorrection` 交出去 → `VoicePipeline.resolveTurnBody`/`replaceBodyBubbles` → 新增纯逻辑 `ui/BodyBubbles.kt` 的 `planSegmentBody`/`applySegmentBody` 落地：**新段 → 追加**一条新的助手气泡（A、B、C 各一条，与设备屏一致），**本段更新 → 只就地替换该段那一条**（段号定位，不是全局最后一条，也不新增气泡；同一轮多次更新不产生多余气泡）；`tts.stop` 收尾仍按装配器口径（各段已上屏不补全文、某段缺失只补那一段，补的那条按「此前没上屏 → 新段追加」落地）；首段（段号 1）仍走既有的「首条回复」路径。**OpenClaw 的整轮历史补正（`BodyDelivery.segmentOrdinal = 0`）行为一行不变**（替换第一条 + 多余降级成弱化小字，`ChatFragment` 只取 `delivery.text`），设备侧与 TTS/识别/绑定/身份/client-id/朗读开关语义、其它四种网关、`versions.json`/版本号/release 流程均未动；不新增依赖。日志新增 `App 气泡:新段(第 N 段)追加` / `App 气泡:本段更新(第 N 段)就地替换`（段号与设备屏 / 直通侧同一套编号，真机可逐段对数）。单测：新增 `ui/SegmentBubblesTest`（真装配器 + 真 `ConversationStore` 的组合逻辑：① 三段流 → App 侧恰好三条 A/B/C；② 段内更新 → 仍是三条且只有该段被就地替换；③ `stop` 收尾不产生第 4 条；④ 某段缺失在结算点被补上 → 按装配器口径是**新段**（追加）；⑤ 新一轮/打断不误删已完成的历史气泡）；`XiaozhiReplyTextTest` 断言装配器的 `isNewSegment`（三段落均为新段、同一句变完整是**本段更新**）；`XiaozhiGatewayTest` 断言段号与「新段/本段更新」经补正出口原样到达（`(2,2,3)` / `(true,false,true)`）；`docs/design/xiaozhi-ai-gateway.md` §6.0 新增「App 侧多段气泡（A/B/C 各一条）与设备屏一致」并同步 §4.4/§5/§6.5 里「App 气泡就地替换」的旧表述。Device tests: NOT RUN。
 
