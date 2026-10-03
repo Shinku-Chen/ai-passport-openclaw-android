@@ -66,9 +66,12 @@ import kotlinx.coroutines.launch
  * 「保存网关设置」= 先用输入框里的草稿值校验连接(OpenClaw=WS 鉴权,Hermes=/health,
  * 自定义 OpenAI 兼容=/models 或最小对话请求,Echo=恒通),校验通过才落盘;
  * 失败一个字段都不写、原配置继续生效,原因用对话框展示。
- * 「小智 AI」没有可填的连接参数,但它走**另一道闸门**(且**只对它生效**):小智的设备绑定
- * (设备未连→拦截;已绑定当前设备→直接保存;未绑定/换了设备→先绑 6 位绑定码再落盘,
- * 见 [XiaozhiBindGate])。其余网关不触发绑定,也不会因「设备未连接」被拦 —— 它们只把小智
+ * 「小智 AI」没有可填的连接参数,但它走**另一道闸门**(且**只对它生效**):小智的设备绑定。
+ * 保存「小智 AI」时**一律真的查一次云端激活状态**(复用 [XiaozhiActivator.queryCloud],本地 `bound_mac`
+ * 只当提示、不作判据):云端未激活 → 弹 6 位绑定码并轮询授权,成功才落盘;云端已激活 → 允许保存,
+ * 但必须弹框讲清楚并给出「要换账号就去 xiaozhi.me 删除设备再重新激活」的引导(不得静默保存);
+ * 查询失败/超时/无网 → 不落盘 + 可读原因,下次保存重试。设备未连 → 拦截(见 [XiaozhiBindGate])。
+ * 其余网关不触发查询/绑定,也不会因「设备未连接」被拦 —— 它们只把小智
  * 当识别引擎(见 [XiaozhiIdentity])。
  *
  * 小智侧的标识(Device-Id)按**当前网关类型**解析:小智 AI = 已连接设备的真 MAC;
@@ -801,15 +804,18 @@ class SettingsFragment : Fragment() {
         val form = snapshotForm()
         // 「小智 AI」没有任何可填的连接参数(ws/OTA 地址与 token 写死在 XiaozhiSettings,会话由识别通道提供),
         // 所以**不走探活闸门**:不造假的必填项,也不拿一个没有会话的适配器去 connect。
-        // 但它有自己的另一道闸门 —— **小智设备绑定**([XiaozhiBindGate]):小智云按 Device-Id
-        // (= 已连接设备的蓝牙 MAC)登记设备,没绑定就落盘等于选了一个用不了的网关。
+        // 但它有自己的另一道闸门 —— **小智设备绑定**([XiaozhiBindGate]):保存「小智 AI」时
+        // **一律真的查一次云端激活状态**(复用 [XiaozhiActivator.queryCloud],不看本地 `bound_mac`):
+        //  - 云端已激活 → 允许保存,但必须弹框讲清楚(不静默);
+        //  - 云端未激活 → 发 6 位绑定码 + 网页引导 + 轮询授权,成功才落盘;
+        //  - 查询失败/超时/无网 → 不落盘 + 可读原因,下次保存重试。
         // **这道闸门只对「小智 AI」生效**:其余类型拿到 NotXiaozhi 就直接落到下面的探活闸门,
-        // 既不触发小智绑定,也不会因为「设备未连接」被拦下。
-        when (val gate = XiaozhiBindGate.beforeSave(form.type, deviceAddress(), xzBinding.boundMac)) {
+        // 既不查云端、不触发绑定,也不会因为「设备未连接」被拦下。
+        when (val gate = XiaozhiBindGate.beforeSave(form.type, deviceAddress())) {
             // 非小智网关(OpenClaw/Hermes/自定义/回显):原样继续,保存不受小智绑定与设备在线状态影响。
             XiaozhiBindGate.BeforeSave.NotXiaozhi -> Unit
 
-            // 小智模式但设备没连(取不到真 MAC):拦住并给可读原因(不回退匿名标识)
+            // 小智模式但设备没连(取不到真 MAC):拦住并给可读原因(不回退匿名标识,也不发任何请求)
             XiaozhiBindGate.BeforeSave.NoDevice -> {
                 log("小智 AI 保存被拦截:未连接设备(未保存任何字段)")
                 showSaveFailure(
@@ -819,15 +825,9 @@ class SettingsFragment : Fragment() {
                 return
             }
 
-            // 已绑定当前设备 → 直接落盘生效(不重复绑定,不打扰用户)
-            is XiaozhiBindGate.BeforeSave.AlreadyBound -> {
-                persistXiaozhiAndApply(form, gate.mac)
-                return
-            }
-
-            // 未绑定/换了设备:先走 [XiaozhiActivator](亮出 6 位绑定码 → 轮询授权),成功才落盘
-            is XiaozhiBindGate.BeforeSave.NeedBind -> {
-                bindXiaozhiThenSave(form, gate.mac)
+            // 小智模式且拿到真 MAC:**一律**查一次云端,按云端结论决定是否落盘(见 [saveXiaozhiAfterCloudQuery])
+            is XiaozhiBindGate.BeforeSave.QueryCloud -> {
+                saveXiaozhiAfterCloudQuery(form, gate.mac)
                 return
             }
         }
@@ -994,36 +994,88 @@ class SettingsFragment : Fragment() {
     }
 
     /**
-     * 落盘小智 AI 的网关设置，并提示用户。只在绑定闸门放行后才调。
+     * 落盘小智 AI 的网关设置，并提示用户。只在绑定/云端闸门放行后才调。
      */
     private fun persistXiaozhiAndApply(form: FormSnapshot, mac: String) {
         persistForm(form)
         // 落盘后用 prefs 回填一遍表单(与其它类型的校验-落盘闸门一致)
         if (view != null) loadSettings()
-        log("小智 AI 已绑定设备 $mac,网关设置已保存(类型 ${form.type})")
+        log("小智 AI 设备 $mac 已就绪,网关设置已保存(类型 ${form.type})")
         toast("已保存")
         applySavedServiceConfig()
     }
 
+    /** 小智「查云端 → 按闸门分流」的唯一执行路径的结果(保存与手动激活共用)。 */
+    private sealed interface XzFlow {
+        /** 云端已激活:允许保存/已可用。[notice] 必须展示给用户(不静默)。 */
+        data class Activated(val mac: String, val notice: String) : XzFlow
+
+        /** 云端未激活,但用户已完成 6 位码绑定:允许保存/已可用。 */
+        data class Bound(val mac: String) : XzFlow
+
+        /** 查询失败 / 绑定失败或超时:不落盘 + 可读原因。 */
+        data class Failed(val reason: String) : XzFlow
+    }
+
     /**
-     * 未绑定当前设备:先走小智绑定流程(展示 6 位绑定码 → 轮询授权)，成功才落盘。
+     * 小智「查云端 → 按闸门分流」的**唯一**网络流程:查一次云端([XiaozhiActivator.queryCloud])
+     * → 按 [XiaozhiBindGate.decide] 分流 → 需要绑定时发 6 位码并轮询授权。
      *
-     * 与 [activateXiaozhi] 同一个 [XiaozhiActivator]，区别只是这里由「保存」触发，
-     * 且结果直接决定**这次保存是否生效**(见 [XiaozhiBindGate.afterBind])。
-     * 传网关类型「小智 AI」+ 已归一化的 [mac]:激活器内部仍会走 [XiaozhiIdentity] 复核同一套标识。
+     * 两个入口(保存「小智 AI」、手动「激活小智设备」)都调这里,保证语义一致 ——
+     * 已激活就提示(不再发码)、未激活才发码轮询、查询失败就不落盘。
+     *
+     * @param mac 已归一化的设备 MAC(调用方已过 [XiaozhiBindGate.beforeSave])
+     * @param onCode 拿到 6 位绑定码后的 UI 回调（在主线程调用）
      */
-    private fun bindXiaozhiThenSave(form: FormSnapshot, mac: String) {
+    private suspend fun runXiaozhiFlow(
+        mac: String,
+        onCode: (code: String, message: String) -> Unit,
+    ): XzFlow {
+        // 激活器不需要 Fragment 视图;页面已销毁时用 application context 把流程跑完（与保存其它分支一致）
+        val ctx = context?.applicationContext
+            ?: return XzFlow.Failed("设置页已关闭,请重新打开后重试")
+        val activator = XiaozhiActivator(ctx, GatewaySettings.TYPE_XIAOZHI, mac, xzSettings.otaUrl)
+        // 保存与手动激活都是小智模式 + 已知 MAC，所以闸门一定会查云端。
+        val query = activator.queryCloud()
+        return when (val decision = XiaozhiBindGate.decide(
+            GatewaySettings.TYPE_XIAOZHI, mac, query.state, xzBinding.boundMac, query.detail,
+        )) {
+            is XiaozhiBindGate.Decision.Activated -> XzFlow.Activated(decision.mac, decision.notice)
+
+            is XiaozhiBindGate.Decision.NeedBind -> {
+                onCode(query.code.orEmpty(), query.message.orEmpty())
+                val ok = activator.pollActivate(mac, query.challenge.orEmpty())
+                when (XiaozhiBindGate.afterBind(ok)) {
+                    XiaozhiBindGate.AfterBind.Persist -> XzFlow.Bound(mac)
+                    XiaozhiBindGate.AfterBind.KeepOldConfig -> XzFlow.Failed(
+                        query.detail
+                            ?: "小智绑定超时:请确认已在 xiaozhi.me 输入绑定码 ${query.code.orEmpty()} 后重试。"
+                    )
+                }
+            }
+
+            is XiaozhiBindGate.Decision.QueryFailed -> XzFlow.Failed(decision.reason)
+
+            // 保存/激活路径已过 beforeSave;这里只为穷尽分支（理论上到不了）
+            XiaozhiBindGate.Decision.NotXiaozhi ->
+                XzFlow.Failed(XiaozhiIdentity.bindingNotApplicableReason(GatewaySettings.TYPE_XIAOZHI))
+
+            XiaozhiBindGate.Decision.NoDevice -> XzFlow.Failed(XiaozhiIdentity.NO_DEVICE_REASON)
+        }
+    }
+
+    /**
+     * 保存「小智 AI」:先查云端(见 [runXiaozhiFlow]),**只有云端的结论允许时才落盘**。
+     *
+     * 与旧实现的区别(真机问题):原来命中「本地 `bound_mac` == 当前设备」就直接落盘、云端一次都不查,
+     * 于是既不给绑定码也不告诉用户任何事。现在本地记录只是提示,判据永远是云端。
+     */
+    private fun saveXiaozhiAfterCloudQuery(form: FormSnapshot, mac: String) {
         binding.btnSave.isEnabled = false
-        binding.btnSave.text = "绑定小智设备…"
-        log("小智 AI 未绑定设备 $mac,开始绑定流程…")
-        val activator = XiaozhiActivator(
-            requireContext(),
-            GatewaySettings.TYPE_XIAOZHI,
-            mac,
-            xzSettings.otaUrl,
-        )
+        binding.btnSave.text = "查询小智云端…"
+        log("小智 AI 保存:查询云端激活状态(设备 $mac)…")
         scope.launch {
-            val result = activator.activateAndPoll { code, msg ->
+            val flow = runXiaozhiFlow(mac) { code, msg ->
                 scope.launch {
                     _binding?.let { b ->
                         b.xzActiveStatus.text =
@@ -1040,20 +1092,45 @@ class SettingsFragment : Fragment() {
                 b.btnSave.text = "保存网关设置"
             }
             dismissApprovalDialog()
-            when (XiaozhiBindGate.afterBind(result.activated)) {
-                XiaozhiBindGate.AfterBind.Persist -> {
+            when (flow) {
+                is XzFlow.Activated -> {
+                    // 云端已激活:保存允许，但必须先告诉用户(不静默)，并把本地记录同步成当前设备
+                    xzBinding.boundMac = mac
+                    persistXiaozhiAndApply(form, mac)
+                    log("小智设备 $mac 已在云端激活,网关设置已保存(无需重新绑定)")
+                    showXiaozhiActivatedDialog(flow.notice)
+                }
+
+                is XzFlow.Bound -> {
                     // 绑定成功才记住这台设备 + 落盘；下次保存不会再绑一遍
                     xzBinding.boundMac = mac
                     persistXiaozhiAndApply(form, mac)
                 }
 
-                XiaozhiBindGate.AfterBind.KeepOldConfig -> {
-                    val reason = result.detail ?: result.message ?: "小智绑定失败(未取得原因)"
-                    log("小智绑定失败,未保存任何字段: $reason")
-                    showSaveFailure("小智设备绑定失败(设置未改动,原配置继续生效)\n$reason")
+                is XzFlow.Failed -> {
+                    log("小智设备未激活,未保存任何字段: ${flow.reason}")
+                    showSaveFailure("小智设备未激活(设置未改动,原配置继续生效)\n${flow.reason}")
                 }
             }
         }
+    }
+
+    /**
+     * 「云端已激活」提示框:让用户看到结论与「要换账号怎么重来」的下一步（保证「不静默」，
+     * 也不会按住用户 —— 保存已经在弹框前完成）。
+     */
+    private fun showXiaozhiActivatedDialog(notice: String) {
+        if (!isAdded || view == null) {
+            // 页面已销毁:至少用提示保证「不静默」
+            toast("该设备已在云端激活,网关设置已保存")
+            return
+        }
+        dismissApprovalDialog()
+        approvalDialog = AlertDialog.Builder(requireContext())
+            .setTitle("小智设备已激活")
+            .setMessage(notice)
+            .setPositiveButton("知道了", null)
+            .show()
     }
 
     /** 绑定码等待框:与 [showApprovalDialog] 共用同一个对话框槽位(两者不可能并发)。 */
@@ -1231,48 +1308,73 @@ class SettingsFragment : Fragment() {
 
     // ---- 小智激活 ----
 
+    /**
+     * 手动「激活小智设备」:与「保存小智 AI」**共用同一套语义**([XiaozhiBindGate] + [runXiaozhiFlow])
+     * —— 先看类型/设备,再**一律查一次云端**:已激活就提示(不发码)、未激活才发码轮询。
+     * 不造第二条不一致的路径。
+     */
     private fun activateXiaozhi() {
         if (!xzSettings.enabled()) {
             Toast.makeText(requireContext(), "请先填写并保存小智地址", Toast.LENGTH_SHORT).show()
             return
         }
-        binding.btnActivateXz.isEnabled = false
-        binding.xzActiveStatus.text = "正在请求小智 OTA/激活…"
         // 标识与识别通道**同一套规则**([XiaozhiIdentity],激活器内部解析):
-        //  - 网关类型是小智 AI → 用已连接设备的真 MAC 绑定;
-        //  - 其它类型 → 压根不做绑定(激活器直接给可读原因,不发任何请求,也不需要设备在线);
+        //  - 网关类型是小智 AI → 用已连接设备的真 MAC 绑;其它类型 → 压根不做绑定(给可读原因,不发请求);
         //  - 小智模式但没连设备 → 同样停手报错,不猜、不回退匿名。
-        log("小智激活:请求 OTA…(网关类型 ${settings.type})")
-        val activator = XiaozhiActivator(
-            requireContext(),
-            settings.type,
-            deviceAddress(),
-            xzSettings.otaUrl,
-        )
-        scope.launch {
-            val result = activator.activateAndPoll { code, msg ->
-                // 拿到绑定码 → 主线程展示,让用户去 xiaozhi.me 绑定
-                scope.launch {
-                    _binding?.let { b ->
-                        b.xzActiveStatus.text =
-                            "请到 xiaozhi.me 登录→添加设备→输入绑定码:\n$code\n($msg)\n完成后自动检测…"
-                    }
-                    log("请到 xiaozhi.me 输入绑定码 $code")
-                }
+        when (val gate = XiaozhiBindGate.beforeSave(settings.type, deviceAddress())) {
+            XiaozhiBindGate.BeforeSave.NotXiaozhi -> {
+                val reason = XiaozhiIdentity.bindingNotApplicableReason(settings.type)
+                binding.xzActiveStatus.text = reason
+                log("小智激活:不适用(网关类型 ${settings.type})")
+                Toast.makeText(requireContext(), reason, Toast.LENGTH_LONG).show()
             }
-            _binding?.let { b -> b.btnActivateXz.isEnabled = true }
-            val mac = result.deviceMac
-            if (result.activated && mac != null) {
-                // 手动激活成功 = 这台设备已可用:记下绑定,之后「保存网关设置」不必再绑一遍。
-                xzBinding.boundMac = mac
-                _binding?.let { b -> b.xzActiveStatus.text = "激活成功!小智识别已可用" }
-                log("小智激活成功,设备 $mac 已绑定,ws=${result.wsUrl}")
-                toast("激活成功,请重启语音桥服务")
-            } else {
-                val reason = result.detail ?: "激活失败"
-                _binding?.let { b -> b.xzActiveStatus.text = reason }
-                log("小智激活失败: $reason")
-                toast(reason)
+
+            XiaozhiBindGate.BeforeSave.NoDevice -> {
+                binding.xzActiveStatus.text = XiaozhiIdentity.NO_DEVICE_REASON
+                log("小智激活被拦截:未连接设备")
+                Toast.makeText(requireContext(), XiaozhiIdentity.NO_DEVICE_REASON, Toast.LENGTH_LONG).show()
+            }
+
+            is XiaozhiBindGate.BeforeSave.QueryCloud -> {
+                binding.btnActivateXz.isEnabled = false
+                binding.xzActiveStatus.text = "正在查询小智云端激活状态…"
+                log("小智激活:查询云端…(设备 ${gate.mac},网关类型 ${settings.type})")
+                scope.launch {
+                    val flow = runXiaozhiFlow(gate.mac) { code, msg ->
+                        // 拿到绑定码 → 主线程展示,让用户去 xiaozhi.me 绑定
+                        scope.launch {
+                            _binding?.let { b ->
+                                b.xzActiveStatus.text =
+                                    "请到 xiaozhi.me 登录→添加设备→输入绑定码:\n$code\n($msg)\n完成后自动检测…"
+                            }
+                            log("请到 xiaozhi.me 输入绑定码 $code")
+                        }
+                    }
+                    _binding?.let { b -> b.btnActivateXz.isEnabled = true }
+                    when (flow) {
+                        is XzFlow.Activated -> {
+                            // 云端已激活:提示即可(不重新发码),并同步本地记录
+                            xzBinding.boundMac = gate.mac
+                            _binding?.let { b -> b.xzActiveStatus.text = flow.notice }
+                            log("小智设备 ${gate.mac} 已在云端激活,无需重新绑定")
+                            showXiaozhiActivatedDialog(flow.notice)
+                        }
+
+                        is XzFlow.Bound -> {
+                            // 手动激活成功 = 这台设备已可用:记下绑定,之后「保存网关设置」不必再绑一遍。
+                            xzBinding.boundMac = gate.mac
+                            _binding?.let { b -> b.xzActiveStatus.text = "激活成功!小智识别已可用" }
+                            log("小智激活成功,设备 ${gate.mac} 已绑定")
+                            toast("激活成功,请重启语音桥服务")
+                        }
+
+                        is XzFlow.Failed -> {
+                            _binding?.let { b -> b.xzActiveStatus.text = flow.reason }
+                            log("小智激活失败: ${flow.reason}")
+                            toast(flow.reason)
+                        }
+                    }
+                }
             }
         }
     }

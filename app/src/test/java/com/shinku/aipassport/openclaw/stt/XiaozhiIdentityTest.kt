@@ -100,26 +100,21 @@ class XiaozhiIdentityTest {
 
     @Test
     fun `绑定闸门只对当前小智 AI 类型生效`() {
-        val bound = "AA:BB:CC:DD:EE:FF"
         for (type in listOf("openclaw", "hermes", "openai", "echo")) {
-            // 设备已连接 + 没绑定过 → 非小智类型也不得触发绑定
+            // 设备已连接 → 非小智类型不得去查云端/触发绑定
             assertEquals(
                 XiaozhiBindGate.BeforeSave.NotXiaozhi,
-                XiaozhiBindGate.beforeSave(type, mac, null),
+                XiaozhiBindGate.beforeSave(type, mac),
             )
             // 设备没连 → 非小智类型也**不得**被拦(保存必须照常走通用校验-落盘)
             assertEquals(
                 XiaozhiBindGate.BeforeSave.NotXiaozhi,
-                XiaozhiBindGate.beforeSave(type, null, bound),
+                XiaozhiBindGate.beforeSave(type, null),
             )
         }
-        // 小智 AI:没设备 → 拦;有设备没绑定 → 先绑定
-        assertEquals(XiaozhiBindGate.BeforeSave.NoDevice, XiaozhiBindGate.beforeSave(xiaozhi, null, bound))
-        assertEquals(XiaozhiBindGate.BeforeSave.NeedBind(mac), XiaozhiBindGate.beforeSave(xiaozhi, mac, bound))
-        assertEquals(
-            XiaozhiBindGate.BeforeSave.AlreadyBound(mac),
-            XiaozhiBindGate.beforeSave(xiaozhi, mac, mac),
-        )
+        // 小智 AI:没设备 → 拦;有设备 → **一律**先查云端(本地 bound_mac 不参与判断)
+        assertEquals(XiaozhiBindGate.BeforeSave.NoDevice, XiaozhiBindGate.beforeSave(xiaozhi, null))
+        assertEquals(XiaozhiBindGate.BeforeSave.QueryCloud(mac), XiaozhiBindGate.beforeSave(xiaozhi, mac))
     }
 
     @Test

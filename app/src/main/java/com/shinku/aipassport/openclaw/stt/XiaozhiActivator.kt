@@ -29,6 +29,10 @@ import javax.crypto.spec.SecretKeySpec
  * 关键:设备 MAC(Device-Id) + 标准 UUID(Client-Id) 是 OTA 握手必需;无 serial_number 时
  * 走 v1 激活(body={}),有 SN 走 v2(body= {algorithm,serial_number,challenge,hmac})。
  *
+ * 这是查/绑的**唯一实现**:[queryCloud] 查云端激活状态,[pollActivate] 在需要绑定时轮询授权。
+ * 保存「小智 AI」与手动「激活小智设备」都只调这两个方法(见 `SettingsFragment`),不另写一套请求。
+ *
+ * @param context 当前上下文(当前实现不用到;保留是为了后续若需 Toast/日志落地不改构造)。
  * @param gatewayType 当前网关类型(见 [XiaozhiIdentity.GATEWAY_XIAOZHI]):**只有**「小智 AI」才做设备绑定,
  *   其余网关压根不绑(它们只把小智当识别引擎,Device-Id 是匿名标识)。
  * @param deviceAddress 已连接对讲设备的蓝牙地址(原始值,可为 null):小智模式下由 [XiaozhiIdentity]
@@ -37,7 +41,7 @@ import javax.crypto.spec.SecretKeySpec
  *   退回全零匿名 MAC 会把两台设备登记成同一台,绑定结果对当前设备无效。
  *   非小智模式下这个值不参与绑定(压根不绑)。
  *
- * 激活成功后返回 websocket url/token 与绑定结果,供调用方落盘/转交识别通路。
+ * [queryCloud] 返回 websocket url/token 与绑定码,供调用方落盘/展示引导。
  */
 class XiaozhiActivator(
     private val context: Context,
@@ -60,84 +64,97 @@ class XiaozhiActivator(
 
     private val JSON = "application/json; charset=utf-8".toMediaType()
 
-    /** 激活结果。 */
-    data class ActivationResult(
-        val activated: Boolean,       // 已激活(可连 websocket 识别)
-        val code: String? = null,     // 绑定码(未激活时给用户去网页绑定)
-        val challenge: String? = null,
-        val wsUrl: String? = null,    // websocket url(OTA 下发)
-        val wsToken: String? = null,  // websocket token(OTA 下发)
-        val message: String? = null,  // 服务器提示(如 "xiaozhi.me\n147063")
-        val detail: String? = null,   // 失败原因等
-        /** 本次绑定实际用的设备 Device-Id(已归一化);不可建链时为 null。 */
-        val deviceMac: String? = null,
+    /**
+     * 一次 OTA 查询的结果(纯数据):云端激活状态 + 绑定码/ws 信息 + 失败原因。
+     *
+     * 走到哪一步由 [state] 唯一决定 —— 保存闸门([XiaozhiBindGate.decide])直接按它分流,
+     * 不再从 `code == null` / `detail == null` 这种间接迹象反推。
+     */
+    data class CloudQuery(
+        val state: XiaozhiBindGate.CloudState,
+        /** 本次查询实际用的设备 Device-Id(已归一化);不可建链时为 null。 */
+        val mac: String? = null,
+        val code: String? = null,      // 绑定码(未激活时给用户去网页绑定)
+        val challenge: String? = null, // 轮询 activate 用的 challenge
+        val message: String? = null,   // 服务器提示(如 "xiaozhi.me\n147063")
+        val wsUrl: String? = null,     // websocket url(OTA 下发)
+        val wsToken: String? = null,   // websocket token(OTA 下发)
+        val detail: String? = null,    // 失败/不可用时的可读原因
     )
 
     /**
-     * 一次完整激活检查:
-     *  1. POST ota/ 拉配置 → 若含 activation(code+challenge)则未激活,返回 code 供用户绑定;
-     *     若不含 activation 则已激活,返回 wsUrl/token。
-     *  2. 若未激活,调用 [pollActivate] 轮询直到用户在网页绑定完成(服务器 200)。
+     * 查一次云端激活状态(**只发 OTA,不轮询**):
+     *  - OTA 响应含 `activation`(code+challenge)→ 未激活,[CloudQuery.state] = [XiaozhiBindGate.CloudState.NeedsBinding];
+     *  - OTA 响应不含 `activation` → 已激活,[CloudQuery.state] = [XiaozhiBindGate.CloudState.Activated];
+     *  - 请求失败/超时/无网,或标识不可用 → [XiaozhiBindGate.CloudState.QueryFailed] + 可读 `detail`。
      *
-     * 这是阻塞式(挂起)直到激活完成或超时。设置页调它并展示 code。
+     * 这是**保存「小智 AI」与手动激活共用的唯一查询入口**:用户点了保存就必须先真的问一次云端,
+     * 不能拿本地 `bound_mac` 当依据(见 [XiaozhiBindGate])。
      */
-    suspend fun activateAndPoll(onCodeReady: (code: String, message: String) -> Unit): ActivationResult =
-        withContext(Dispatchers.IO) {
-            // 标识与识别通道是**同一套规则**([XiaozhiIdentity]):只有网关类型「小智 AI」才用已连接设备的
-            // 真实 MAC 做绑定;其余网关直接停手(它们只把小智当识别引擎,拿匿名标识去绑也绑不到本机);
-            // 小智模式取不到设备地址同样停手 —— 不猜、不回退。三种情况都不发任何网络请求。
-            val mac = when (val identity = XiaozhiIdentity.resolve(gatewayType, deviceAddress)) {
-                is XiaozhiIdentity.Resolution.DeviceMac -> identity.deviceId
-                XiaozhiIdentity.Resolution.Anonymous -> return@withContext ActivationResult(
-                    false,
-                    detail = XiaozhiIdentity.bindingNotApplicableReason(gatewayType),
-                )
-                is XiaozhiIdentity.Resolution.Unavailable -> return@withContext ActivationResult(
-                    false,
-                    detail = identity.reason,
-                )
-            }
-            // Client-Id 每次 App 启动随机生成(进程内稳定,重启换新)。
-            val clientId = this@XiaozhiActivator.clientId
+    suspend fun queryCloud(): CloudQuery = withContext(Dispatchers.IO) {
+        // 标识与识别通道是**同一套规则**([XiaozhiIdentity]):只有网关类型「小智 AI」才用已连接设备的
+        // 真实 MAC 做绑定;其余网关直接停手(它们只把小智当识别引擎,拿匿名标识去绑也绑不到本机);
+        // 小智模式取不到设备地址同样停手 —— 不猜、不回退。三种情况都不发任何网络请求。
+        val mac = when (val identity = XiaozhiIdentity.resolve(gatewayType, deviceAddress)) {
+            is XiaozhiIdentity.Resolution.DeviceMac -> identity.deviceId
+            XiaozhiIdentity.Resolution.Anonymous -> return@withContext CloudQuery(
+                XiaozhiBindGate.CloudState.QueryFailed,
+                detail = XiaozhiIdentity.bindingNotApplicableReason(gatewayType),
+            )
+            is XiaozhiIdentity.Resolution.Unavailable -> return@withContext CloudQuery(
+                XiaozhiBindGate.CloudState.QueryFailed,
+                detail = identity.reason,
+            )
+        }
+        // Client-Id 每次 App 启动随机生成(进程内稳定,重启换新)。
+        val clientId = this@XiaozhiActivator.clientId
+        val ota = postOta(otaUrl, mac, clientId) ?: return@withContext CloudQuery(
+            XiaozhiBindGate.CloudState.QueryFailed,
+            mac = mac,
+            detail = "OTA 请求失败:没连上小智服务器(网络不可用/超时/服务器无响应)。",
+        )
+        val activation = ota.getAsJsonObject("activation")
+        val wsUrl = ota.getAsJsonObject("websocket")?.get("url")?.asString
+        val wsToken = ota.getAsJsonObject("websocket")?.get("token")?.asString
 
-            // 1. OTA 拉取(Device-Id = 已连接设备的真实 MAC)
-            val ota = postOta(otaUrl, mac, clientId)
-                ?: return@withContext ActivationResult(false, detail = "OTA 请求失败", deviceMac = mac)
-            val activation = ota.getAsJsonObject("activation")
-            val wsUrl = ota.getAsJsonObject("websocket")?.get("url")?.asString
-            val wsToken = ota.getAsJsonObject("websocket")?.get("token")?.asString
-
-            if (activation == null || !activation.has("challenge")) {
-                // 无 activation = 设备已授权,直接可用
-                Log.i(tag, "OTA 无激活数据,设备已激活 ws=$wsUrl")
-                return@withContext ActivationResult(
-                    true, wsUrl = wsUrl, wsToken = wsToken, deviceMac = mac,
-                )
-            }
-
-            val code = activation.get("code")?.asString
-            val challenge = activation.get("challenge")?.asString
-            val message = activation.get("message")?.asString
-            Log.i(tag, "需激活 code=$code message=$message")
-            // 通知 UI:显示绑定码,让用户去 xiaozhi.me 绑定
-            onCodeReady(code ?: "", message ?: "")
-
-            // 2. 轮询 activate 直到 200(用户绑定完成后)
-            val ok = pollActivate(otaUrl, mac, clientId, challenge ?: "")
-            return@withContext ActivationResult(
-                activated = ok,
-                code = code,
-                challenge = challenge,
+        if (activation == null || !activation.has("challenge")) {
+            // 无 activation = 设备已授权,直接可用
+            Log.i(tag, "OTA 无激活数据,设备已激活 ws=$wsUrl")
+            return@withContext CloudQuery(
+                XiaozhiBindGate.CloudState.Activated,
+                mac = mac,
                 wsUrl = wsUrl,
                 wsToken = wsToken,
-                message = message,
-                detail = if (ok) null else "激活超时:请确认已在 xiaozhi.me 输入绑定码 $code",
-                deviceMac = mac,
             )
         }
 
+        val code = activation.get("code")?.asString
+        val challenge = activation.get("challenge")?.asString
+        val message = activation.get("message")?.asString
+        Log.i(tag, "云端未激活 code=$code message=$message")
+        CloudQuery(
+            XiaozhiBindGate.CloudState.NeedsBinding,
+            mac = mac,
+            code = code,
+            challenge = challenge,
+            message = message,
+            wsUrl = wsUrl,
+            wsToken = wsToken,
+        )
+    }
+
+    /**
+     * 轮询 ota/activate,直到服务器 200(用户在 xiaozhi.me 绑定完成)或超时(60s)。
+     *
+     * **只有** [queryCloud] 返回 [XiaozhiBindGate.CloudState.NeedsBinding] 时才调用 ——
+     * 已激活的设备不该被再按一遍。返回值 = 用户是否真的完成了绑定。
+     */
+    suspend fun pollActivate(mac: String, challenge: String): Boolean = withContext(Dispatchers.IO) {
+        pollActivateLoop(otaUrl, mac, clientId, challenge)
+    }
+
     /** 轮询 ota/activate,直到服务器 200(用户已在网页绑定)或超时。 */
-    private suspend fun pollActivate(otaUrl: String, mac: String, clientId: String, challenge: String): Boolean {
+    private suspend fun pollActivateLoop(otaUrl: String, mac: String, clientId: String, challenge: String): Boolean {
         val activateUrl = "${otaUrl.trimEnd('/')}/activate"
         // 无 serial_number → v1 激活,body={}(小智固件 GetActivationPayload 无SN返回{})
         val payload = JsonObject()
@@ -218,7 +235,8 @@ class XiaozhiActivator(
         }
     }
 
-    /** HMAC-SHA256 签名(challenge),供 v2 激活用(有 SN 时)。 */
+    /** HMAC-SHA256 签名(challenge),供 v2 激活用(有 SN 时)。当前未接线,保留以备 v2。 */
+    @Suppress("unused")
     private fun hmacSha256(key: String, msg: String): String {
         return try {
             val mac = Mac.getInstance("HmacSHA256")
