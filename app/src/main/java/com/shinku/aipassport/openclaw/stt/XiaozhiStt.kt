@@ -24,7 +24,7 @@ package com.shinku.aipassport.openclaw.stt
 class XiaozhiStt(
     serverUrl: String,                      // 如 wss://api.tenclass.net/xiaozhi/v1/
     token: String,                          // 如 test-token
-    /** 小智 Device-Id 的按需解析回调(已连接设备的蓝牙 MAC;见 [XiaozhiDeviceId])。 */
+    /** 小智 Device-Id 的按需解析回调(每次建链时按当时的网关类型 + 已连接设备解析;见 [XiaozhiIdentity])。 */
     deviceIdProvider: () -> String,
     onPartial: ((String) -> Unit)? = null,
     recovery: TurnRecovery.Budget = TurnRecovery.Budget(),
@@ -88,6 +88,12 @@ class XiaozhiStt(
     override fun barge() = session.barge()
 
     override fun onLinkDown() = session.onLinkDown()
+
+    /**
+     * 网关类型(Device-Id 的来源)变了:丢掉热连接,下一次建链按新标识重连
+     * (见 [XiaozhiSession.resetDeviceId])。
+     */
+    fun resetDeviceId() = session.resetDeviceId()
 
     override fun release() = session.release()
 }

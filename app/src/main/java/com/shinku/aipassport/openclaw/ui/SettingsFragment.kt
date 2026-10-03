@@ -38,7 +38,7 @@ import com.shinku.aipassport.openclaw.service.VoiceBridgeService
 import com.shinku.aipassport.openclaw.stt.XiaozhiActivator
 import com.shinku.aipassport.openclaw.stt.XiaozhiBindGate
 import com.shinku.aipassport.openclaw.stt.XiaozhiBinding
-import com.shinku.aipassport.openclaw.stt.XiaozhiDeviceId
+import com.shinku.aipassport.openclaw.stt.XiaozhiIdentity
 import com.shinku.aipassport.openclaw.stt.XiaozhiSettings
 import com.shinku.aipassport.openclaw.tts.TtsSupport
 import kotlinx.coroutines.CancellationException
@@ -66,9 +66,13 @@ import kotlinx.coroutines.launch
  * 「保存网关设置」= 先用输入框里的草稿值校验连接(OpenClaw=WS 鉴权,Hermes=/health,
  * 自定义 OpenAI 兼容=/models 或最小对话请求,Echo=恒通),校验通过才落盘;
  * 失败一个字段都不写、原配置继续生效,原因用对话框展示。
- * 「小智 AI」没有可填的连接参数,但它走**另一道闸门**:小智的设备绑定
+ * 「小智 AI」没有可填的连接参数,但它走**另一道闸门**(且**只对它生效**):小智的设备绑定
  * (设备未连→拦截;已绑定当前设备→直接保存;未绑定/换了设备→先绑 6 位绑定码再落盘,
- * 见 [saveXiaozhi])。
+ * 见 [XiaozhiBindGate])。其余网关不触发绑定,也不会因「设备未连接」被拦 —— 它们只把小智
+ * 当识别引擎(见 [XiaozhiIdentity])。
+ *
+ * 小智侧的标识(Device-Id)按**当前网关类型**解析:小智 AI = 已连接设备的真 MAC;
+ * 其余网关 = 全零匿名标识(见 [XiaozhiIdentity]);「高级」里的设备 ID 行与实际在用的一致。
  *
  * 「等待网关授权」(OpenClaw 设备未在网关被批准)单独处理:它不是配置错误 ——
  * 每 [PAIRING_RETRY_INTERVAL_MS] 自动重试一次、最长等 [PAIRING_RETRY_TIMEOUT_MS],
@@ -324,8 +328,8 @@ class SettingsFragment : Fragment() {
     /**
      * 「高级 → 小智识别」的两行状态(唯一一份 UI，网关设置页不再有这块)。
      *
-     *  - 识别引擎行:小智云端 + **真实设备 ID**(已连接设备的蓝牙 MAC;未连接时给可读提示，
-     *    既不退回手机侧标识也不猜);
+     *  - 识别引擎行:小智云端 + **实际在用的设备 ID**(与识别通道/绑定同一个 [XiaozhiIdentity.resolve]:
+     *    小智 AI 模式 = 已连接设备的真 MAC;其余网关 = 全零匿名标识并附一句说明;小智模式没连设备 = 可读原因);
      *  - 连接状态行:语音桥服务的状态广播(与主界面顶部状态卡**同源**)。小智网关没有独立连接 ——
      *    它的「可收发」就是识别通道那条 WS 是否握手(见 `XiaozhiGateway.isReady`),
      *    这里不再引入第二套探活。
@@ -334,28 +338,44 @@ class SettingsFragment : Fragment() {
         val b = _binding ?: return
         // 小智识别只有「高级」这一份 → 只在那个 section 里渲染(避免又出现第二套状态)。
         if (currentSection != Section.ADVANCED) return
-        val id = connectedDeviceId()
-        b.xzStatus.text = if (id != null) {
-            "识别引擎:小智云端 · 设备 ID $id"
-        } else {
-            "识别引擎:小智云端 · 未连接设备(请先连接设备)"
+        // 设备 ID 必须与**实际在用**的标识一致:同一个解析函数,不在这里另写一套类型判断。
+        b.xzStatus.text = when (val id = currentIdentity()) {
+            is XiaozhiIdentity.Resolution.DeviceMac ->
+                "识别引擎:小智云端 · 设备 ID ${id.deviceId}"
+
+            XiaozhiIdentity.Resolution.Anonymous ->
+                "识别引擎:小智云端 · 设备 ID ${XiaozhiIdentity.ANONYMOUS_LABEL}\n" +
+                    XiaozhiIdentity.DEVICE_MAC_HINT
+
+            is XiaozhiIdentity.Resolution.Unavailable ->
+                "识别引擎:小智云端 · 未连接设备\n${id.reason}"
         }
         b.xzConnectStatus.text =
             "连接状态:${lastStatus.ifBlank { "等待语音桥服务上报…" }}"
     }
 
     /**
-     * 已连接对讲设备的蓝牙 MAC，归一化成小智 Device-Id 格式。
+     * 已连接对讲设备的蓝牙地址(原始值)。
      *
      * 用 [BleCentral.lastConnectedAddr] 这一个来源(与设备页/服务同一份 prefs);
-     * 未连接或地址非法时返回 null —— **不**回退到手机侧标识(全零匿名 MAC/机型名)。
+     * 「取哪个标识」不在这里判断 —— 统一交给 [XiaozhiIdentity](见 [currentIdentity])。
      */
-    private fun connectedDeviceId(): String? = try {
-        XiaozhiDeviceId.formatAddress(BleCentral.lastConnectedAddr(requireContext()))
+    private fun deviceAddress(): String? = try {
+        BleCentral.lastConnectedAddr(requireContext())
     } catch (_: IllegalStateException) {
         // 视图已脱离 Activity:当作没有设备地址，不抛给调用方
         null
     }
+
+    /**
+     * 当前**生效中**网关类型下小智侧的标识(纯逻辑,与识别通道/绑定/状态行同一套规则)。
+     *
+     * 用已落盘的 [GatewaySettings.type](生效中的模式)而不是下拉框当前选择 —— 类型要保存后才真的切换
+     * (保存后会重启服务,服务侧用同一个解析函数取值)。小智模式取不到设备地址时返回
+     * [XiaozhiIdentity.Resolution.Unavailable],**不**回退匿名标识。
+     */
+    private fun currentIdentity(): XiaozhiIdentity.Resolution =
+        XiaozhiIdentity.resolve(settings.type, deviceAddress())
 
     /** 读下拉框上选中的类型(未选中时回退 OpenClaw,与旧单选默认一致)。 */
     private fun selectedType(): String =
@@ -781,11 +801,35 @@ class SettingsFragment : Fragment() {
         val form = snapshotForm()
         // 「小智 AI」没有任何可填的连接参数(ws/OTA 地址与 token 写死在 XiaozhiSettings,会话由识别通道提供),
         // 所以**不走探活闸门**:不造假的必填项,也不拿一个没有会话的适配器去 connect。
-        // 但它有自己的另一道闸门 —— **小智设备绑定**(见 [saveXiaozhi]):
-        // 小智云按 Device-Id(= 已连接设备的蓝牙 MAC)登记设备,没绑定就落盘等于选了一个用不了的网关。
-        if (form.type == GatewaySettings.TYPE_XIAOZHI) {
-            saveXiaozhi(form)
-            return
+        // 但它有自己的另一道闸门 —— **小智设备绑定**([XiaozhiBindGate]):小智云按 Device-Id
+        // (= 已连接设备的蓝牙 MAC)登记设备,没绑定就落盘等于选了一个用不了的网关。
+        // **这道闸门只对「小智 AI」生效**:其余类型拿到 NotXiaozhi 就直接落到下面的探活闸门,
+        // 既不触发小智绑定,也不会因为「设备未连接」被拦下。
+        when (val gate = XiaozhiBindGate.beforeSave(form.type, deviceAddress(), xzBinding.boundMac)) {
+            // 非小智网关(OpenClaw/Hermes/自定义/回显):原样继续,保存不受小智绑定与设备在线状态影响。
+            XiaozhiBindGate.BeforeSave.NotXiaozhi -> Unit
+
+            // 小智模式但设备没连(取不到真 MAC):拦住并给可读原因(不回退匿名标识)
+            XiaozhiBindGate.BeforeSave.NoDevice -> {
+                log("小智 AI 保存被拦截:未连接设备(未保存任何字段)")
+                showSaveFailure(
+                    "${XiaozhiIdentity.NO_DEVICE_REASON}\n" +
+                        "请在「设备管理」里连接对讲设备后，再点「保存网关设置」。"
+                )
+                return
+            }
+
+            // 已绑定当前设备 → 直接落盘生效(不重复绑定,不打扰用户)
+            is XiaozhiBindGate.BeforeSave.AlreadyBound -> {
+                persistXiaozhiAndApply(form, gate.mac)
+                return
+            }
+
+            // 未绑定/换了设备:先走 [XiaozhiActivator](亮出 6 位绑定码 → 轮询授权),成功才落盘
+            is XiaozhiBindGate.BeforeSave.NeedBind -> {
+                bindXiaozhiThenSave(form, gate.mac)
+                return
+            }
         }
         val draft = buildDraft(form) ?: return
         binding.btnSave.isEnabled = false
@@ -962,46 +1006,22 @@ class SettingsFragment : Fragment() {
     }
 
     /**
-     * 保存网关类型「小智 AI」—— 小智的设备**绑定闸门**。
-     *
-     * 与其它三套网关的差异:小智云按 Device-Id 登记/绑定设备，而 Device-Id 必须是
-     * **已连接对讲设备的真实蓝牙 MAC**([connectedDeviceId])。所以保存不能直接落盘:
-     *  - 设备未连接 → **拦截**并给可读提示(不回退手机侧标识、也不猜);
-     *  - 已绑定当前设备 → 直接落盘生效(不重复绑定);
-     *  - 未绑定/换了设备 → 走 [XiaozhiActivator](显示 6 位绑定码 → 轮询授权)，成功才落盘;
-     *  - 绑定失败/超时 → **不落盘**，原配置继续生效，原因用对话框展示。
-     * 整体语义与其它类型的「校验-落盘」闸门一致:闸门不过，一个字段都不写。
-     */
-    private fun saveXiaozhi(form: FormSnapshot) {
-        val mac = connectedDeviceId()
-        when (val decision = XiaozhiBindGate.beforeSave(mac, xzBinding.boundMac)) {
-            XiaozhiBindGate.BeforeSave.NoDevice -> {
-                val reason = "请先连接设备:小智 AI 用【已连接设备的蓝牙 MAC】作为设备 ID，" +
-                    "现在没取到设备地址。\n请在「设备管理」里连接对讲设备后，再点「保存网关设置」。"
-                log("小智 AI 保存被拦截:未连接设备(未保存任何字段)")
-                showSaveFailure(reason)
-            }
-
-            XiaozhiBindGate.BeforeSave.AlreadyBound -> {
-                // 已绑定就不再打扰用户(不要每次保存都重新绑定)
-                persistXiaozhiAndApply(form, mac.orEmpty())
-            }
-
-            is XiaozhiBindGate.BeforeSave.NeedBind -> bindXiaozhiThenSave(form, decision.mac)
-        }
-    }
-
-    /**
      * 未绑定当前设备:先走小智绑定流程(展示 6 位绑定码 → 轮询授权)，成功才落盘。
      *
      * 与 [activateXiaozhi] 同一个 [XiaozhiActivator]，区别只是这里由「保存」触发，
      * 且结果直接决定**这次保存是否生效**(见 [XiaozhiBindGate.afterBind])。
+     * 传网关类型「小智 AI」+ 已归一化的 [mac]:激活器内部仍会走 [XiaozhiIdentity] 复核同一套标识。
      */
     private fun bindXiaozhiThenSave(form: FormSnapshot, mac: String) {
         binding.btnSave.isEnabled = false
         binding.btnSave.text = "绑定小智设备…"
         log("小智 AI 未绑定设备 $mac,开始绑定流程…")
-        val activator = XiaozhiActivator(requireContext(), mac, xzSettings.otaUrl)
+        val activator = XiaozhiActivator(
+            requireContext(),
+            GatewaySettings.TYPE_XIAOZHI,
+            mac,
+            xzSettings.otaUrl,
+        )
         scope.launch {
             val result = activator.activateAndPoll { code, msg ->
                 scope.launch {
@@ -1216,20 +1236,19 @@ class SettingsFragment : Fragment() {
             Toast.makeText(requireContext(), "请先填写并保存小智地址", Toast.LENGTH_SHORT).show()
             return
         }
-        // Device-Id = 已连接设备的真实蓝牙 MAC。取不到就不请求 OTA —— 不猜、不回退手机侧标识。
-        val mac = connectedDeviceId()
-        if (mac == null) {
-            val reason = "请先连接设备:小智激活用【已连接设备的蓝牙 MAC】作为设备 ID。"
-            binding.xzActiveStatus.text = reason
-            log("小智激活被拦截:未连接设备")
-            toast(reason)
-            return
-        }
         binding.btnActivateXz.isEnabled = false
         binding.xzActiveStatus.text = "正在请求小智 OTA/激活…"
-        log("小智激活:请求 OTA…(设备 $mac)")
-
-        val activator = XiaozhiActivator(requireContext(), mac, xzSettings.otaUrl)
+        // 标识与识别通道**同一套规则**([XiaozhiIdentity],激活器内部解析):
+        //  - 网关类型是小智 AI → 用已连接设备的真 MAC 绑定;
+        //  - 其它类型 → 压根不做绑定(激活器直接给可读原因,不发任何请求,也不需要设备在线);
+        //  - 小智模式但没连设备 → 同样停手报错,不猜、不回退匿名。
+        log("小智激活:请求 OTA…(网关类型 ${settings.type})")
+        val activator = XiaozhiActivator(
+            requireContext(),
+            settings.type,
+            deviceAddress(),
+            xzSettings.otaUrl,
+        )
         scope.launch {
             val result = activator.activateAndPoll { code, msg ->
                 // 拿到绑定码 → 主线程展示,让用户去 xiaozhi.me 绑定
@@ -1242,7 +1261,8 @@ class SettingsFragment : Fragment() {
                 }
             }
             _binding?.let { b -> b.btnActivateXz.isEnabled = true }
-            if (result.activated) {
+            val mac = result.deviceMac
+            if (result.activated && mac != null) {
                 // 手动激活成功 = 这台设备已可用:记下绑定,之后「保存网关设置」不必再绑一遍。
                 xzBinding.boundMac = mac
                 _binding?.let { b -> b.xzActiveStatus.text = "激活成功!小智识别已可用" }

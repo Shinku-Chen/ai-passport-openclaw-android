@@ -150,10 +150,11 @@ class XiaozhiSession(
     private val serverUrl: String,          // 如 wss://api.tenclass.net/xiaozhi/v1/
     private val token: String,              // 如 test-token
     /**
-     * 小智 Device-Id 的**按需解析**回调(= 已连接设备的蓝牙 MAC,格式见 [XiaozhiDeviceId])。
+     * 小智 Device-Id 的**按需解析**回调(每次建链时调用一次;取值规则见 [XiaozhiIdentity])。
      *
-     * 为什么用回调而不是定值:服务先起、设备后连 —— 只有建链时取值才能拿到当前真正连着的设备;
-     * 返回空串 = 设备未连接 → **不建链**(见 [connectAndHello]),也绝不退回手机侧标识。
+     * 为什么用回调而不是定值:服务先起、设备后连,而且用户可能中途改网关类型 ——
+     * 只有建链时按当时的类型/设备取值才是「现在真正该用的标识」;返回空串 = 不可建链
+     * (小智模式但设备未连接)→ **不建链**(见 [connectAndHello]),也绝不退回手机侧标识。
      */
     private val deviceIdProvider: () -> String,
     /** 重连重放的等待预算:默认取 [TurnRecovery] 的实机常量(见 [TurnRecovery.Budget]),单测可缩短。 */
@@ -615,6 +616,20 @@ class XiaozhiSession(
 
     fun onLinkDown() {
         // 设备链路断开(BLE 断开/掉线):留热连接没有意义,立即关闭。
+        abandonLink()
+    }
+
+    /**
+     * Device-Id 的取值来源变了(网关类型切换):丢掉当前热连接,让**下一次**建链按新标识重新握手。
+     *
+     * 为什么必须丢掉而不是留着:热连接是拿建链那一刻的 Device-Id 握手建起来的 —— 网关类型在小智 AI
+     * 与其它网关之间切换,意味着标识在「设备真 MAC」与「全零匿名」之间切换(见 [XiaozhiIdentity]),
+     * 复用旧 socket 等于继续用旧标识。没有连接时只是把状态复位,幂等。
+     */
+    fun resetDeviceId() = abandonLink()
+
+    /** 丢弃当前连接的公共收尾:作废在途重放与本轮缓存,并关掉热连接(下一轮按下/预热会重连)。 */
+    private fun abandonLink() {
         listening = false
         turnRunning = false
         turnSeq++
@@ -728,11 +743,11 @@ class XiaozhiSession(
      * 这样「预热握手还没回来时用户就按下」也能直接等这次握手,不做两次往返。
      */
     private fun connectAndHello(onReady: (Boolean) -> Unit) {
-        // 设备未连接时解析不出真实 MAC:不建链、不猜(退回全零/手机侧标识会把平台那台设备认错)。
+        // 标识不可用(只有小智模式没连设备才会如此)时:不建链、不猜(退回全零/手机侧标识会把平台那台设备认错)。
         // 设备一连上,服务的预热巡检(prewarm)会带着真实 Device-Id 重新走到这里。
         val deviceId = deviceIdProvider().trim()
         if (deviceId.isEmpty()) {
-            Log.w(tag, "小智 Device-Id 未就绪(请先连接设备),跳过建链")
+            Log.w(tag, "小智 Device-Id 未就绪(小智网关需先连接设备),跳过建链")
             onReady(false)
             return
         }
@@ -763,7 +778,7 @@ class XiaozhiSession(
     private fun buildRequest(deviceId: String): Request = Request.Builder()
         .url(serverUrl)
         // 小智:必须先带 Device-Id/Client-Id/Protocol-Version 握手头 + 发 hello,否则立即 close
-        // Device-Id = 已连接设备的真实蓝牙 MAC(与 OTA/绑定用的是同一个值)。
+        // Device-Id 按当前网关类型解析(小智 AI=已连接设备真 MAC,与 OTA/绑定同一个值;其余网关=全零匿名)。
         // Client-Id 每次 App 启动随机生成(进程内稳定,重启换新)。
         .addHeader("Authorization", token.ifBlank { "test-token" })
         .addHeader("Protocol-Version", "1")

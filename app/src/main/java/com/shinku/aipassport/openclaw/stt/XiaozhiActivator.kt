@@ -29,15 +29,20 @@ import javax.crypto.spec.SecretKeySpec
  * 关键:设备 MAC(Device-Id) + 标准 UUID(Client-Id) 是 OTA 握手必需;无 serial_number 时
  * 走 v1 激活(body={}),有 SN 走 v2(body= {algorithm,serial_number,challenge,hmac})。
  *
- * @param deviceMac **已连接对讲设备的真实蓝牙 MAC**(小智 Device-Id;格式见 [XiaozhiDeviceId])。
+ * @param gatewayType 当前网关类型(见 [XiaozhiIdentity.GATEWAY_XIAOZHI]):**只有**「小智 AI」才做设备绑定,
+ *   其余网关压根不绑(它们只把小智当识别引擎,Device-Id 是匿名标识)。
+ * @param deviceAddress 已连接对讲设备的蓝牙地址(原始值,可为 null):小智模式下由 [XiaozhiIdentity]
+ *   归一化成 Device-Id(与小智识别的 WS 握手、设置页显示**同一套规则**)。
  *   小智云按这个值登记/绑定设备,所以既不能用手机侧标识代替,取不到时也只能停手报错 ——
  *   退回全零匿名 MAC 会把两台设备登记成同一台,绑定结果对当前设备无效。
+ *   非小智模式下这个值不参与绑定(压根不绑)。
  *
  * 激活成功后返回 websocket url/token 与绑定结果,供调用方落盘/转交识别通路。
  */
 class XiaozhiActivator(
     private val context: Context,
-    private val deviceMac: String,
+    private val gatewayType: String,
+    private val deviceAddress: String?,
     private val otaUrl: String,   // 默认 https://api.tenclass.net/xiaozhi/ota/
 ) {
 
@@ -64,6 +69,8 @@ class XiaozhiActivator(
         val wsToken: String? = null,  // websocket token(OTA 下发)
         val message: String? = null,  // 服务器提示(如 "xiaozhi.me\n147063")
         val detail: String? = null,   // 失败原因等
+        /** 本次绑定实际用的设备 Device-Id(已归一化);不可建链时为 null。 */
+        val deviceMac: String? = null,
     )
 
     /**
@@ -76,18 +83,26 @@ class XiaozhiActivator(
      */
     suspend fun activateAndPoll(onCodeReady: (code: String, message: String) -> Unit): ActivationResult =
         withContext(Dispatchers.IO) {
-            // Device-Id 必须是【设备侧】的真实 MAC:OTA 的 `board.mac`/`Device-Id` 与 activate 轮询
-            // 用同一个值(小智平台据此把绑定落到这台设备上)。取不到就停手,不猜、不回退。
-            val mac = XiaozhiDeviceId.formatAddress(deviceMac)
-                ?: return@withContext ActivationResult(
+            // 标识与识别通道是**同一套规则**([XiaozhiIdentity]):只有网关类型「小智 AI」才用已连接设备的
+            // 真实 MAC 做绑定;其余网关直接停手(它们只把小智当识别引擎,拿匿名标识去绑也绑不到本机);
+            // 小智模式取不到设备地址同样停手 —— 不猜、不回退。三种情况都不发任何网络请求。
+            val mac = when (val identity = XiaozhiIdentity.resolve(gatewayType, deviceAddress)) {
+                is XiaozhiIdentity.Resolution.DeviceMac -> identity.deviceId
+                XiaozhiIdentity.Resolution.Anonymous -> return@withContext ActivationResult(
                     false,
-                    detail = "请先连接设备:小智绑定需要已连接设备的蓝牙 MAC(现在没有取到设备地址)",
+                    detail = XiaozhiIdentity.bindingNotApplicableReason(gatewayType),
                 )
+                is XiaozhiIdentity.Resolution.Unavailable -> return@withContext ActivationResult(
+                    false,
+                    detail = identity.reason,
+                )
+            }
             // Client-Id 每次 App 启动随机生成(进程内稳定,重启换新)。
             val clientId = this@XiaozhiActivator.clientId
 
             // 1. OTA 拉取(Device-Id = 已连接设备的真实 MAC)
-            val ota = postOta(otaUrl, mac, clientId) ?: return@withContext ActivationResult(false, detail = "OTA 请求失败")
+            val ota = postOta(otaUrl, mac, clientId)
+                ?: return@withContext ActivationResult(false, detail = "OTA 请求失败", deviceMac = mac)
             val activation = ota.getAsJsonObject("activation")
             val wsUrl = ota.getAsJsonObject("websocket")?.get("url")?.asString
             val wsToken = ota.getAsJsonObject("websocket")?.get("token")?.asString
@@ -95,7 +110,9 @@ class XiaozhiActivator(
             if (activation == null || !activation.has("challenge")) {
                 // 无 activation = 设备已授权,直接可用
                 Log.i(tag, "OTA 无激活数据,设备已激活 ws=$wsUrl")
-                return@withContext ActivationResult(true, wsUrl = wsUrl, wsToken = wsToken)
+                return@withContext ActivationResult(
+                    true, wsUrl = wsUrl, wsToken = wsToken, deviceMac = mac,
+                )
             }
 
             val code = activation.get("code")?.asString
@@ -115,6 +132,7 @@ class XiaozhiActivator(
                 wsToken = wsToken,
                 message = message,
                 detail = if (ok) null else "激活超时:请确认已在 xiaozhi.me 输入绑定码 $code",
+                deviceMac = mac,
             )
         }
 

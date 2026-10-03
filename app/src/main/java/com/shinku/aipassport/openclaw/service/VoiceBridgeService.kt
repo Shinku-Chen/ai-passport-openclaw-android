@@ -314,6 +314,13 @@ class VoiceBridgeService : Service() {
     @Volatile
     private var appliedGatewaySnapshot: GatewayConfigSnapshot? = null
 
+    /**
+     * 生效中的网关类型:「小智侧标识(Device-Id)」由它决定(见 [XiaozhiIdentity]),
+     * 所以类型一变,识别通道必须丢掉旧热连接、按新标识重连(旧 socket 是拿旧标识握手的)。
+     */
+    @Volatile
+    private var appliedGatewayType: String? = null
+
     private lateinit var tts: TtsEngine
     private lateinit var pipeline: VoicePipeline
 
@@ -505,6 +512,7 @@ class VoiceBridgeService : Service() {
         this.settings = settings
         gateway = GatewayFactory.create(this, settings, gatewayStatusListener, stt.session)
         appliedGatewaySnapshot = GatewayFactory.configSnapshot(this, settings)
+        appliedGatewayType = settings.type
         // 把生效的关键参数打出来(排查「为什么等了这么久/怎么这么快就失败」时一眼能看到)。
         Log.i(TAG, "网关配置: type=${settings.type} 回复等待上限=${settings.openclawReplyTimeoutSeconds}s")
         tts = TtsEngine(this)
@@ -645,6 +653,16 @@ class VoiceBridgeService : Service() {
         val settings = GatewaySettings(this)
         // 语音附加提示:与连接无关,每次保存都同步(否则改了提示词要重启 App 才生效)
         if (::pipeline.isInitialized) pipeline.updateVoicePromptSuffix(settings.voicePromptSuffix)
+
+        // 网关类型决定识别通道的 Device-Id(小智 AI=设备真 MAC / 其余=全零匿名,见 [XiaozhiIdentity]):
+        // 旧热连接是拿旧标识握手建起来的,类型变了必须丢掉,让下一次建链带**新标识**重连
+        // (否则会一直复用旧 socket 用旧标识,直到它闲置超时/掉线)。
+        if (appliedGatewayType != settings.type) {
+            Log.i(TAG, "网关类型已变化:识别通道按新的 Device-Id 重建(${appliedGatewayType} → ${settings.type})")
+            appliedGatewayType = settings.type
+            if (::stt.isInitialized) stt.resetDeviceId()
+            if (::pipeline.isInitialized) pipeline.prewarm()
+        }
 
         val next = GatewayFactory.configSnapshot(this, settings)
         if (!needsGatewayReload(appliedGatewaySnapshot, next)) {
