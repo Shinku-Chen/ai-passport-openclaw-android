@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- 设置返工（小智 AI）：流式识别（小智识别）只保留在「高级」一处（网关设置里那份删掉），「设备 ID」改用**已连接设备的蓝牙 MAC**（未连接时给可读原因、不回退手机侧标识），保存「小智 AI」改为走**设备绑定闸门**（未绑定/换设备 → 弹 6 位绑定码并轮询授权，成功才落盘；已绑定 → 直接生效；失败/超时 → 不落盘）。
+
 - 新增：「小智 AI」网关的**设备朗读直通**——小智回的下行 opus 音频**原样转发**给设备，用**小智的音色**朗读。
   新增纯逻辑 `tts/XiaozhiTtsRelay`（`XiaozhiTtsObserver` ←会话层）：把 `tts.state=start|sentence_start|sentence_end|stop`
   映射到既有的 `tts_start`/`tts_stop` 生命周期（首句即开、`stop` 收尾），音频按小智 hello 自报的

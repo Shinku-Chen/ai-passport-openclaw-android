@@ -149,7 +149,13 @@ interface XiaozhiTtsObserver {
 class XiaozhiSession(
     private val serverUrl: String,          // 如 wss://api.tenclass.net/xiaozhi/v1/
     private val token: String,              // 如 test-token
-    private val deviceId: String,           // 设备 MAC(小智按 Device-Id 白名单登记)
+    /**
+     * 小智 Device-Id 的**按需解析**回调(= 已连接设备的蓝牙 MAC,格式见 [XiaozhiDeviceId])。
+     *
+     * 为什么用回调而不是定值:服务先起、设备后连 —— 只有建链时取值才能拿到当前真正连着的设备;
+     * 返回空串 = 设备未连接 → **不建链**(见 [connectAndHello]),也绝不退回手机侧标识。
+     */
+    private val deviceIdProvider: () -> String,
     /** 重连重放的等待预算:默认取 [TurnRecovery] 的实机常量(见 [TurnRecovery.Budget]),单测可缩短。 */
     private val recovery: TurnRecovery.Budget = TurnRecovery.Budget(),
     private val onStt: ((String) -> Unit)? = null,
@@ -722,6 +728,14 @@ class XiaozhiSession(
      * 这样「预热握手还没回来时用户就按下」也能直接等这次握手,不做两次往返。
      */
     private fun connectAndHello(onReady: (Boolean) -> Unit) {
+        // 设备未连接时解析不出真实 MAC:不建链、不猜(退回全零/手机侧标识会把平台那台设备认错)。
+        // 设备一连上,服务的预热巡检(prewarm)会带着真实 Device-Id 重新走到这里。
+        val deviceId = deviceIdProvider().trim()
+        if (deviceId.isEmpty()) {
+            Log.w(tag, "小智 Device-Id 未就绪(请先连接设备),跳过建链")
+            onReady(false)
+            return
+        }
         val alreadyWarm: Boolean
         synchronized(linkLock) {
             if (connecting) {
@@ -736,7 +750,7 @@ class XiaozhiSession(
                 // 必须先存回调再建 socket:hello 可能在 newWebSocket 返回后极快到达,
                 // 存晚了就会丢掉本次调用方(→ 冷路径永远收不到 onReady、设备收不到 turn_ready)。
                 onHelloCallback = onReady
-                ws = client.newWebSocket(buildRequest(), listener())
+                ws = client.newWebSocket(buildRequest(deviceId), listener())
             }
         }
         if (alreadyWarm) {
@@ -745,9 +759,11 @@ class XiaozhiSession(
         }
     }
 
-    private fun buildRequest(): Request = Request.Builder()
+    /** @param deviceId 本次建链使用的 Device-Id(已由 [connectAndHello] 解析并校验非空)。 */
+    private fun buildRequest(deviceId: String): Request = Request.Builder()
         .url(serverUrl)
         // 小智:必须先带 Device-Id/Client-Id/Protocol-Version 握手头 + 发 hello,否则立即 close
+        // Device-Id = 已连接设备的真实蓝牙 MAC(与 OTA/绑定用的是同一个值)。
         // Client-Id 每次 App 启动随机生成(进程内稳定,重启换新)。
         .addHeader("Authorization", token.ifBlank { "test-token" })
         .addHeader("Protocol-Version", "1")

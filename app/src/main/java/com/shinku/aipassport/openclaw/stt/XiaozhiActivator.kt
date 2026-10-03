@@ -29,7 +29,11 @@ import javax.crypto.spec.SecretKeySpec
  * 关键:设备 MAC(Device-Id) + 标准 UUID(Client-Id) 是 OTA 握手必需;无 serial_number 时
  * 走 v1 激活(body={}),有 SN 走 v2(body= {algorithm,serial_number,challenge,hmac})。
  *
- * 激活成功后持久化 activated=true + websocket url/token,供 XiaozhiStt 连接使用。
+ * @param deviceMac **已连接对讲设备的真实蓝牙 MAC**(小智 Device-Id;格式见 [XiaozhiDeviceId])。
+ *   小智云按这个值登记/绑定设备,所以既不能用手机侧标识代替,取不到时也只能停手报错 ——
+ *   退回全零匿名 MAC 会把两台设备登记成同一台,绑定结果对当前设备无效。
+ *
+ * 激活成功后返回 websocket url/token 与绑定结果,供调用方落盘/转交识别通路。
  */
 class XiaozhiActivator(
     private val context: Context,
@@ -39,11 +43,6 @@ class XiaozhiActivator(
 
     private val tag = "XiaozhiActivator"
     private val gson = Gson()
-
-    private companion object {
-        /** 小智 Device-Id(全零 MAC,服务器放行的匿名通道;真实 MAC 当前被 op=8 拒)。 */
-        const val DEVICE_MAC = "00:00:00:00:00:00"
-    }
 
     /** 小智 Client-Id:每次 App 启动随机生成(进程内稳定,重启换新)。 */
     private val clientId: String = UUID.randomUUID().toString()
@@ -77,11 +76,18 @@ class XiaozhiActivator(
      */
     suspend fun activateAndPoll(onCodeReady: (code: String, message: String) -> Unit): ActivationResult =
         withContext(Dispatchers.IO) {
+            // Device-Id 必须是【设备侧】的真实 MAC:OTA 的 `board.mac`/`Device-Id` 与 activate 轮询
+            // 用同一个值(小智平台据此把绑定落到这台设备上)。取不到就停手,不猜、不回退。
+            val mac = XiaozhiDeviceId.formatAddress(deviceMac)
+                ?: return@withContext ActivationResult(
+                    false,
+                    detail = "请先连接设备:小智绑定需要已连接设备的蓝牙 MAC(现在没有取到设备地址)",
+                )
             // Client-Id 每次 App 启动随机生成(进程内稳定,重启换新)。
             val clientId = this@XiaozhiActivator.clientId
 
-            // 1. OTA 拉取(Device-Id 用全零 MAC 匿名通道)
-            val ota = postOta(otaUrl, DEVICE_MAC, clientId) ?: return@withContext ActivationResult(false, detail = "OTA 请求失败")
+            // 1. OTA 拉取(Device-Id = 已连接设备的真实 MAC)
+            val ota = postOta(otaUrl, mac, clientId) ?: return@withContext ActivationResult(false, detail = "OTA 请求失败")
             val activation = ota.getAsJsonObject("activation")
             val wsUrl = ota.getAsJsonObject("websocket")?.get("url")?.asString
             val wsToken = ota.getAsJsonObject("websocket")?.get("token")?.asString
@@ -100,7 +106,7 @@ class XiaozhiActivator(
             onCodeReady(code ?: "", message ?: "")
 
             // 2. 轮询 activate 直到 200(用户绑定完成后)
-            val ok = pollActivate(otaUrl, DEVICE_MAC, clientId, challenge ?: "")
+            val ok = pollActivate(otaUrl, mac, clientId, challenge ?: "")
             return@withContext ActivationResult(
                 activated = ok,
                 code = code,

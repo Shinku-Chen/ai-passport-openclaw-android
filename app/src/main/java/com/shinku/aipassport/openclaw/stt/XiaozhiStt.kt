@@ -24,10 +24,23 @@ package com.shinku.aipassport.openclaw.stt
 class XiaozhiStt(
     serverUrl: String,                      // 如 wss://api.tenclass.net/xiaozhi/v1/
     token: String,                          // 如 test-token
-    deviceId: String,                       // 设备 MAC(小智按 Device-Id 白名单登记)
+    /** 小智 Device-Id 的按需解析回调(已连接设备的蓝牙 MAC;见 [XiaozhiDeviceId])。 */
+    deviceIdProvider: () -> String,
     onPartial: ((String) -> Unit)? = null,
     recovery: TurnRecovery.Budget = TurnRecovery.Budget(),
 ) : SttEngine {
+
+    /**
+     * Device-Id 已固定的调用方(单测 / 直连会话)用这个重载:等价于恒返回 [deviceId] 的回调。
+     * 服务侧请用回调重载 —— 设备是后连的,定值会永远停在「没设备」那一刻。
+     */
+    constructor(
+        serverUrl: String,
+        token: String,
+        deviceId: String,
+        onPartial: ((String) -> Unit)? = null,
+        recovery: TurnRecovery.Budget = TurnRecovery.Budget(),
+    ) : this(serverUrl, token, { deviceId }, onPartial, recovery)
 
     /** 流式中间结果回调(构造参数原样保留):会话层的 `onStt` 与对外 [onPartial] 共用同一个实例。 */
     private val partialCallback: ((String) -> Unit)? = onPartial
@@ -42,7 +55,7 @@ class XiaozhiStt(
     val session = XiaozhiSession(
         serverUrl = serverUrl,
         token = token,
-        deviceId = deviceId,
+        deviceIdProvider = deviceIdProvider,
         recovery = recovery,
         // 唯一保留的一条路:stt → 文本(其余 llm/tts/音频分流本适配器不接;
         // llm 正文由共用本会话的「小智 AI 网关」用观察者取走,见 XiaozhiGateway)。

@@ -93,6 +93,19 @@ class BleCentral(
 
         /** 上次连接成功设备的地址(SharedPreferences key,用于启动自动重连)。 */
         private const val KEY_LAST_DEVICE = "last_device_addr"
+
+        /** BLE 状态 prefs 文件名(实例与静态读法共用,保证看到同一个地址)。 */
+        private const val PREFS = "ble_central"
+
+        /**
+         * 上次连接设备的地址(**不持有 [BleCentral] 实例的调用方用**,如设置页的「小智识别」
+         * 与 STT 工厂):设备页/激活页都用这一个来源,避免各自去读 prefs 键名而写错。
+         *
+         * 与实例方法 [lastConnectedAddr] 读同一份 prefs;返回 null 表示从未连过设备。
+         */
+        fun lastConnectedAddr(context: Context): String? =
+            context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+                .getString(KEY_LAST_DEVICE, null)
     }
 
     private var scanner: BluetoothLeScanner? = null
@@ -124,7 +137,7 @@ class BleCentral(
 
     /** 上次连接设备地址持久化(记住设备,App 重启后自动重连)。 */
     private val prefs =
-        context.getSharedPreferences("ble_central", Context.MODE_PRIVATE)
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
 
     /** 上次连接成功的设备地址(持久化,App 重启后用于自动重连)。 */
     private val lastDeviceAddr: String?
