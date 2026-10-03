@@ -1264,12 +1264,10 @@ class XiaozhiSession(
         val hello = JsonObject().apply {
             addProperty("type", "hello")
             addProperty("version", 1)
-            // 能力声明:官方固件恒发 mcp:true(见 xiaozhi-esp32/main/protocols/websocket_protocol.cc
-            // 的 GetHelloMessage:features = {aec?, mcp:true}),真机上缺了它在**已注册设备**这条
-            // 通道会被云端升级成功后立刻关闭(code=1005、reason 空);游客通道不需要,所以一直没暴露。
-            add("features", JsonObject().apply {
-                addProperty("mcp", true)
-            })
+            // 能力声明:官方固件恒发 mcp:true,但本项目**不实现 MCP**——真机 A/B 证明声明它后
+            // 服务端会改走带 MCP 工具调用的应答路径(日志里出现 `% get_weather...` 模板),
+            // 那条路径**不下发 TTS 音频**(App 侧 0 帧),而修 1005 的真正原因是 Device-Id 小写。
+            // 因此**不声明** mcp:按"只做识别+LLM+TTS"的用法让服务端走普通应答路径。
             addProperty("transport", "websocket")
             add("audio_params", JsonObject().apply {
                 addProperty("format", "opus")
