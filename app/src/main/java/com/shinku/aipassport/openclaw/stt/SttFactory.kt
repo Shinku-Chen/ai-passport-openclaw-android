@@ -4,6 +4,7 @@ import android.content.Context
 import android.util.Log
 import com.shinku.aipassport.openclaw.ble.BleCentral
 import com.shinku.aipassport.openclaw.gateway.GatewaySettings
+import com.shinku.aipassport.openclaw.service.VoiceBridgeService
 
 /**
  * STT 引擎工厂。
@@ -37,6 +38,17 @@ object SttFactory {
         // 绑定得到的识别凭据(OTA 的 websocket url/token)只从本机读;没读到时不给凭据 ——
         // [XiaozhiCredentialGate] 对小智 AI 会返回可读原因,绝不拿占位 token 硬撞真 MAC 的链路。
         val credentials = XiaozhiCredentialStore(context)
+        // 凭据刷新(策略①保守兜底 + 策略②被拒就刷新):重查 OTA 复用 [XiaozhiActivator.queryCloud],
+        // 落盘复用同一个 [XiaozhiCredentialStore];网关类型实时读,非小智网关闭一次 OTA 都不发。
+        // 会话层只在「绑定凭据链路」([XiaozhiLinkAuth.Ok.refreshable])上使用它。
+        val credentialRefresh: XiaozhiCredentialRefreshSource = XiaozhiCredentialRefresher(
+            context = context,
+            otaUrl = xz.otaUrl,
+            store = credentials,
+            gatewayType = { gateway.type },
+            // 与绑定/保存走**同一个**版本号来源(见 [XiaozhiOtaRequest.version]):固件版本优先。
+            deviceFirmwareVersionProvider = { VoiceBridgeService.lastKnownFirmwareVersion() },
+        )
         // 「非小智网关模式」= 小智通道只做识别:云端拿到识别文本后会接着跑走它自己的 LLM + TTS,
         // 那段回复没人用(回复来自 App 自己的网关) → 识别结束后要补发一次中止。
         // 判定来源只有一处:复用 [XiaozhiIdentity.isXiaozhi] 的既有判定,不在这里再写一份字符串比较;
@@ -65,6 +77,7 @@ object SttFactory {
                     placeholderToken = wsToken,
                 )
             },
+            credentialRefresh = credentialRefresh,
         )
     }
 }

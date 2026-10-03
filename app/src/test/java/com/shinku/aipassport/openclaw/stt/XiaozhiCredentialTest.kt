@@ -51,11 +51,12 @@ class XiaozhiCredentialTest {
         )
         assertNull("别的设备拿到 null(不拿另一台设备的 token 去握手)", store.get("AA:BB:CC:DD:EE:FF"))
         assertEquals(
-            "键名清晰:凭据带自己的设备 MAC",
+            "键名清晰:凭据带自己的设备 MAC + 落盘时刻(兜底刷新的依据)",
             setOf(
                 XiaozhiCredentialStore.KEY_MAC,
                 XiaozhiCredentialStore.KEY_URL,
                 XiaozhiCredentialStore.KEY_TOKEN,
+                XiaozhiCredentialStore.KEY_SAVED_AT,
             ),
             kv.keys(),
         )
@@ -79,6 +80,29 @@ class XiaozhiCredentialTest {
         val (empty, _) = store()
         empty.save(mac, XiaozhiCredential(url, ""))
         assertNull("半份凭据存不进去(状态就是「还没取得凭据」)", empty.get(mac))
+    }
+
+    @Test
+    fun `凭据落盘时刻可读_没存过或时间戳缺失时为 null`() {
+        val (store, _) = store()
+        assertNull("没存过凭据 → 没有落盘时刻", store.savedAt(mac))
+
+        store.save(mac, XiaozhiCredential(url, token), nowMs = 1_700_000_000_000L)
+        assertEquals(1_700_000_000_000L, store.savedAt(mac))
+        assertNull("别的设备拿不到", store.savedAt("AA:BB:CC:DD:EE:FF"))
+
+        store.save(mac, XiaozhiCredential(url, "新token"), nowMs = 1_700_000_100_000L)
+        assertEquals("刷新落盘会推进时间戳", 1_700_000_100_000L, store.savedAt(mac))
+
+        // 旧版本存的凭据(没有时间戳键):读作 null(调用方按「偏旧」处理),不当作 0 而爆炸
+        val kv = FakeXiaozhiStore()
+        kv.put(XiaozhiCredentialStore.KEY_MAC, mac)
+        kv.put(XiaozhiCredentialStore.KEY_URL, url)
+        kv.put(XiaozhiCredentialStore.KEY_TOKEN, token)
+        assertNull(XiaozhiCredentialStore(kv).savedAt(mac))
+
+        store.clear()
+        assertNull("清掉后连时间戳一起没了", store.savedAt(mac))
     }
 
     @Test
@@ -125,7 +149,7 @@ class XiaozhiCredentialTest {
             defaultUrl = "wss://fallback/",
             placeholderToken = "test-token",
         )
-        assertEquals(XiaozhiLinkAuth.Ok(url, "Bearer $token"), auth)
+        assertEquals(XiaozhiLinkAuth.Ok(url, "Bearer $token", refreshable = true), auth)
     }
 
     @Test

@@ -49,8 +49,16 @@ sealed interface XiaozhiLinkAuth {
      *
      * @param url 本次握手的地址
      * @param authorization `Authorization` 头取值;`null` = 不带这个头
+     * @param refreshable 这条链路用的是**绑定凭据**(而非匿名占位 token):只有它为 true 时,
+     *   鉴权被拒 / 凭据偏旧才会触发「重查 OTA 换新凭据」。
+     *   为什么由闸门给出而不是会话层自己判断:「这条链路是不是凭据链路」正是 [XiaozhiCredentialGate]
+     *   的决策内容,会话层再判一次必然分叉(匿名通道绝不能被带进刷新逻辑,见 [XiaozhiCredentialGate.linkAuth])。
      */
-    data class Ok(val url: String, val authorization: String?) : XiaozhiLinkAuth
+    data class Ok(
+        val url: String,
+        val authorization: String?,
+        val refreshable: Boolean = false,
+    ) : XiaozhiLinkAuth
 
     /** 不可建链:[reason] 是给用户看的可读原因(调用方据此显示状态文案与下一步)。 */
     data class Unavailable(val reason: String) : XiaozhiLinkAuth
@@ -107,7 +115,9 @@ object XiaozhiCredentialGate {
             )
         }
         val cred = credential ?: return XiaozhiLinkAuth.Unavailable(MISSING_CREDENTIAL_REASON)
-        return XiaozhiLinkAuth.Ok(cred.url, cred.authorizationValue())
+        // refreshable=true:凭据是按需签发、**会过期**的(见 stt/XiaozhiCredentialRefresh 的阈值说明),
+        // 所以这条链路在「被拒 / 凭据偏旧」时允许重查 OTA 换新凭据后重连一次。
+        return XiaozhiLinkAuth.Ok(cred.url, cred.authorizationValue(), refreshable = true)
     }
 }
 
@@ -154,14 +164,32 @@ class XiaozhiCredentialStore(private val kv: XiaozhiKeyValueStore) {
         return XiaozhiCredential.fromOta(kv.getString(KEY_URL), kv.getString(KEY_TOKEN))
     }
 
-    /** 存下该设备的凭据;MAC 为空或凭据不完整(url/token 有空)时**不落盘**(不覆盖已有凭据)。 */
-    fun save(mac: String, credential: XiaozhiCredential) {
+    /**
+     * 存下该设备的凭据;MAC 为空或凭据不完整(url/token 有空)时**不落盘**(不覆盖已有凭据)。
+     *
+     * 同时记下**落盘时刻**([savedAt]):token 的过期时间藏在**加密的 payload** 里,App 读不出 `exp`,
+     * 只能按「存了多久」做保守兜底刷新(见 [XiaozhiCredentialRefresh.STALE_AFTER_MS])。
+     *
+     * @param nowMs 落盘时刻(毫秒);单测注入固定时间,生产用系统时钟。
+     */
+    fun save(mac: String, credential: XiaozhiCredential, nowMs: Long = System.currentTimeMillis()) {
         val want = mac.trim()
         if (want.isEmpty()) return
         if (credential.url.isBlank() || credential.token.isBlank()) return
         kv.put(KEY_MAC, want)
         kv.put(KEY_URL, credential.url)
         kv.put(KEY_TOKEN, credential.token)
+        kv.put(KEY_SAVED_AT, nowMs.toString())
+    }
+
+    /**
+     * 该设备凭据的**落盘时刻**(毫秒);没存过凭据 / 时间戳缺失(旧版本存的) → `null`。
+     *
+     * 调用方([XiaozhiSession])把 `null` 当作「未知 = 保守地当作偏旧」,见 [XiaozhiCredentialRefresh.isStale]。
+     */
+    fun savedAt(mac: String): Long? {
+        if (get(mac) == null) return null
+        return kv.getString(KEY_SAVED_AT)?.trim()?.toLongOrNull()
     }
 
     /** 清掉本机凭据(换设备/退出时用;识别通道下一次建链会给出「请先绑定」)。 */
@@ -169,6 +197,7 @@ class XiaozhiCredentialStore(private val kv: XiaozhiKeyValueStore) {
         kv.put(KEY_MAC, null)
         kv.put(KEY_URL, null)
         kv.put(KEY_TOKEN, null)
+        kv.put(KEY_SAVED_AT, null)
     }
 
     companion object {
@@ -183,5 +212,13 @@ class XiaozhiCredentialStore(private val kv: XiaozhiKeyValueStore) {
 
         /** OTA 下发的识别通道 token(运行时 secret,只存本机)。 */
         const val KEY_TOKEN = "cred_ws_token"
+
+        /**
+         * 凭据**落盘时刻**(毫秒时间戳,`System.currentTimeMillis()` 的十进制字符串)。
+         *
+         * 只用于保守兜底刷新([XiaozhiCredentialRefresh.STALE_AFTER_MS]):token 过期时间在加密 payload 里,
+         * App 读不出来,只能按「存了多久」估。缺失 = 未知(旧版本存的凭据)→ 下一次建链前刷新一次。
+         */
+        const val KEY_SAVED_AT = "cred_saved_at_ms"
     }
 }

@@ -157,8 +157,8 @@
   `websocket.token`）。识别 WS 握手必须带它（`Authorization: Bearer <token>`，与官方固件
   `websocket_protocol.cc` 同一规则），否则真 MAC 的整轮识别静默失败（App 只能回「无语音」）。
 - 凭据落盘：`stt/XiaozhiCredentialStore`（独立 prefs `xiaozhi_credential`，键 `cred_mac` / `cred_ws_url` /
-  `cred_ws_token`，只存本机、不入库、不进日志 —— 日志只打长度与前 4 位）。凭据带自己的设备 MAC，
-  换设备取不到旧凭据（不会拿别的设备的 token 去握手）。
+  `cred_ws_token` / `cred_saved_at_ms`，只存本机、不入库、不进日志 —— 日志只打长度与前 4 位）。凭据带自己的设备 MAC，
+  换设备取不到旧凭据（不会拿别的设备的 token 去握手）；`cred_saved_at_ms` 是**落盘时刻**，供 §7.4 的兜底刷新用。
 - 建链鉴权唯一决策点：`stt/XiaozhiCredentialGate.linkAuth(网关类型, 凭据, 默认地址, 占位 token)` ——
   小智 AI 用凭据；**没有凭据就不建链**并给可读原因（`MISSING_CREDENTIAL_REASON`，经新增的
   `SttEngine.unavailableReason` 进状态卡文案），**绝不**用占位 token 硬撞云端；
@@ -169,12 +169,32 @@
 - OTA 请求字段单一来源：`stt/XiaozhiOtaRequest`（`name=ai-passport`、`version` = 设备固件版本 → App
   `versionName` → 显式回退、`User-Agent` 同源）；OTA 响应按未激活/已激活两种把键名与结构打进日志用于取证。
 
+### 7.4 修订（识别凭据会过期：自动刷新）
+
+- **token 是按需签发、会过期的**（开源服务端实现为 JWT，`exp` 约 1 小时；官方固件每次 OTA 都覆盖写入
+  `websocket` 段）。旧实现把 token 存下来一直用 → 一小时后 WS 因鉴权失败连不上，用户侧又变回「无语音」。
+- **两条刷新策略**（纯逻辑 `stt/XiaozhiCredentialRefresh` + 会话层 `XiaozhiSession`）：
+  1. **被拒就换**：升级响应 401/403，或对端以鉴权类关闭码（`1008`/`4001`/`4003`/`4401`/`4403`）收掉连接 →
+     **重查一次 OTA**（复用 `XiaozhiActivator.queryCloud`，不另写请求）→ 复用 `XiaozhiCredentialStore` 落盘 →
+     **用新凭据重连一次**（用户无感，不用手动重绑）。对端的关闭码在 `onClosing` 就处理 —— 实测对端发完关闭帧
+     并不立刻结束 TCP，只等 `onClosed` 会错过这个时机。
+  2. **保守兜底**：token 的 payload 是**加密**的，App **读不出 `exp`**，所以只能按「存了多久」估 ——
+     凭据落盘超过 `XiaozhiCredentialRefresh.STALE_AFTER_MS`（**50 分钟**）时，**下一次建链前**先换一份；
+     阈值取 50 分钟 = 短于服务端约 60 分钟的有效期（留 10 分钟余量），又不至于每轮对话都白查一次 OTA。
+- **防死循环**：同一次建链尝试**最多刷新一次**（`startTurn` 复位）；刷新后仍被拒 → 放弃并给出可读原因
+  （`REFRESH_FAILED_REASON` / `STILL_REJECTED_REASON`，走既有 `unavailableReason` → 状态卡文案），绝不无限重连。
+- **匿名通道完全不变**：刷新只对「绑定凭据链路」生效（闸门给出的 `XiaozhiLinkAuth.Ok.refreshable`）——
+  非小智网关仍用匿名地址 + 占位 token，**0 次 OTA**（单测钉住）；小智模式**永不**回退占位 token。
+- **刷新过程有脱敏日志**：`凭据需要刷新(<原因>) → 重新查询 OTA…` → `已取到新凭据:url=… token=len=N,前4位=xxxx → 用新凭据重连一次`
+  （token 只打长度与前 4 位，明文永不进日志）。
+
 ## 8. 异常与回退
 
 | 情况 | 行为 |
 | --- | --- |
 | 未激活 / 激活过期 | 状态卡给出可读原因 + 引导重新激活；对话不可用但不阻断其他网关 |
 | WS 断线 | 沿用 `TurnRecovery`（一轮内重连重放一次）；持续失败则提示并可切回其他网关 |
+| 凭据过期（WS 被 401/403 拒、或对端以 1008 一类鉴权码关闭） | 重查一次 OTA 换新凭据并用新凭据重连**一次**（见 §7.4）；失败/仍被拒 → 放弃并给可读原因 |
 | 小智只回 STT 不回 LLM | 视为失败，提示「小智没有返回回复」，**不发**空气泡 |
 | TTS 无音频或解码失败 | 设备回报 `tts_playback_aborted` → 记录并只保留文字（不回退手机合成，保持行为可预期） |
 | 打断 | 小智 `abort` + 设备 `tts_abort`，两条路径都要幂等 |

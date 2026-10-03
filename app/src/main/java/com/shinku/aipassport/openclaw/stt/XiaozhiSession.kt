@@ -5,7 +5,11 @@ import com.google.gson.Gson
 import com.google.gson.JsonObject
 import com.theeasiestway.opus.Constants
 import com.theeasiestway.opus.Opus
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -139,6 +143,12 @@ interface XiaozhiTtsObserver {
  *  - **兜底**(见 [TurnRecovery]):本轮每一帧 Opus 都留一份缓存,一旦「已上送音频却一条 stt 都没等到」,
  *    就重连并**把这一轮重放**上去 —— 结果只是晚 1–2s,而不是变成「无语音」。
  *
+ * **凭据过期时的自动换新**(见 [XiaozhiCredentialRefresh]):识别 WS 的 `Authorization` 是 OTA 下发的 token,
+ * 它**会过期**。因此两条策略在本层兑现:WS 被 401/403 拒、或对端以鉴权类关闭码收掉连接 → 重查一次 OTA
+ * 换新凭据并用它重连**一次**(用户无感,不用手动重绑);凭据落盘超过保守阈值 → 建链**之前**先刷新一次。
+ * 两条都只对**绑定凭据链路**生效(匿名通道 0 次 OTA,行为与改动前一致),同一次建链尝试最多刷新一次,
+ * 刷新后仍被拒就放弃并把可读原因写进 [unavailableReason](绝不无限重连)。
+ *
  * @param onStt 识别文本分流(每条 `stt` 回调一次;小智边识边发,可能是部分结果)。
  * @param onLlm 回复正文分流(`{"type":"llm"}`)。
  *   共用本会话的网关不靠它,而是用 [setLlmObserver] 挂观察者(两条出口互不覆盖)。
@@ -191,6 +201,15 @@ class XiaozhiSession(
      * 默认 null = 不注入,行为与改动前逐字一致(单测/直连会话)。
      */
     private val linkAuthProvider: ((String) -> XiaozhiLinkAuth)? = null,
+    /**
+     * 凭据刷新能力面(重查 OTA → 落盘 → 用新凭据重连一次);见 [XiaozhiCredentialRefreshSource]。
+     *
+     * 为什么是注入的:刷新需要网络(OTA)+ 存储(SharedPreferences),会话层不该自己 new 一套请求;
+     * `savedAtMs`/`nowMs` 注入后,「凭据偏旧」那条兜底阈值就能在 JVM 单测里用固定时间戳验证。
+     * 默认 null = 不刷新(单测/直连会话)。注意匿名通道**不会**用到它:
+     * [XiaozhiLinkAuth.Ok.refreshable] 为 false,刷新入口直接返回。
+     */
+    private val credentialRefresh: XiaozhiCredentialRefreshSource? = null,
 ) : XiaozhiLlmSource {
 
     private val tag = "XiaozhiStt"
@@ -288,6 +307,30 @@ class XiaozhiSession(
     /** 本轮因热连接复用失败而自动重连的次数(最多一次,见 [WarmLink.shouldFallbackReconnect])。 */
     @Volatile
     private var warmFallbackAttempts = 0
+
+    /**
+     * 本次「建链尝试」是否已经刷新过凭据:同一次尝试**最多刷新一次**。
+     *
+     * 防死循环:刷新后仍被拒就放弃并给可读原因,绝不为一份不该成功的凭据无限重连。
+     * 复位点:[startTurn](一轮 = 一次尝试)与 hello 成功(这次尝试真的成功了,允许后续再刷)。
+     */
+    @Volatile
+    private var authRefreshed = false
+
+    /**
+     * 当前连接是否用**绑定凭据**握手([XiaozhiLinkAuth.Ok.refreshable]);只有它会触发刷新。
+     * 匿名通道(全零 MAC + 占位 token)永远是 false,因此刷新逻辑一行都走不到(行为与改动前一致)。
+     */
+    @Volatile
+    private var linkAuthRefreshable = false
+
+    /**
+     * 凭据刷新的后台协程作用域。
+     *
+     * 为什么必须异步:[prewarm]/[startTurn] 跑在主线程或 BLE 回调线程上,而一次刷新要发 OTA 请求
+     * (硬超时 [XiaozhiActivator.CLOUD_QUERY_TIMEOUT_MS])—— 绝不能阻塞它们。
+     */
+    private val refreshScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     // ---- 本轮音频缓存(重连重放兜底,见 [TurnRecovery]) ----
 
@@ -406,6 +449,7 @@ class XiaozhiSession(
         lastStt = ""
         pcmLen = 0
         warmFallbackAttempts = 0
+        authRefreshed = false   // 新一轮 = 新的建链尝试:允许再刷一次(但每轮最多一次)
         initOpusEncoder()
 
         // ① 优先复用热连接:按下时直接 listen.start,毫秒级就绪(不用再等一次 hello 往返)。
@@ -718,6 +762,8 @@ class XiaozhiSession(
         dropWarmLink()
         cancelWarmIdleTimer()
         warmIdleScheduler.shutdownNow()
+        // 在途的凭据刷新一并取消(服务已停,刷完也没人用;OTA 请求本身有硬超时兜底)。
+        refreshScope.cancel()
         releaseOpus()
     }
 
@@ -800,6 +846,8 @@ class XiaozhiSession(
         // 连接一旦丢弃,「正在建立」也随之作废:否则旧握手的回调可能被 ws 判定拦下,
         // connecting 会永久停在 true,下一次 connectAndHello 就会误以为「已在建立中」而一直等。
         connecting = false
+        // 鉴权链路的「可刷新」标记随连接一起作废:它描述的是**当前那条** socket。
+        linkAuthRefreshable = false
         val socket = ws
         ws = null
         try { socket?.close(1000, "done") } catch (_: Exception) {}
@@ -825,8 +873,7 @@ class XiaozhiSession(
         }
         // 鉴权只有一处决策([XiaozhiCredentialGate]):小智 AI 必须用**绑定得到的凭据**;
         // 没有凭据就不建链(绝不用占位 token 硬撞),原因写进 unavailableReason 给上层文案。
-        val auth = linkAuthProvider?.invoke(deviceId)
-            ?: XiaozhiLinkAuth.Ok(serverUrl, token.ifBlank { XiaozhiSettings.ANONYMOUS_PLACEHOLDER_TOKEN })
+        val auth = resolveAuth(deviceId)
         if (auth is XiaozhiLinkAuth.Unavailable) {
             unavailableReason = auth.reason
             Log.w(tag, "小智识别通道不可用,本轮不建链:${auth.reason}")
@@ -835,6 +882,13 @@ class XiaozhiSession(
         }
         unavailableReason = null
         val ok = auth as XiaozhiLinkAuth.Ok
+        // 兜底刷新(策略①):token 的过期时间在**加密 payload** 里,App 读不出 `exp`,只能按「存了多久」
+        // 保守判断 —— 落盘超过 [XiaozhiCredentialRefresh.STALE_AFTER_MS] 的凭据在建链**之前**先换一份。
+        if (shouldRefreshBeforeConnect(ok, deviceId)) {
+            startCredentialRefresh(deviceId, "凭据落盘时间偏旧(超过兜底阈值)", onReady)
+            return
+        }
+        linkAuthRefreshable = ok.refreshable
         Log.i(
             tag,
             "识别通道建链:url=${ok.url} deviceId=$deviceId" +
@@ -860,6 +914,129 @@ class XiaozhiSession(
         if (alreadyWarm) {
             Log.i(tag, "已有可用热连接,跳过握手")
             onReady(true)
+        }
+    }
+
+    /**
+     * 本次建链的鉴权:**唯一**决策点 [XiaozhiCredentialGate];未注入 provider 时用构造参数(单测/直连会话)。
+     */
+    private fun resolveAuth(deviceId: String): XiaozhiLinkAuth =
+        linkAuthProvider?.invoke(deviceId)
+            ?: XiaozhiLinkAuth.Ok(serverUrl, token.ifBlank { XiaozhiSettings.ANONYMOUS_PLACEHOLDER_TOKEN })
+
+    /**
+     * 建链前是否要先刷新凭据(策略①:保守兜底)。
+     *
+     * 三个条件缺一不可:这条链路用绑定凭据([XiaozhiLinkAuth.Ok.refreshable])、
+     * 本次尝试还没刷过([authRefreshed])、凭据落盘时间已超过阈值(或未知)。
+     */
+    private fun shouldRefreshBeforeConnect(auth: XiaozhiLinkAuth.Ok, deviceId: String): Boolean {
+        val source = credentialRefresh ?: return false
+        if (!XiaozhiCredentialRefresh.shouldRefreshOnRejection(auth.refreshable, authRefreshed)) return false
+        val savedAt = try {
+            source.savedAtMs(deviceId)
+        } catch (e: Exception) {
+            Log.w(tag, "读取凭据落盘时间失败,按偏旧处理", e)
+            null
+        }
+        return XiaozhiCredentialRefresh.isStale(savedAt, source.nowMs())
+    }
+
+    /**
+     * 重新查 OTA 拿新凭据并落盘(异步),完成后用新凭据**重连一次**。
+     *
+     * 为什么占住「连接建立中」的槽位([connecting]/[onHelloCallback]):刷新期间别的调用方
+     * ([startTurn]/[prewarm])不该另建一条 socket —— 按既有语义把回调放进同一个槽位(最新调用方胜出),
+     * hello 回来时统一回调,于是「刷新 + 重连」对上层完全不可见。
+     *
+     * @param reason 触发原因(写日志,便于真机取证:是「被拒」还是「凭据偏旧」)
+     * @param onReady 这次建链的等待者;刷新失败时以 false 收尾(可读原因进 [unavailableReason])
+     */
+    private fun startCredentialRefresh(deviceId: String, reason: String, onReady: (Boolean) -> Unit) {
+        val source = credentialRefresh
+        if (source == null || deviceId.isEmpty()) {
+            onReady(false)
+            return
+        }
+        synchronized(linkLock) {
+            authRefreshed = true   // 同一次尝试最多一次(先占位再发请求,并发路径也不会重复刷)
+            connecting = true
+            onHelloCallback = onReady
+        }
+        Log.i(tag, "小智识别凭据需要刷新($reason) → 重新查询 OTA…")
+        refreshScope.launch {
+            val fresh = try {
+                source.refresh(deviceId)
+            } catch (e: Exception) {
+                Log.w(tag, "重新查询 OTA 失败", e)
+                null
+            }
+            if (fresh == null) {
+                val cb = synchronized(linkLock) {
+                    connecting = false
+                    val c = onHelloCallback
+                    onHelloCallback = null
+                    c
+                }
+                unavailableReason = XiaozhiCredentialRefresh.REFRESH_FAILED_REASON
+                Log.w(tag, "凭据刷新失败(OTA 未下发新凭据),本次不建链")
+                cb?.invoke(false)
+                return@launch
+            }
+            // 脱敏取证:token 只打长度与前 4 位,明文绝不进日志。
+            Log.i(
+                tag,
+                "已取到新凭据:url=${fresh.url} token=${XiaozhiOtaRequest.describeSecret(fresh.token)}" +
+                    " → 用新凭据重连一次",
+            )
+            reconnectAfterRefresh(deviceId)
+        }
+    }
+
+    /**
+     * 刷新完成后用**新凭据**重连:重新走一次 [resolveAuth](此时闸门读到的是刚落盘的凭据)。
+     *
+     * 与 [connectAndHello] 的区别:不新建等待槽位 —— 槽位从刷新开始就被占着(可能已被更新的调用方替换),
+     * 这里只在「仍处在本次建立中」时把 socket 建起来,hello 回来统一回调。
+     */
+    private fun reconnectAfterRefresh(deviceId: String) {
+        val auth = resolveAuth(deviceId)
+        if (auth is XiaozhiLinkAuth.Unavailable) {
+            val cb = synchronized(linkLock) {
+                connecting = false
+                val c = onHelloCallback
+                onHelloCallback = null
+                c
+            }
+            unavailableReason = auth.reason
+            Log.w(tag, "刷新后仍取不到凭据,本次不建链:${auth.reason}")
+            cb?.invoke(false)
+            return
+        }
+        val ok = auth as XiaozhiLinkAuth.Ok
+        unavailableReason = null
+        linkAuthRefreshable = ok.refreshable
+        Log.i(
+            tag,
+            "识别通道建链(凭据刷新后):url=${ok.url} deviceId=$deviceId" +
+                " Authorization=${if (ok.authorization.isNullOrEmpty()) "无" else "len=${ok.authorization.length}"}",
+        )
+        val created = synchronized(linkLock) {
+            if (!connecting || ws != null) {
+                false
+            } else {
+                ws = client.newWebSocket(buildRequest(deviceId, ok), listener())
+                true
+            }
+        }
+        if (!created) {
+            // 期间已被放弃(release/onLinkDown/resetDeviceId)或已有连接:让等待者立刻结束,不留悬空回调。
+            val cb = synchronized(linkLock) {
+                val c = onHelloCallback
+                onHelloCallback = null
+                c
+            }
+            cb?.invoke(false)
         }
     }
 
@@ -908,32 +1085,78 @@ class XiaozhiSession(
 
         override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
             Log.e(tag, "小智 WS 失败 code=${response?.code} ${response?.message}: ${t.message}")
-            // 旧 socket 的迟到回调不能影响当前(新)连接:只有确定是自己的连接才处理
-            val cb: ((Boolean) -> Unit)?
-            synchronized(linkLock) {
-                if (!(ws === webSocket || ws == null)) return
-                connecting = false
-                warmReady = false
-                ws = null
-                cancelWarmIdleTimer()
-                listening = false
-                cb = onHelloCallback
-                onHelloCallback = null
-            }
-            cb?.invoke(false)
+            // 升级响应非 101(如 401/403)也走这里:OkHttp 把非 101 的响应在 response 里给出来。
+            handleSocketDown(webSocket, response?.code, null, "建链被拒 HTTP ${response?.code}")
+        }
+
+        /**
+         * 对端主动关闭:这是**最早**能拿到关闭码的时机。
+         *
+         * 为什么不能只靠 [onClosed]:实测在假服务端/部分真实服务端下,对端发完关闭帧
+         * 并不立刻结束 TCP,onClosed 可能很久才到(甚至不到);鉴权类关闭码必须在这里就处理,
+         * 否则「凭据过期 → 自动换新」就永远不会触发。
+         */
+        override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
+            Log.w(tag, "小智 WS 收到对端关闭 $code $reason")
+            handleSocketDown(webSocket, null, code, "对端关闭 code=$code")
         }
 
         override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
             Log.w(tag, "小智 WS 关闭 $code $reason")
-            synchronized(linkLock) {
-                if (!(ws === webSocket || ws == null)) return
-                connecting = false
-                warmReady = false
-                ws = null
-                cancelWarmIdleTimer()
-                listening = false
-            }
+            // 与 [onClosing] 同一套收尾;幂等(严格按 socket 身份判定,已处理过的不再重复)。
+            handleSocketDown(webSocket, null, code, "连接被关闭 code=$code")
         }
+    }
+
+    /**
+     * 当前 socket 失败/被关闭时的**统一收尾**([onFailure]/[onClosing]/[onClosed] 共用)。
+     *
+     * 三件事做全,顺序不能变:
+     *  1. **先按 socket 身份判定**:只有仍是当前连接的才处理(旧 socket 的迟到回调不能影响新连接);
+     *     同时把热连接状态/等待者摘干净,并把「这条链路的凭据可刷新」标记跟着作废;
+     *  2. **鉴权失败 → 刷新一次**:升级 401/403、或对端以鉴权类码关闭(1008/4001…)
+     *     都按凭据过期处理 —— 重查 OTA 换新凭据后用新凭据重连一次(等待者交给刷新流程统一回调,
+     *     用户侧因此无感)。只对**绑定凭据**链路([XiaozhiLinkAuth.Ok.refreshable])且
+     *     同一次尝试没刷过([authRefreshed])时才刷,匿名通道行为与改动前逐字一致;
+     *  3. **其余情况**:等待者立刻收到 false(否则握手没回来就断链时它会一直等下去);
+     *     若鉴权失败且已经刷过,则给可读原因([XiaozhiCredentialRefresh.STILL_REJECTED_REASON]),
+     *     绝不为一份不该成功的凭据无限重连。
+     *
+     * @param httpCode 非 101 升级响应的状态码(来自 `onFailure` 的 response)
+     * @param wsCloseCode 对端关闭帧的码(来自 `onClosing`/`onClosed`)
+     * @param label 写日志/刷新的原因描述(区分「被拒」与「被关闭」)
+     */
+    private fun handleSocketDown(
+        socket: WebSocket,
+        httpCode: Int?,
+        wsCloseCode: Int?,
+        label: String,
+    ) {
+        val rejected = XiaozhiCredentialRefresh.isAuthRejection(httpCode, wsCloseCode)
+        val cb: ((Boolean) -> Unit)?
+        val refreshable: Boolean
+        synchronized(linkLock) {
+            if (ws !== socket) return   // 旧 socket 的迟到回调:丢掉
+            connecting = false
+            warmReady = false
+            ws = null
+            cancelWarmIdleTimer()
+            listening = false
+            refreshable = linkAuthRefreshable
+            linkAuthRefreshable = false
+            cb = onHelloCallback
+            onHelloCallback = null
+        }
+        if (rejected && XiaozhiCredentialRefresh.shouldRefreshOnRejection(refreshable, authRefreshed)) {
+            Log.w(tag, "小智识别通道鉴权失败($label):按凭据过期处理,重查 OTA 换新凭据后重连一次")
+            startCredentialRefresh(deviceIdProvider().trim(), "鉴权失败($label)", cb ?: {})
+            return
+        }
+        if (rejected && refreshable) {
+            unavailableReason = XiaozhiCredentialRefresh.STILL_REJECTED_REASON
+            Log.w(tag, "凭据刷新后仍鉴权失败($label),本次放弃不再重连")
+        }
+        cb?.invoke(false)
     }
 
     private fun sendHello(webSocket: WebSocket) {
@@ -1057,6 +1280,8 @@ class XiaozhiSession(
             connecting = false
             warmReady = true
             warmActiveAtMs = System.currentTimeMillis()
+            // 这次建链真的成功(凭据被云端接受了):允许后续的建链尝试再刷一次(每轮仍最多一次)。
+            authRefreshed = false
             cb = onHelloCallback
             onHelloCallback = null
         }
