@@ -97,27 +97,45 @@ class XiaozhiGatewayTest {
     /**
      * 两个**真实件**接起来(假传输):`XiaozhiReplyText` 装配 → 网关等待 → 流水线拿到的正文。
      *
-     * 验收点 1 的「上屏的是两句拼接的 tts 文本(不是 😊)」在这一层可见:会话层(此处用真装配器模拟
-     * 它的分流)喂进 `llm` 的表情 + 两句 `tts` 文本,网关交出的回复就是那两句拼接。
+     * 验收点 1 的「上屏的是 tts 拼接的正文(不是 😊)」在这一层可见:会话层(此处用真装配器模拟
+     * 它的分流)喂进 `llm` 的表情 + 两句 `tts` 文本,网关交出的**首条**回复就是渐进交付出的首句;
+     * 之后更完整的正文经 `onBodyCorrection` 补正交付(小智网关「首条 + 补正」的完整契约)。
      */
     @Test
     fun tts_concat_body_reaches_the_gateway_verbatim() = runTest {
         val session = FakeSession()
-        // 与会话层同构:装配器的 emit 就是推给本会话正文观察者的那个回调。
-        val replyText = XiaozhiReplyText(emit = { outcome -> session.pushLlm(outcome.body) })
+        // 与会话层同构:装配器的 emit 就是推给本会话正文观察者的那个回调(未变化的诊断不上屏)。
+        val replyText = XiaozhiReplyText(emit = { outcome ->
+            if (outcome.changed) session.pushLlm(outcome.body)
+        })
         val gw = XiaozhiGateway(session)
+        val corrections = CopyOnWriteArrayList<String>()
         var reply: ChatReply? = null
-        val job = launch { reply = gw.chatMulti("明天天气怎么样") }
+        val job = launch {
+            reply = gw.chatMulti("明天天气怎么样", onBodyCorrection = { corrections += it })
+        }
         runCurrent()
         replyText.onTurnStart()
         replyText.onLlm("😊")
         replyText.onTtsState("sentence_start", "气温大概十八到二十三度，")
+        advanceUntilIdle()
+        assertEquals(
+            "首句先到:首条交付就是它(渐进交付,直接开播的那条)",
+            listOf("气温大概十八到二十三度，"),
+            reply!!.messages,
+        )
+
         replyText.onTtsState("sentence_end", "出门记得带把伞喔。")
         replyText.onTtsState("stop", "")
         advanceUntilIdle()
         job.join()
 
-        assertEquals(listOf("气温大概十八到二十三度，出门记得带把伞喔。"), reply!!.messages)
+        assertEquals(listOf("气温大概十八到二十三度，"), reply!!.messages)
+        assertEquals(
+            "更完整的正文(tts 两句拼接)经补正交付",
+            listOf("气温大概十八到二十三度，出门记得带把伞喔。"),
+            corrections.toList(),
+        )
         assertNull(reply!!.error)
     }
 

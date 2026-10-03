@@ -28,14 +28,28 @@ class XiaozhiReplyTextTest {
     /** 真机报文里的表情(UTF-16 下是 2 个 char,断言长度时要用它而不是手写的数字)。 */
     private val EMOJI = "😊"
 
-    /** 一次结算的记录:正文、说明、触发者、是否真的产生了新正文。 */
-    private data class Settle(val body: String, val detail: String, val trigger: XiaozhiReplyTrigger, val changed: Boolean)
+    /** 一次结算的记录:正文、说明、触发者、是否真的产生了新正文、第几次交付、触发者描述。 */
+    private data class Settle(
+        val body: String,
+        val detail: String,
+        val trigger: XiaozhiReplyTrigger,
+        val changed: Boolean,
+        val deliveryIndex: Int,
+        val triggerLabel: String,
+    )
 
     /** 记录 [XiaozhiReplyText.emit] 交出的每一次结算(含「未变化」的诊断)。 */
     private class Recorder {
         val settles = ArrayList<Settle>()
         val reply = XiaozhiReplyText(emit = { outcome ->
-            settles += Settle(outcome.body, outcome.detail, outcome.trigger, outcome.changed)
+            settles += Settle(
+                outcome.body,
+                outcome.detail,
+                outcome.trigger,
+                outcome.changed,
+                outcome.deliveryIndex,
+                outcome.triggerLabel,
+            )
         })
 
         /** 真正上屏的正文(按顺序;`changed = false` 的诊断不进这里)。 */
@@ -51,7 +65,7 @@ class XiaozhiReplyTextTest {
         fun lastBody(): String = bodies().last()
     }
 
-    /** 验收点 1:llm 的正文是表情(真机形态)→ 以 tts 两句拼接为准,表情不上屏。 */
+    /** 验收点 1:llm 的正文是表情(真机形态)→ 以 tts 句级拼接为准,表情不上屏。 */
     @Test
     fun llm_emoji_is_replaced_by_tts_sentence_concat() {
         val r = Recorder()
@@ -60,13 +74,26 @@ class XiaozhiReplyTextTest {
         r.reply.onLlm("😊")
         // tts 句级文本 = 用户实际听到的内容(这里模拟 sentence_start/sentence_end 各带一次首句)。
         r.reply.onTtsState("sentence_start", "气温大概十八到二十三度，")
-        r.reply.onTtsState("sentence_end", "气温大概十八到二十三度，")
-        r.reply.onTtsState("sentence_end", "出门记得带把伞喔。")
-        assertTrue("整段在 stop 之前不上屏(方案 A:一条回复一个气泡)", r.settles.isEmpty())
+        assertEquals(
+            "渐进交付(作者定稿:第一句就好):首句一清洗出来就交付一次,直通侧据此开播",
+            listOf("气温大概十八到二十三度，"),
+            r.bodies(),
+        )
+        r.reply.onTtsState("sentence_end", "气温大概十八到二十三度，")   // 同一句:不重复交付
+        assertEquals(listOf("气温大概十八到二十三度，"), r.bodies())
+        r.reply.onTtsState("sentence_end", "出门记得带把伞喔。")          // 第二句 → 补正
+        assertEquals(
+            listOf("气温大概十八到二十三度，", "气温大概十八到二十三度，出门记得带把伞喔。"),
+            r.bodies(),
+        )
 
-        r.reply.onTtsState("stop", "")
-        assertEquals(listOf("气温大概十八到二十三度，出门记得带把伞喔。"), r.bodies())
+        r.reply.onTtsState("stop", "")   // 最终结算点:与上次相同 → 不再交付
+        assertEquals(
+            listOf("气温大概十八到二十三度，", "气温大概十八到二十三度，出门记得带把伞喔。"),
+            r.bodies(),
+        )
         assertEquals(XiaozhiReplyTrigger.STOP, r.lastTrigger())
+        assertFalse("stop 上没有新正文,只能记诊断", r.settles.last().changed)
         assertFalse("表情绝不能进正文", r.bodies().any { it.contains("😊") })
     }
 
@@ -153,7 +180,12 @@ class XiaozhiReplyTextTest {
         r.reply.onTtsState("sentence_start", "第二句。")
         r.reply.onTtsState("sentence_end", "第二句。")
         r.reply.onTtsState("stop", "")
-        assertEquals(listOf("第一句。第二句。"), r.bodies())
+        assertEquals(
+            "每次交付都是「当前累积的完整拼接」;同一句在被推两次时只算一次",
+            listOf("第一句。", "第一句。第二句。"),
+            r.bodies(),
+        )
+        assertEquals("最终正文里同一句不会拼两遍", "第一句。第二句。", r.lastBody())
     }
 
     /** 句子在增长(start 给部分文本、end 给完整文本)时取更完整的那份,而不是两边都拼上。 */
@@ -162,9 +194,20 @@ class XiaozhiReplyTextTest {
         val r = Recorder()
         r.reply.onTurnStart()
         r.reply.onTtsState("sentence_start", "气温大概")
+        // 渐进交付:部分句也先上屏一次(作者允许「屏幕先短后长」),但**绝不能**把同一句拼两遍
+        assertEquals(listOf("气温大概"), r.bodies())
         r.reply.onTtsState("sentence_end", "气温大概十八到二十三度。")
+        assertEquals(
+            "句子增长时取更完整的那份(补正替换,不是追加)",
+            listOf("气温大概", "气温大概十八到二十三度。"),
+            r.bodies(),
+        )
         r.reply.onTtsState("stop", "")
-        assertEquals(listOf("气温大概十八到二十三度。"), r.bodies())
+        assertEquals("气温大概十八到二十三度。", r.lastBody())
+        assertFalse(
+            "同一句不能被拼成两遍",
+            r.lastBody().contains("气温大概气温大概"),
+        )
     }
 
     /** 反过来(end 比 start 短 / 少一个标点)也不能把同一句拼两遍。 */
@@ -195,7 +238,17 @@ class XiaozhiReplyTextTest {
         r.reply.onTtsState("sentence_end", "第二句，带更多内容。") // 句子在增长:取更完整的
         r.reply.onTtsState("sentence_end", "第三句。")
         r.reply.onTtsState("stop", "")
-        assertEquals(listOf("第一句。第二句，带更多内容。第三句。"), r.bodies())
+        assertEquals(
+            "渐进交付每次交出的都是当前累积的完整拼接(空句/重复句不占位)",
+            listOf(
+                "第一句。",
+                "第一句。第二句，",
+                "第一句。第二句，带更多内容。",
+                "第一句。第二句，带更多内容。第三句。",
+            ),
+            r.bodies(),
+        )
+        assertEquals("第一句。第二句，带更多内容。第三句。", r.lastBody())
     }
 
     /** 没有 `stop` 的服务端:收到过 tts 报文时只挂**强制兜底**窗口,到点才结算(而不是半路 2s)。 */
@@ -234,7 +287,12 @@ class XiaozhiReplyTextTest {
         r.reply.onTurnStart()                 // 新一轮:上一轮的句级文本作废
         r.reply.onTtsState("sentence_end", "这一句。")
         r.reply.onTtsState("stop", "")
-        assertEquals(listOf("这一句。"), r.bodies())
+        assertEquals(
+            "新一轮从零开始(上一轮那条不会再被拼进来)",
+            listOf("上一句。", "这一句。"),
+            r.bodies(),
+        )
+        assertEquals("这一句。", r.lastBody())
     }
 
     /**
@@ -327,6 +385,62 @@ class XiaozhiReplyTextTest {
     }
 
     /**
+     * **本轮主验收(渐进交付「第一句就好」)**:真机那种逐句交错流 —— 噪声句**绝不**提前交付;
+     * 首句一到就交付(直通侧据此在首句上屏时即可开播);第二/三句各补正一次;`stop` 与最后一次
+     * 相同则**不再**交付。
+     *
+     * 硬约束(上一轮「正文不完整」的根因):只拿到模板/emoji/空文本时**一个字节都不提前交付**,
+     * 而且中途交付**从不回退 `llm.text`** —— 所以每一次交付的正文都是清洗后非空可读、不含模板的。
+     */
+    @Test
+    fun progressive_delivery_first_sentence_then_corrections_and_stop_final() {
+        val r = Recorder()
+        r.reply.onTurnStart()
+        r.reply.onLlm("😊")
+        r.reply.onTtsState("start", "")
+        // 噪声句(真机形状的工具模板):清洗后不可读 → **绝不允许**产生一次交付
+        r.reply.onTtsState("sentence_start", "% get_weather(location=\"上海\", date=\"明天\")")
+        r.reply.onTtsState("sentence_end", "% get_weather(location=\"上海\", date=\"明天\")")
+        assertTrue("只拿到模板时不许提前交付", r.bodies().isEmpty())
+        assertTrue("噪声句连「交付」都不算(changed 全为 false)", r.settles.none { it.changed })
+
+        // 首句真文本:必须交付,且是**第一次**交付(触发者=首句)
+        r.reply.onTtsState("sentence_start", "明天上海是小雨喔，")
+        assertEquals("首句一清洗出来就交付(不等 stop)", listOf("明天上海是小雨喔，"), r.bodies())
+        assertEquals(XiaozhiReplyTrigger.PROGRESS_FIRST, r.settles.last().trigger)
+        assertEquals("首句", r.settles.last().triggerLabel)
+        assertEquals("首句就是本轮第 1 次交付", 1, r.settles.last().deliveryIndex)
+
+        // 第二/三句:各交付一次**补正**(整段拼接,不是碎气泡)
+        r.reply.onTtsState("sentence_end", "白天都湿湿的，")
+        r.reply.onTtsState("sentence_start", "晚上才转阴。")
+        assertEquals(
+            listOf(
+                "明天上海是小雨喔，",
+                "明天上海是小雨喔，白天都湿湿的，",
+                "明天上海是小雨喔，白天都湿湿的，晚上才转阴。",
+            ),
+            r.bodies(),
+        )
+        assertEquals("补正(第2句)", r.settles[r.settles.indexOfLast { it.changed } - 1].triggerLabel)
+        assertEquals("补正(第3句)", r.settles.last().triggerLabel)
+        assertEquals("补正是第 2、3 次交付", listOf(2, 3), r.settles.filter { it.changed }.drop(1).map { it.deliveryIndex })
+
+        // stop 是最终结算点:与最后一次相同 → 不再交付
+        val beforeStop = r.bodies().size
+        r.reply.onTtsState("stop", "")
+        assertEquals("stop 上与上次相同:不重复交付", beforeStop, r.bodies().size)
+        assertEquals("stop 最终结算", r.settles.last().triggerLabel)
+        assertFalse("stop 的诊断行不得声称产生了新正文", r.settles.last().changed)
+
+        // 每一次交付的正文都是清洗后非空可读、不含模板的
+        r.bodies().forEach { body ->
+            assertTrue("交付的正文必须有可读文字:«$body»", XiaozhiReplySanitizer.isDisplayable(body))
+            assertFalse("模板绝不能上屏:«$body»", body.contains("get_weather"))
+        }
+    }
+
+    /**
      * 验收点 A3:兜底正文**先**上屏(纯 llm 兜底窗口到点,当时还没有 tts 句级文本),
      * 随后 tts 句级文本到达 —— 必须把它**当作新正文再交一次**(调用方替换屏幕上那条),
      * 同一轮内不得出现「兜底先上屏、完整正文再也上不了」。
@@ -345,10 +459,15 @@ class XiaozhiReplyTextTest {
         r.reply.onTtsState("sentence_end", "真正的完整回答，包含更多细节。")
         r.reply.onTtsState("stop", "")
         assertEquals(
-            "tts 句级文本到达后必须**替换**已上屏的兜底正文(第二次交付)",
-            listOf("中间态的兜底正文。", "真正的完整回答，包含更多细节。"),
+            "tts 句级文本到达后必须**替换**已上屏的兜底正文(后续交付都是补正)",
+            listOf(
+                "中间态的兜底正文。",
+                "真正的完整回答，",
+                "真正的完整回答，包含更多细节。",
+            ),
             r.bodies(),
         )
+        assertTrue("首条之后都走补正通道", r.settles.filter { it.changed }.drop(1).all { it.triggerLabel.startsWith("补正") })
         assertEquals(XiaozhiReplyTrigger.STOP, r.lastTrigger())
     }
 
@@ -371,8 +490,11 @@ class XiaozhiReplyTextTest {
         r.reply.onTtsState("sentence_start", "第二句，")
         r.reply.onTtsState("sentence_end", "第三句。")
         r.reply.onTtsState("stop", "")
-        assertEquals(listOf("第一句，第二句，第三句。"), r.bodies())
-        assertTrue("只上屏一次(不是逐句碎气泡)", r.bodies().size == 1)
+        assertEquals("第一句，第二句，第三句。", r.lastBody())
+        assertTrue(
+            "stop 上没有新正文:最终交付次数 = 逐句交付次数(不是又交一次)",
+            r.settles.last().changed.not(),
+        )
     }
 
     /**

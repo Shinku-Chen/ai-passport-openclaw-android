@@ -116,15 +116,22 @@ class TtsFlowControlTest {
     // ---- 小智直通的推送节奏:开播预充 + 与领先量无关的帧间下限([pushWaitMs])----
 
     /**
-     * 参数取值本身要站得住:预充是「几帧量级」且不会顶到硬上限;帧间下限比实时(60ms)快,
+     * 参数取值本身要站得住:预充是「十几帧量级」且不会顶到硬上限;帧间下限比实时(60ms)快,
      * 又允许落后于实测吞吐(≈54ms/帧)时它不成为新瓶颈。
      */
     @Test
     fun precharge_and_realtime_floor_parameters_stay_in_the_safe_range() {
-        // 预充几帧、且远不到目标领先量 / 硬上限
-        assertTrue(TtsFlowControl.PRECHARGE_FRAMES in 3..10)
+        // 预充加厚后的安全区间:12–16 帧(≈0.7–1.0s,作者给的区间)
+        assertTrue(
+            "预充应当已从 6 帧加厚到 12–16 帧,实际 ${TtsFlowControl.PRECHARGE_FRAMES}",
+            TtsFlowControl.PRECHARGE_FRAMES in 12..16,
+        )
+        // 下限:6 帧 ≈360ms 扣掉最坏在途(8 帧 = 480ms)后设备侧会见底 —— 真机 `欠载=23` 就是这么来的
+        assertTrue(TtsFlowControl.PRECHARGE_FRAMES * TtsFlowControl.FRAME_MS >= 600L)
+        // 上限:必须**严格小于**设备解码队列(24 包≈1.44s)的一半,给「设备起播 priming 期间仍在到达的帧」留位置
+        // (真机开局日志里出现过 `解码队列满,已丢最旧的包`,溢出丢的是用户**还没听到的**音频)
+        assertTrue(TtsFlowControl.PRECHARGE_FRAMES <= 24 / 2)
         assertTrue(TtsFlowControl.PRECHARGE_FRAMES * TtsFlowControl.FRAME_MS < TtsFlowControl.TARGET_LEAD_MS)
-        assertTrue(TtsFlowControl.PRECHARGE_FRAMES * TtsFlowControl.FRAME_MS < 24 * TtsFlowControl.FRAME_MS)
         // 帧间下限在用户给定的 50–55ms 区间内、且比实时(60ms)快
         assertTrue(TtsFlowControl.MIN_SEND_INTERVAL_MS in 50L..55L)
         assertTrue(TtsFlowControl.MIN_SEND_INTERVAL_MS < TtsFlowControl.FRAME_MS)
@@ -132,6 +139,24 @@ class TtsFlowControlTest {
         assertTrue(TtsFlowControl.MIN_SEND_INTERVAL_MS <= 54L)
         // 在途积压有界等待必须短于写回调超时(2s),否则超时先触发、上限没意义
         assertTrue(TtsFlowControl.MAX_INFLIGHT_WAIT_MS <= 2_000L)
+    }
+
+    /**
+     * 加厚预充**不能拖后首帧**:「首句上屏 → 立刻出声」要求第一帧零等待,预充只影响第 2 帧之后的
+     * 快速填充(它的等待只能来自领先量那一条,而开播瞬间领先量 ≈0)。
+     */
+    @Test
+    fun thicker_precharge_does_not_delay_the_first_frame() {
+        assertEquals("首帧必须零等待", 0L, TtsFlowControl.pushWaitMs(0, 0L))
+        assertEquals("第 2 帧也不应被帧间下限拖后", 0L, TtsFlowControl.pushWaitMs(1, TtsFlowControl.FRAME_MS.toLong()))
+        // 预充整整 12–16 帧都在「一口气推」的范围内(每一帧都不因下限而等)
+        for (sent in 0 until TtsFlowControl.PRECHARGE_FRAMES) {
+            assertEquals(
+                "预充第 $sent 帧不应因帧间下限等待",
+                0L,
+                TtsFlowControl.pushWaitMs(sent, sent * 5L),
+            )
+        }
     }
 
     /** 预充:前 [PRECHARGE_FRAMES] 帧不受帧间下限约束(开播瞬时一口气推给设备垫底)。 */

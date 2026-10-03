@@ -24,7 +24,16 @@ package com.shinku.aipassport.openclaw.stt
  * 清洗只针对这些模板/占位与多余空白,不碰正文标点。**清洗后为空串**时按「本轮没有可上屏正文」
  * 交出空串(与「只有 emoji」同一条可读原因路径,不产生空气泡)。
  *
- * ## 结算时机(2026-10-06 真机定案:唯一权威结算点是 `tts.state=stop`)
+ * ## 结算时机(2026-10-06 定案「唯一权威结算点是 `tts.state=stop`」;2026-10 起增补「首句即渐进交付」)
+ *
+ * **渐进交付(作者决定:第一句就好)**:`tts` 句级文本是**逐句**生成的(真机上从第一句到 `stop`
+ * 要 ~16s,长回答更久),等 `stop` 才上屏会让「音频响应」显得很慢。现在每收到一句就把**当前累积的
+ * 拼接**清洗后交付一次([progressLocked]):只要清洗后**有可读文字**且与上一次交付的正文**不同**,
+ * 就立刻交出去(沿用 [XiaozhiReplyOutcome.changed])—— 直通侧据此在**首句**上屏时即可开播,
+ * 屏幕文字随后由补正补齐(先短后长)。**硬约束**:中途交付只认 **tts 句级文本**、且必须清洗后
+ * **非空可读** —— 只拿到模板/emoji/空文本时**一个字节都不提前交付**,更**绝不**在这里回退
+ * `llm.text`(那正是「中间态文本抢在真答案前面上屏」的成因)。`stop` 仍是**最终结算点**:
+ * 它做最后一次补正(与上次相同则不重复交付),并在 tts 清洗后不可上屏时挂起不结算(工具调用静默期)。
  *
  * 真机现象「从小智获取的文本不是完整的」(上屏内容比小智实际说的短/漏句)的直接成因有两条,都改掉:
  *  1. **抢跑结算**:旧实现「最后一句之后 2s 无新增即结算」会在服务端还在**逐句推**或**等待工具调用
@@ -87,6 +96,9 @@ class XiaozhiReplyText(
     /** 已上屏的正文(清洗后,非空);null = 本轮还没交过非空正文。 */
     private var emittedBody: String? = null
 
+    /** 本轮**真正交付**正文的次数(渐进交付与最终结算各算一次;「未变化」的诊断不算)。 */
+    private var deliveries = 0
+
     /** 是否已经交过「本轮没有可上屏正文」的空结果(同轮最多一次,后续只记日志)。 */
     private var emittedEmpty = false
 
@@ -103,6 +115,7 @@ class XiaozhiReplyText(
             ttsReportsSeen = false
             emittedBody = null
             emittedEmpty = false
+            deliveries = 0
         }
     }
 
@@ -119,9 +132,11 @@ class XiaozhiReplyText(
     /**
      * 收一条 `tts` 状态报文(`state` 与 `text` 原样来自报文)。
      *
-     * `stop` 是**唯一权威结算点**,其余状态里的非空文本进拼接(不带文本的状态不影响候选)。
+     * `stop` 是**最终结算点**(最后一次补正;tts 清洗后不可上屏时挂起不结算),其余状态里的非空文本
+     * 先进拼接、再尝试一次**渐进交付**([progressLocked]:清洗后可读且与上次不同就立刻交给调用方,
+     * 直通侧据此在首句上屏时开播)。
      * 结算后到达的文本**照样收下**:同一轮多段 `tts[start…stop]` 的第二段、以及迟到的句级文本都靠它
-     * 参与下一次结算(见类注释第 2 条)。
+     * 参与下一次交付(见类注释第 2 条)。
      */
     fun onTtsState(state: String, text: String) {
         synchronized(lock) {
@@ -130,6 +145,7 @@ class XiaozhiReplyText(
                 settleLocked(trigger = XiaozhiReplyTrigger.STOP)
             } else {
                 addSentenceLocked(text)
+                progressLocked()
             }
         }
     }
@@ -205,6 +221,54 @@ class XiaozhiReplyText(
     }
 
     /**
+     * **渐进交付**(作者决定「第一句就好」):从**首句**起,只要累积的 tts 拼接清洗后**有可读文字**
+     * 且与上一次交付的正文**不同**,就立刻交出去一次 —— 直通侧据此在首句上屏时开播(不必等 `stop`),
+     * 屏幕文字随后由补正补齐(先短后长)。
+     *
+     * **硬约束**(上一轮「正文不完整」的根因就在这里,不许破坏):
+     *  - 只认 [ttsCandidateLocked](**tts 句级文本**),**不**回退 `llm.text` —— 工具调用轮次的
+     *    `llm.text` 常常只是中间态那一句,提前交付它正是「真答案被挡在门外」的成因;
+     *  - 清洗后**非空且可读**([XiaozhiReplySanitizer.isDisplayable])才交付:只有模板/emoji/空文本时
+     *    什么都不交(不产生 changed),继续等下一句;
+     *  - 与上次交付相同则什么都不做(幂等,不重复上屏)。
+     * 与 [settleLocked] 的分工:[settleLocked] 是**最终结算**(可以用 `llm.text` 兜底、可以交空串
+     * 走可读原因路径),这里只是**中途交付**。
+     */
+    private fun progressLocked() {
+        val candidate = ttsCandidateLocked() ?: return
+        if (!XiaozhiReplySanitizer.isDisplayable(candidate.body)) return
+        if (candidate.body == emittedBody) return
+        deliverLocked(
+            candidate,
+            trigger = if (deliveries == 0) {
+                XiaozhiReplyTrigger.PROGRESS_FIRST
+            } else {
+                XiaozhiReplyTrigger.PROGRESS_CORRECTION
+            },
+        )
+    }
+
+    /**
+     * 交付一次正文([changed] = true 的唯一产生点):记账(已上屏正文 + 交付次数)并交出口。
+     *
+     * @param candidate 已选定的正文候选(已清洗、已确认可上屏)
+     * @param trigger 本次交付的触发者([XiaozhiReplyTrigger];日志用)
+     */
+    private fun deliverLocked(candidate: Candidate, trigger: XiaozhiReplyTrigger) {
+        emittedBody = candidate.body
+        deliveries++
+        emit(
+            XiaozhiReplyOutcome(
+                body = candidate.body,
+                detail = candidate.detail,
+                trigger = trigger,
+                changed = true,
+                deliveryIndex = deliveries,
+            ),
+        )
+    }
+
+    /**
      * 按下 [XiaozhiReplyTrigger] 结算一次:选最优候选,与已上屏的正文比对,只在**变了**的时候才真正
      * 交出(changed = true),否则只交一条「未变化」的诊断给调用方记日志。
      *
@@ -258,15 +322,7 @@ class XiaozhiReplyText(
             )
             return
         }
-        emittedBody = preferred.body
-        emit(
-            XiaozhiReplyOutcome(
-                body = preferred.body,
-                detail = preferred.detail,
-                trigger = trigger,
-                changed = true,
-            ),
-        )
+        deliverLocked(preferred, trigger)
     }
 
     /**
@@ -383,8 +439,17 @@ class XiaozhiReplyText(
  * @property logName 日志里的中文说明。
  */
 enum class XiaozhiReplyTrigger(val logName: String) {
-    /** `tts.state=stop`:**唯一权威**的结算点(正常轮次都走它)。 */
-    STOP("tts.stop(权威结算点)"),
+    /** `tts.state=stop`:**最终结算点**(正常轮次都走它;与上次相同则不重复交付)。 */
+    STOP("stop 最终结算"),
+
+    /**
+     * **渐进交付的第一条**(作者决定「第一句就好」):首句 tts 文本一清洗出来就交付 ——
+     * 直通侧据此在首句上屏时即可开播(不再等 ~16s 的 `stop`)。
+     */
+    PROGRESS_FIRST("首句"),
+
+    /** 渐进交付的后续每一条:正文因新句到达而变完整,当作**补正**交给调用方替换屏幕上那条。 */
+    PROGRESS_CORRECTION("补正"),
 
     /** 整轮没有任何 tts 报文,`llm.text` 兜底的空闲窗口到点。 */
     IDLE_LLM_FALLBACK("空闲窗口(llm 兜底)"),
@@ -411,4 +476,18 @@ data class XiaozhiReplyOutcome(
     val detail: String,
     val trigger: XiaozhiReplyTrigger = XiaozhiReplyTrigger.UNKNOWN,
     val changed: Boolean = true,
-)
+    /** 本轮**第几次真正交付正文**(1 起;0 = 这次没有交付新正文)。真机日志用它看出交付了几次。 */
+    val deliveryIndex: Int = 0,
+) {
+    /**
+     * 交付日志里的**触发者描述**:`首句` / `补正(第N句)` / `stop 最终结算` / …(见 [XiaozhiReplyTrigger])。
+     *
+     * 「第 N 句」= 本轮**第几次交付**(渐进交付下就是第 N 句可上屏的真文本):只拿到模板/emoji 的
+     * 噪声句**不计数**,这样日志里的句号与用户实际听到的第几句对得上。
+     */
+    val triggerLabel: String
+        get() = when (trigger) {
+            XiaozhiReplyTrigger.PROGRESS_CORRECTION -> "补正(第${deliveryIndex}句)"
+            else -> trigger.logName
+        }
+}

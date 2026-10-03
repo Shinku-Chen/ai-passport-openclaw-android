@@ -175,30 +175,34 @@ data class XiaozhiTtsGate(
 /**
  * 小智 `tts` 状态机 → 设备下行 TTS 生命周期的**纯逻辑映射**(可 JVM 单测,不依赖 Android/coroutines)。
  *
- * **触发点 = `stop`(整段正文齐)**:正文先上屏,**紧接着**开始播 TTS —— 已缓冲的帧按到达顺序
- * 下发,`tts_start` 必在首帧前。**播放窗口在 `stop` 之后保持打开**:`stop` 之后继续到达的帧照常
- * 下发(一边播放一边缓冲),直到本轮被收尾才 `tts_stop`(见下)。时序:
+ * **触发点 = 「本轮正文已上屏」信号**(渐进交付下 = **首句**上屏那一刻;见
+ * `com.shinku.aipassport.openclaw.stt.XiaozhiReplyText` 与 `docs/design/xiaozhi-ai-gateway.md` §6.0):
+ * 正文先上屏,**紧接着**开始播 TTS —— 已缓冲的帧按到达顺序下发,`tts_start` 必在首帧前。
+ * **播放窗口在 `stop` 之后保持打开**:`stop` 之后继续到达的帧照常下发(一边播放一边缓冲),
+ * 直到本轮被收尾才 `tts_stop`(见下)。时序:
  * ```
  * 设备 turn_start ─(流水线)─> {"ev":"tts_abort"} + relay.onTurnStart()   // 上一轮作废 + 关窗口 + 清空缓冲
  * 小智 tts.state=start / sentence_start / sentence_end ─> relay           // 只记账,一个字节都不下发
  * 小智 二进制 opus 帧 ─> relay 组 [SEQ][rate_khz][frame_ms]+opus ─> **先缓冲**
- * 小智 tts.state=stop(整段正文齐了)─> relay                              // 只「武装」:仍不下发
- * 流水线把整段正文写成 TEXT('A', 正文)(上屏后) ─> relay.onReplyTextDisplayed('A', 正文)
+ * 会话层首句正文交付 ─> relay.onReplyBody(首句正文)
+ * 流水线把首句正文写成 TEXT('A', 首句正文)(上屏后) ─> relay.onReplyTextDisplayed
  *      ─> {"ev":"tts_start"} → 按既有流控把已缓冲的帧**连续**推给设备
  *      → 之后到达的帧**即时下发**(窗口保持打开)
+ * 小智 tts.state=stop(整段正文齐) ─> 只「确认窗口仍开」;文本侧做最后一次补正(与首句不同则再上屏一次)
  * 窗口关闭:新一轮 turn_start / barge / 设备 turn_cancel / 设备回报本段播放结束
  *      ─> 丢弃剩余缓冲 + {"ev":"tts_stop"}(已开段时)
  * ```
  *
- * 为什么不再「首句即开段、边收边播」(真机听感**一句一顿**):小智按句推音频,句与句之间的生成
- * 间隔不定,而设备按 60ms/帧实时播 —— 句间一旦断供只能补静音。正文整段齐(`stop`)之前一个
- * 音频字节都不下发,所以 `stop` 一开播就有成段的音频垫底,句间空档被缓冲吸收。
+ * **已知取舍(作者 2026-10 决定:「第一句就好」)**:提前到**首句**开播把「听到声音」的延迟从整段
+ * 生成时间(~16s,长回答更久)压到首句到达(~3s);代价是早期「首句即开段」那个已知听感风险
+ * (句与句之间的 TTS 生成间隔可能造成设备侧短暂欠载)会再出现一截 —— 本次按作者要求以**延迟优先**,
+ * 句间供不上时仍是早期那套办法(缓冲垫底 + 既有流控),后续如需再调另开一轮。
  * 但**不等整段音频齐**:服务端在 `stop` 之后仍会继续推本段的音频帧(实测存在),这些**迟到帧照常
  * 下发**,不是丢弃 —— 反过来「等整段音频齐」或「`stop` 后丢迟到帧」都是错的(前者把音频永远
  * 挡在门外,后者切掉尾音)。
  *
- * **顺序保证(正文必须先于首帧到设备)**:本类不自己在 `stop` 时开播,而是等一个**明确的
- * 「正文已上屏」信号**([onReplyTextDisplayed],由服务侧在 `TEXT('A')` 已写进 BLE 串行写队列
+ * **顺序保证(正文必须先于首帧到设备)**:本类不自己开播,而是等一个**明确的**
+ * 「正文已上屏」信号([onReplyTextDisplayed],由服务侧在 `TEXT('A')` 已写进 BLE 串行写队列
  * 之后调用)。于是「正文帧已入 BLE 写队列」在「首帧入队」之前**由构造保证** —— 而不是靠时序碰运气。
  * 这是**唯一**的下发闸门:正常路径、`stop` 路径、缓冲超限、无状态报文兜底四条路径都不许越过它
  * (作者要求:文字先于声音,**降级时宁可稍晚也别抢跑**)。代价:信号之前到达的帧继续留在缓冲里。
@@ -300,13 +304,23 @@ class XiaozhiTtsRelay(
     private var textScreenPassed = false
 
     /**
-     * **本轮正文**(会话层装配好、清洗后的整段;空串 = 本轮确实没有可上屏正文);null = 还没装配好。
+     * **本轮交付过的所有正文**(会话层渐进交付:首句一条、之后每次补正各一条;见
+     * `com.shinku.aipassport.openclaw.stt.XiaozhiReplyText`);空 = 本轮还没交付过可上屏正文。
+     *
+     * 为什么是**列表**而不是「最后一条」:渐进交付下,首句的 `TEXT('A')` 可能仍在流水线/写队列里
+     * 排队时,下一次补正的正文就已经通过 [onReplyBody] 到来了(会话层与流水线是两个线程)。
+     * 只认「最后一条」会把先发出的首句上屏信号误判成「不是本轮正文」而**拒绝开播** ——
+     * 正好破坏「首句即开播」。列表里的每一条都是**本轮**的正文(逐字由会话层装配),
+     * 因此仍然满足「只有本轮正文才算信号」这条不变量。
      *
      * 为什么单独记:[onReplyTextDisplayed] 必须能分辨「上屏的是本轮正文」还是「同为 `'A'` 的其它文本」
      * (版本提示/「无语音」/超时与失败原因/空回复兜底),否则那些文本一上屏就会把本轮的音频放出来
      * (声音跑到文字前面)。见 [XiaozhiScreenSignal]。
      */
-    private var expectedReplyBody: String? = null
+    private val expectedReplyBodies = ArrayList<String>()
+
+    /** 本轮已接受的「正文上屏」信号次数(1 = 首次;≥2 = 补正)。[onTurnStart] 归零。 */
+    private var screenSignals = 0
 
     /**
      * **本会话是否见过任何 `tts` 状态报文**(start/sentence_start/sentence_end/stop 之一)。
@@ -357,7 +371,8 @@ class XiaozhiTtsRelay(
         awaitingTextScreen = false
         textScreenPassed = false
         // 上一轮的正文记录一并作废:旧轮的迟到「上屏信号」绝不能再把新一轮的闸门打开。
-        expectedReplyBody = null
+        expectedReplyBodies.clear()
+        screenSignals = 0
         buffered.clear()
         pushedFrames = 0
         droppedFrames = 0
@@ -371,7 +386,7 @@ class XiaozhiTtsRelay(
      * 调用时机保证早于那一条 `TEXT('A')` 入队:会话层在把正文交给网关/流水线**之前**就调了它。
      */
     override fun onReplyBody(body: String) {
-        expectedReplyBody = body
+        if (body.isNotBlank() && !expectedReplyBodies.contains(body)) expectedReplyBodies.add(body)
         Log.i(
             tag,
             if (body.isBlank()) {
@@ -392,16 +407,34 @@ class XiaozhiTtsRelay(
      * @param logRefusal 拒绝时是否记一行警告(true = 默认,真机排查靠它看“为什么没开播”)
      */
     fun acceptsScreenSignal(role: Char, text: String, logRefusal: Boolean = true): Boolean {
-        val ok = XiaozhiScreenSignal.accepts(role, text, expectedReplyBody)
+        val ok = acceptsLocked(role, text)
         if (!ok && logRefusal) {
             Log.w(
                 tag,
-                "忽略「正文上屏」信号(${XiaozhiScreenSignal.refuseReason(role, text, expectedReplyBody)}):" +
+                "忽略「正文上屏」信号(${XiaozhiScreenSignal.refuseReason(role, text, expectedReplyBodies.lastOrNull())}):" +
                     "不抢跑(role=$role 文本前 20 字=${text.take(20)})",
             )
         }
         return ok
     }
+
+    /**
+     * 这条 `TEXT` 若被接受,将是**本轮第几次**「正文上屏」(1 = 首次,≥2 = 补正)。
+     *
+     * null = 本通道/本轮不适用(还没交付过任何本轮正文 —— 例如非小智网关,或本轮正文还没到);
+     * 0 = 本轮已有正文,但这条不是本轮正文(不该开播)。
+     *
+     * 只读、**不打日志**([acceptsScreenSignal] 才负责拒绝时的警告):服务侧在写 `TEXT`
+     * 之前用它标出「首次上屏 / 补正上屏」。
+     */
+    fun replyScreenOrdinal(role: Char, text: String): Int? {
+        if (expectedReplyBodies.isEmpty()) return null
+        return if (acceptsLocked(role, text)) screenSignals + 1 else 0
+    }
+
+    /** 本条 `TEXT` 是不是**本轮任何一条**已交付的正文(判定仍用同一套纯函数,不会分叉)。 */
+    private fun acceptsLocked(role: Char, text: String): Boolean =
+        expectedReplyBodies.any { XiaozhiScreenSignal.accepts(role, text, it) }
 
     /**
      * **「本轮正文已上屏」信号**(服务侧在整段正文 `TEXT('A')` 已写进 BLE 串行写队列之后调用)。
@@ -423,6 +456,7 @@ class XiaozhiTtsRelay(
      */
     fun onReplyTextDisplayed(role: Char, text: String): Boolean {
         if (!acceptsScreenSignal(role, text)) return false
+        screenSignals++
         // 先记「本轮正文已上屏」:正文可能比 `stop` 早结算(空闲兜底 / 纯 llm 兜底),那时这个信号
         // 先到、`stop` 后到 —— `stop` 一到就该开播,不必再等一个不会来的信号。
         textScreenPassed = true
