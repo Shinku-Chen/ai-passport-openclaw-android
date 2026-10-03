@@ -106,10 +106,10 @@ interface XiaozhiTtsObserver {
     /**
      * 会话层已装配好**这一段**的正文(清洗后的这一段自己的文本;空串 = 本轮确实没有可上屏正文)。
      *
-     * 为什么需要它:直通侧的音频下发闸门是「正文已上屏」信号,而**不是**任何一个 `TEXT('A')` ——
+     * 为什么需要它:直通侧的音频下发闸门是「本段正文已写进 BLE 队列」,而**不是**任何一个 `TEXT('A')` ——
      * 服务侧还有版本提示、「无语音」、超时与失败原因等同样以 `'A'` 上屏的文本。直通侧用这里给出的
-     * 正文做**唯一**依据:只有随后上屏的那条 `'A'` 与本段正文一致,才允许开播(见
-     * [com.shinku.aipassport.openclaw.tts.XiaozhiTtsRelay.onReplyTextDisplayed])。
+     * 正文做**唯一**依据:只有随后请求上屏的那条 `'A'` 与本段正文一致,才允许写它、开它的段(见
+     * [com.shinku.aipassport.openclaw.tts.XiaozhiTtsRelay.onReplySubtitleReady])。
      *
      * 调用时机:在本段正文交出**之前**(`llm` 观察者之前),保证信号到时正文已经对得上号。
      * **同一轮会调多次**(**按段交付**:第 1 段一条、之后每一句各一条;同一句变完整时再一条),直通侧
@@ -1426,9 +1426,9 @@ class XiaozhiSession(
                     onTtsState?.invoke(state, sentence)
                     // 正文装配优先喂:`tts.state=stop` 是文本侧的**最终结算点**(只补还没上屏的那一段;
                     // 各段都已上屏则不重复交付);直通侧的段机也在这里推进。
-                    // 两阶段的**顺序保证**不靠这里的先后:直通侧要等一个明确的「正文已上屏」信号
-                    // (`XiaozhiTtsRelay.onReplyTextDisplayed`,由服务侧在 `TEXT('A')` 已写进 BLE
-                    // 串行写队列之后发出),所以首帧一定晚于正文帧(见 `docs/design/xiaozhi-ai-gateway.md` §4.4)。
+                    // 两阶段的**顺序保证**不靠这里的先后:直通侧要等服务侧交来本段字幕
+                    // (`XiaozhiTtsRelay.onReplySubtitleReady`),由它在本段轮到的那一刻回写 BLE
+                    // 串行写队列(首段立即),所以首帧一定晚于字幕帧(见 `docs/design/xiaozhi-ai-gateway.md` §4.8)。
                     feedReply { replyText.onTtsState(state, sentence) }
                     ttsObserver?.onTtsState(state, sentence)
                 }

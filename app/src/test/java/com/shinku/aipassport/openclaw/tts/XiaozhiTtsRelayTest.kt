@@ -22,6 +22,8 @@ import org.junit.Test
  *     「下一句文本到达」(或段尾静默兜底)决定,`tts.state=stop` **不**收段(尾帧还要收);
  *  2. **段间等设备回报**:回报到达 / 兜底超时两条路都能进下一段,且不在设备还在播上一段时抢跑;
  *  3. **字幕与同段音频的先后**:第 N 段的 `tts_start` 只在它的字幕已写进 BLE 串行写队列之后;
+ *     **字幕随段推进**（2026-10 真机修正):第 N 段的字幕只在**第 N 段真正开始**的那一刻才写
+ *     —— 文本可以早到,但**只缓存**（首段仍立即上屏）。
  *  4. **不丢音频、不串段**:段内迟到的帧照收(一段 `tts_stop` 之后绝不再有帧插进那一段);
  *     缺帧的段跳过;换轮/打断清全部段,上一轮在途的残帧丢弃;
  *  5. **既有不变量**:首段(首句)文本+音频齐了就**立即**开播;直通门(网关类型/开关/设备能力)
@@ -37,6 +39,9 @@ class XiaozhiTtsRelayTest {
         val frames = ArrayList<ByteArray>()
         val frameMeta = ArrayList<Pair<Int, Int>>()
 
+        /** relay 在段界回调「把本段字幕写进 BLE 队列」写下的那些字幕(顺序与 [events] 里的 `screen` 同源)。 */
+        val subtitles = ArrayList<String>()
+
         override fun start() {
             events.add("start")
         }
@@ -49,6 +54,16 @@ class XiaozhiTtsRelayTest {
 
         override fun stop() {
             events.add("stop")
+        }
+
+        /**
+         * 服务侧的**段界上屏**出口([com.shinku.aipassport.openclaw.tts.XiaozhiTtsRelay] 的
+         * `writeSubtitle` 回调):真实链路里它由 `VoiceBridgeService.writeSegmentSubtitle` 写帧,
+         * 与音频帧**同一条 BLE 串行写队列** —— 所以这里只记一条 `screen`。
+         */
+        fun writeSubtitle(body: String) {
+            events.add("screen")
+            subtitles.add(body)
         }
 
         /** 假通路上已下发的 SEQ 序列(校验「按序、不丢、不重」)。 */
@@ -85,7 +100,16 @@ class XiaozhiTtsRelayTest {
         maxBufferFrames: Int = XiaozhiTtsRelay.MAX_BUFFER_FRAMES,
         clock: FakeClock = FakeClock(),
         gate: () -> XiaozhiTtsGate = { openGate() },
-    ) = XiaozhiTtsRelay(gate = gate, downlink = downlink, maxBufferFrames = maxBufferFrames, nowMs = { clock.now })
+    ) = XiaozhiTtsRelay(
+        gate = gate,
+        downlink = downlink,
+        // 段界上屏:relay 在推进到本段时回调它写帧(真实链路 = VoiceBridgeService.writeSegmentSubtitle)。
+        writeSubtitle = { body -> downlink.writeSubtitle(body) },
+        // 段内更新:真实链路 = VoiceBridgeService.rewriteDisplayedSubtitle(带让路),单测里同样记一条 `screen`。
+        rewriteSubtitle = { body -> downlink.writeSubtitle(body) },
+        maxBufferFrames = maxBufferFrames,
+        nowMs = { clock.now },
+    )
 
     /**
      * 会话层交付本轮正文([XiaozhiTtsRelay.onReplyBody])。
@@ -100,13 +124,33 @@ class XiaozhiTtsRelayTest {
     private fun XiaozhiTtsRelay.state(state: String, text: String = "") = onTtsState(state, text)
 
     /**
-     * 服务侧把这条正文写成 `TEXT('A')`、**已进 BLE 串行写队列之后**发上屏信号
-     * ([VoiceBridgeService.notifyXiaozhiReplyOnScreen] → [XiaozhiTtsRelay.onReplyTextDisplayed])。
-     * 顺序断言靠它往下发通路的 events 里插一条 `screen` 标记(真实链路里正文帧与音频帧同一条队列)。
+     * 服务侧要把这条本段字幕写给设备([VoiceBridgeService.sendTextFrame] →
+     * [XiaozhiTtsRelay.onReplySubtitleReady]):**写帧时刻由 relay 按段界决定** —— 首段立即,
+     * 后续段要等上一段播完/兜底超时推进。真正写下的那一下由假通路的 `writeSubtitle` 记一条 `screen`。
      */
-    private fun screen(link: FakeDownlink, r: XiaozhiTtsRelay, body: String) {
+    private fun subtitle(r: XiaozhiTtsRelay, body: String): Boolean =
+        r.onReplySubtitleReady(XiaozhiScreenSignal.REPLY_ROLE, body)
+
+    /**
+     * 服务侧**自己**写完一条本段字幕(段内更新 / 让路补上)之后的对账回调
+     * ([VoiceBridgeService.notifyXiaozhiReplyOnScreen] → [XiaozhiTtsRelay.onReplyTextDisplayed]);
+     * `screen` 事件由本方法模拟写入。
+     */
+    private fun screenWritten(link: FakeDownlink, r: XiaozhiTtsRelay, body: String) {
         link.events.add("screen")
         r.onReplyTextDisplayed(XiaozhiScreenSignal.REPLY_ROLE, body)
+    }
+
+    /**
+     * 服务侧交来一条本段字幕的**完整行为**(= 真实 `VoiceBridgeService.sendTextFrame`):
+     * relay 接管(首段/下一段)→ 由它在段界写(假 `writeSubtitle` 会记一条 `screen`);
+     * relay 不接管(非本段正文 / 本段已在屏上的段内更新)→ 服务侧自己写 + [screenWritten] 对账。
+     *
+     * 顺序断言靠它往下发通路的 events 里插 `screen` 标记(真实链路里正文帧与音频帧同一条队列)。
+     */
+    private fun screen(link: FakeDownlink, r: XiaozhiTtsRelay, body: String) {
+        if (subtitle(r, body)) return
+        screenWritten(link, r, body)
     }
 
     /**
@@ -155,12 +199,12 @@ class XiaozhiTtsRelayTest {
             link.events,
         )
 
-        // ---- 第 2 段:字幕先落位,但要等设备回报第 1 段播完才 tts_start ----
+        // ---- 第 2 段:字幕**只缓存**(文本早到也不提前上屏),要等设备回报第 1 段播完才写 + tts_start ----
         screen(link, r, "第一句。第二句。")
         r.onTtsAudio(opus(4), 24, 60)
         assertEquals(
-            "第 1 段还没播完:第 2 段一个字节都不发",
-            listOf("screen", "start", "frame", "frame", "frame", "stop", "screen"),
+            "第 1 段还没播完:第 2 段一个字节都不发(文本也不许提前上屏)",
+            listOf("screen", "start", "frame", "frame", "frame", "stop"),
             link.events,
         )
 
@@ -210,8 +254,8 @@ class XiaozhiTtsRelayTest {
         screen(link, r, "第一句。第二句。")
         r.onTtsAudio(opus(6), 24, 60)
         assertEquals(
-            "第 1 段收口后:第 2 段等设备回报",
-            listOf("screen", "start", "frame", "frame", "frame", "frame", "frame", "stop", "screen"),
+            "第 1 段收口后:第 2 段只缓存字幕+帧,等设备回报",
+            listOf("screen", "start", "frame", "frame", "frame", "frame", "frame", "stop"),
             link.events,
         )
 
@@ -383,8 +427,8 @@ class XiaozhiTtsRelayTest {
         screen(link, r, "旧轮第一句。旧轮第二句。")
         r.onTtsAudio(opus(0x12), 24, 60)
         assertEquals(
-            "第 2 段已声明、字幕已上屏,但它的音频要等设备回报第 1 段播完",
-            listOf("screen", "start", "frame", "stop", "screen"),
+            "第 2 段已声明,但字幕只缓存、音频要等设备回报第 1 段播完(一个字节都不发)",
+            listOf("screen", "start", "frame", "stop"),
             link.events,
         )
 
@@ -393,20 +437,20 @@ class XiaozhiTtsRelayTest {
         r.onTurnStart()
         assertEquals(
             "换轮:第 2 段从未开段(没有 bracket),所以只有已开的那一段要 tts_stop",
-            listOf("screen", "start", "frame", "stop", "screen"),
+            listOf("screen", "start", "frame", "stop"),
             link.events,
         )
 
         // 换轮前在途的残帧:本轮还什么都没声明 → 丢弃(绝不进下一轮)
         r.onTtsAudio(opus(0x13), 24, 60)
-        assertEquals("残帧丢弃,不产生任何下发", 5, link.events.size)
+        assertEquals("残帧丢弃,不产生任何下发", 4, link.events.size)
 
         // 下一轮:只推这一轮的帧
         sentence(r, "新轮第一句。")
         screen(link, r, "新轮第一句。")
         r.onTtsAudio(opus(0x21), 24, 60)
         assertEquals(
-            listOf("screen", "start", "frame", "stop", "screen", "screen", "start", "frame"),
+            listOf("screen", "start", "frame", "stop", "screen", "start", "frame"),
             link.events,
         )
         assertEquals(
@@ -870,5 +914,242 @@ class XiaozhiTtsRelayTest {
             "帧数很少也要等最短时间",
             XiaozhiSegmentWait.reportWaitExpired(XiaozhiSegmentWait.MIN_WAIT_MS - 1, 1),
         )
+    }
+
+    // ---- ⑩ 字幕随段推进(2026-10 真机修正:上一段的声音还没播完,下一段的文字不许先上屏) ----
+
+    /**
+     * 验收点 ①(本轮真机目标):**三段流** —— B 的文本早到也不得提前上屏;A 推进的那一刻
+     * 才**先写 B 字幕、再 `tts_start` B**;C 同理。
+     *
+     * 真机反例就是本测试要封死的那个:第 2 段的 `TEXT('A')` 落在第 1 段的音频中间
+     * (① 字幕比声音早 ② 文字帧插队打断音频)。
+     */
+    @Test
+    fun three_segment_stream_writes_each_subtitle_only_at_its_own_segment_boundary() {
+        val clock = FakeClock()
+        val link = FakeDownlink()
+        val r = relay(link, clock = clock)
+
+        // ---- 第 1 段(A):字幕**立即**上屏 + 立即开播(延迟优先,不变) ----
+        sentence(r, "A。")
+        assertTrue("首段字幕由 relay 接管并立即上屏", subtitle(r, "A。"))
+        repeat(4) { r.onTtsAudio(opus(it + 1), 24, 60) }
+        assertEquals(listOf("screen", "start", "frame", "frame", "frame", "frame"), link.events)
+
+        // ---- B 的文本与帧都早到(第 1 段还在播) ----
+        sentence(r, "B。")
+        assertTrue("第 2 段字幕:只缓存", subtitle(r, "B。"))
+        r.onTtsAudio(opus(5), 24, 60)
+        assertEquals("B 的文本早到时**没有任何** TEXT('A')(A 还在播)", 1, link.events.count { it == "screen" })
+        assertEquals("B 的帧也在缓冲", 1, link.events.count { it == "start" })
+
+        // ---- A 播完回报 → 推进到 B:先写 B 字幕、再 tts_start B ----
+        r.onDevicePlaybackFinished()
+        assertEquals(
+            "A 推进(播完回报) → 先上屏 B 字幕 → B 的 tts_start → 推 B 的帧",
+            listOf(
+                "screen", "start", "frame", "frame", "frame", "frame", "stop",
+                "screen", "start", "frame",
+            ),
+            link.events,
+        )
+        assertTrue(
+            "字幕帧必须排在它自己那一段的 tts_start 之前",
+            link.events.lastIndexOf("screen") < link.events.lastIndexOf("start"),
+        )
+        assertEquals("写的是 B 自己的字幕", listOf("A。", "B。"), link.subtitles)
+
+        // ---- C 同理:文本+帧早到也只缓存,等 B 播完才轮到 ----
+        sentence(r, "C。")
+        subtitle(r, "C。")
+        r.onTtsAudio(opus(6), 24, 60)
+        assertEquals("C 的文本早到也不许提前上屏(B 还在播)", 2, link.events.count { it == "screen" })
+        r.onDevicePlaybackFinished()
+        assertEquals(
+            "B 推进 → 先上屏 C 字幕 → C 的 tts_start → 推 C 的帧",
+            listOf(
+                "screen", "start", "frame", "frame", "frame", "frame", "stop",
+                "screen", "start", "frame", "stop",
+                "screen", "start", "frame",
+            ),
+            link.events,
+        )
+        assertEquals("三段：三条字幕、各自一对括号", listOf("A。", "B。", "C。"), link.subtitles)
+        assertEquals(3, link.events.count { it == "screen" })
+        assertEquals(3, link.events.count { it == "start" })
+    }
+
+    /**
+     * 验收点 ②:**段内字幕更新不提前上屏** —— 第 2 段的正文被服务端分两次推(半句 → 整句),
+     * 两次都在它轮到之前到达:屏幕上一字不发,段界到了写的是**最新**那一版。
+     *
+     * 顺序按**真实链路**:`tts` 报文先让装配器交付正文(服务侧随即请求上屏),随后直通侧才收到
+     * 句界报文 —— 所以「这条是下一段的首条字幕还是已上屏那一段的更新」要到句界才能定下来。
+     */
+    @Test
+    fun a_held_segment_subtitle_is_updated_in_place_and_still_written_only_at_its_boundary() {
+        val link = FakeDownlink()
+        val r = relay(link)
+
+        // 第 1 段:A 已上屏并在播
+        sentence(r, "A。")
+        subtitle(r, "A。")
+        r.onTtsAudio(opus(1), 24, 60)
+        assertEquals(listOf("screen", "start", "frame"), link.events)
+
+        // 第 2 段:半句 → 整句,两次都早于它的段界(且都走在句界报文之前)
+        r.deliver("B 半句")
+        subtitle(r, "B 半句")
+        r.state("sentence_start", "B 半句")
+        assertEquals("第 2 段还没轮到:一个字都不许上屏", 1, link.events.count { it == "screen" })
+
+        r.deliver("B 整句。")
+        subtitle(r, "B 整句。")
+        r.state("sentence_end", "B 整句。")
+        assertEquals("同一句变完整也不提前上屏(仍只缓存)", 1, link.events.count { it == "screen" })
+
+        r.onTtsAudio(opus(2), 24, 60)
+        r.onDevicePlaybackFinished()
+        assertEquals("段界到了写的是**最新**那一版字幕", listOf("A。", "B 整句。"), link.subtitles)
+        assertEquals(
+            listOf("screen", "start", "frame", "stop", "screen", "start", "frame"),
+            link.events,
+        )
+    }
+
+    /**
+     * 验收点 ②(另一半):**已在屏上那一段**的同一句更新仍照旧立刻上屏(不切段、不重开)。
+     */
+    @Test
+    fun an_update_of_a_segment_already_on_screen_is_rewritten_without_splitting_the_segment() {
+        val link = FakeDownlink()
+        val r = relay(link)
+
+        sentence(r, "气温大概十")
+        subtitle(r, "气温大概十")
+        r.onTtsAudio(opus(1), 24, 60)
+        assertEquals(listOf("screen", "start", "frame"), link.events)
+
+        // 真实链路顺序:更完整的正文先到(服务侧请求上屏)→ `sentence_end` 把它归到**本段**
+        r.deliver("气温大概十八到二十三度。")
+        assertTrue("已上屏那一段的更新也由 relay 接管(等句界让它落位)", subtitle(r, "气温大概十八到二十三度。"))
+        assertEquals("句界还没到:不写", listOf("screen", "start", "frame"), link.events)
+        r.state("sentence_end", "气温大概十八到二十三度。")
+        assertEquals(
+            "段内更新:立刻重写本段字幕(不切段、不重开)",
+            listOf("screen", "start", "frame", "screen"),
+            link.events,
+        )
+        r.onTtsAudio(opus(2), 24, 60)
+        assertEquals("仍是同一段(只有一个 tts_start)", 1, link.events.count { it == "start" })
+        assertEquals(listOf("气温大概十", "气温大概十八到二十三度。"), link.subtitles)
+    }
+
+    /**
+     * 验收点 ⑤(首段时序的另一半):**首段的正文可能早于它的句界报文**到达(装配器交付 → 网关 →
+     * 流水线在另一条线程/协程上)。它同样要**立即上屏**——只是上屏发生在句界报文让它落位那一刻,
+     * 而不是拖到段尾。
+     */
+    @Test
+    fun the_first_segment_is_displayed_immediately_even_when_its_body_arrives_before_its_state_report() {
+        val link = FakeDownlink()
+        val r = relay(link)
+        // 让会话层处于「服务端会发状态报文」的常态(非空句界才声明段)
+        r.state("sentence_start", "")
+        val base = link.events.size
+
+        r.deliver("A。")
+        assertTrue("服务侧请求上屏(正文早于句界):relay 接管并缓存", subtitle(r, "A。"))
+        assertEquals("句界还没到:一个字都不发", base, link.events.size)
+
+        r.state("sentence_start", "A。")   // 句界到 → 声明第 1 段(字幕已就绪)
+        assertEquals(
+            "首段仍立即上屏(还没有帧,所以先不开播)",
+            listOf("screen"),
+            link.events.drop(base),
+        )
+        r.onTtsAudio(opus(1), 24, 60)
+        assertEquals(
+            "帧一到就立即开播(首帧排在字幕之后)",
+            listOf("screen", "start", "frame"),
+            link.events.drop(base),
+        )
+    }
+
+    /**
+     * 验收点 ③:**兜底超时**那条推进路径同样成立 —— 设备不回报时,字幕也是在
+     * 「等满本段该播完的时刻」才写,绝不提前。
+     */
+    @Test
+    fun the_timeout_path_also_writes_the_next_subtitle_only_after_the_wait_expires() {
+        val clock = FakeClock()
+        val link = FakeDownlink()
+        val r = relay(link, clock = clock)
+
+        sentence(r, "A。")
+        subtitle(r, "A。")
+        repeat(3) { r.onTtsAudio(opus(it + 1), 24, 60) }
+        sentence(r, "B。")
+        subtitle(r, "B。")
+        r.onTtsAudio(opus(4), 24, 60)
+        assertEquals(
+            "B 的文本早到:只缓存(A 还在播)",
+            listOf("screen", "start", "frame", "frame", "frame", "stop"),
+            link.events,
+        )
+
+        clock.advance(1_900)
+        r.pumpSegments()
+        assertEquals("还没到设备该播完的时刻:不写 B 字幕、不开 B", 1, link.events.count { it == "screen" })
+
+        clock.advance(200)
+        r.pumpSegments()
+        assertEquals(
+            "兜底超时推进 → 先上屏 B 字幕 → B 的 tts_start → 推 B 的帧",
+            listOf(
+                "screen", "start", "frame", "frame", "frame", "stop",
+                "screen", "start", "frame",
+            ),
+            link.events,
+        )
+        assertEquals("B 的字幕在超时推进那一刻才写", listOf("A。", "B。"), link.subtitles)
+    }
+
+    /**
+     * 验收点 ④:**某段缺失时只补该段** —— 收尾才到齐的那一段字幕,同样先上屏它、再开它;
+     * 已上屏的段（A）**不被重写**、不被重开。
+     */
+    @Test
+    fun a_late_supplement_is_written_before_its_own_tts_start_and_earlier_subtitles_are_not_rewritten() {
+        val clock = FakeClock()
+        val link = FakeDownlink()
+        val r = relay(link, clock = clock)
+
+        // A 上屏并在播;A 播完后第 2 段已声明(帧也早到),但它的字幕一直没到 → 不开播
+        sentence(r, "A。")
+        subtitle(r, "A。")
+        r.onTtsAudio(opus(1), 24, 60)
+        sentence(r, "B。")
+        r.onTtsAudio(opus(2), 24, 60)
+        r.onDevicePlaybackFinished()
+        assertEquals(
+            "第 2 段字幕还没到:即使轮到了也不开播",
+            listOf("screen", "start", "frame", "stop"),
+            link.events,
+        )
+
+        // 收尾结算时补上缺失的那一段(装配器的「只补该段」)
+        r.deliver("B。")
+        screen(link, r, "B。")
+        r.state("stop")
+        assertEquals(
+            "只补 B:先上屏 B 字幕 → B 的 tts_start → 推 B 的帧",
+            listOf("screen", "start", "frame", "stop", "screen", "start", "frame"),
+            link.events,
+        )
+        assertEquals(listOf("A。", "B。"), link.subtitles)
+        assertEquals("A 的字幕没有被重写", 1, link.subtitles.count { it == "A。" })
+        assertEquals("每段一对括号", 2, link.events.count { it == "start" })
     }
 }

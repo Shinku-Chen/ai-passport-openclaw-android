@@ -199,7 +199,7 @@ class XiaozhiTtsObserverDeliveryTest {
 
     /**
      * 回归测试:服务端只推二进制音频、一条 `tts` 状态报文都没有时,帧仍然要一路走到设备侧入口
-     * (观察者 = 真 `XiaozhiTtsRelay`,假的下发实现计帧)—— 但**必须等「正文已上屏」信号**
+     * (观察者 = 真 `XiaozhiTtsRelay`,假的下发实现计帧)—— 但**必须等「本段字幕已写进 BLE 写队列」**
      * (顺序优先:文字先于声音,降级也不抢跑)。
      */
     @Test
@@ -230,9 +230,10 @@ class XiaozhiTtsObserverDeliveryTest {
         assertTrue("会话层的 3 帧必须都交给 relay", relayed.await(5, TimeUnit.SECONDS))
         assertEquals("正文还没上屏:一个音频帧都不许下发", emptyList<String>(), downlink.events.toList())
 
-        // 服务侧在整段 TEXT('A') 已写进 BLE 串行写队列之后发这个信号(文本就是本轮正文)
+        // 服务侧要把本段字幕写出去(流水线交来的 TEXT('A') 就是本轮正文):
+        // 「字幕随段推进」里这个入口由 relay 接管 —— 首段**立即**写(段界还没轮到其它段)。
         relay.onReplyBody("测试正文")
-        assertTrue(relay.onReplyTextDisplayed(XiaozhiScreenSignal.REPLY_ROLE, "测试正文"))
+        assertTrue(relay.onReplySubtitleReady(XiaozhiScreenSignal.REPLY_ROLE, "测试正文"))
 
         assertTrue("上屏信号之后,音频帧必须下发到设备侧", frameLatch.await(5, TimeUnit.SECONDS))
         assertEquals(

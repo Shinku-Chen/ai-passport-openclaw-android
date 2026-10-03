@@ -556,12 +556,13 @@ class VoiceBridgeService : Service() {
         deviceTts = DeviceTtsSession(enabled = { this.settings.ttsEnabled }, downlink = deviceTtsPush)
         // 小智 TTS 直通(增量 3):只挂观察者,不建连接 —— 音频在小智会话里已经下来,
         // 直接按 [SEQ][rate_khz][frame_ms]+opus 组 TTS_OPUS 帧转发给设备(不本地合成/不重编码)。
-        // 时序(2026-10 作者定稿:**按段(句)播放**——小智能区分段落,按段落播放对应语音,
-        // 不是「整轮一串音频一直连续着」):一段 = 小智的一旬。段的字幕先写进 BLE 串行写队列,
-        // 紧接着该段 `tts_start` + 按到达顺序推这一段的帧,段尾 `tts_stop`;设备回报「这一段播完」
+        // 时序(2026-10 作者定稿:**按段(句)播放** —— 小智能区分段落,按段落播放对应语音,
+        // 不是「整轮一串音频一直连续着」):一段 = 小智的一旬。段的字幕**随段推进**才写进 BLE
+        // 串行写队列(首段立即;后续段等上一段播完回报/兜底超时推进的那一刻),紧接着该段 `tts_start`
+        // + 按到达顺序推这一段的帧,段尾 `tts_stop`;设备回报「这一段播完」
         // 之后才进下一段(段间是自然停顿;设备不回报时按本段时长兜底超时)。
-        // 「字幕先于同段音频」由构造保证:段的开播要等 [notifyXiaozhiReplyOnScreen] 这个信号
-        // (在 `TEXT('A')` 分片已写入 BLE 串行写队列之后发出)—— 详见 `XiaozhiTtsRelay`。
+        // 「字幕先于同段音频」由构造保证:relay 在推进到本段时回调 [writeSegmentSubtitle] 先写字幕帧
+        // (`TEXT('A')` 分片已入 BLE 串行写队列),紧接着才 `tts_start` —— 详见 `XiaozhiTtsRelay`。
         //
         // 直通门的三项逐项进日志(见 [XiaozhiTtsGate]):
         //  ① 当前网关类型是小智 AI —— 小智服务端并不知道 App 用哪个后端,任何类型下它都会推自己的
@@ -578,6 +579,11 @@ class VoiceBridgeService : Service() {
                 )
             },
             downlink = deviceTtsPush,
+            // 【字幕随段推进】段界上屏的出口:relay 在推进到本段时回调它,先写这一段字幕帧,
+            // 紧接着才发本段的 `tts_start`(见 [writeSegmentSubtitle])。
+            writeSubtitle = { text -> writeSegmentSubtitle(text) },
+            // 段内更新(本段已在屏上、同一句又变完整)仍走服务侧的让路 + 写帧 + 通知(旧行为不变)。
+            rewriteSubtitle = { text -> rewriteDisplayedSubtitle(text) },
         ).also {
             xiaozhiTtsRelay = it
             stt.session.setTtsObserver(it)
@@ -991,26 +997,82 @@ class VoiceBridgeService : Service() {
     // ---- 数据出口 ----
 
     private fun sendTextFrame(role: Char, text: String) {
-        // 【按段上屏的让路门】后续各段的字幕不要在音频正紧时插队(第 1 段/非本段正文一律不受影响)。
-        // 放在最前面是有意的:被暂缓的这一条不会写进 BLE 队列、也不会发「正文已上屏」信号。
+        // 【字幕随段推进】本段还没轮到上屏时只缓存:由 relay 在段界(上一段播完回报 / 兜底超时推进
+        // 的那一刻)回调 [writeSegmentSubtitle] 把字幕写进 BLE 串行写队列 —— 于是字幕与它那一段的声音
+        // 严格同段,且写帧一定排在它自己的 `tts_start` 之前(同一写队列,先写字幕后开段)。
+        // 首段仍**立即**上屏(延迟优先,不变);段内更新(本段已在屏上)不在这里拦。
+        if (role == XiaozhiScreenSignal.REPLY_ROLE) {
+            val relay = xiaozhiTtsRelay
+            if (relay != null && relay.onReplySubtitleReady(role, text)) return
+        }
+        // 【让路】本段已在屏上(段内字幕更新):仍不要在音频正紧时插队(见 [deferCorrectionWhileAudioIsTight])。
         if (deferCorrectionWhileAudioIsTight(role, text)) return
         writeTextFrame(role, text)
     }
 
     /**
-     * **按段播放**下「下一段的字幕」不要在音频正紧时插队([XiaozhiCorrectionPacer])。
+     * **段界上屏**:relay 在「本段轮到」的那一刻回调这里,把这一段字幕写进 BLE 串行写队列。
+     *
+     * 与 [sendTextFrame] 的分工(2026-10 真机修正「字幕随段推进」):
+     *  - 服务侧一到文本**不再直接写**:先问 relay 该不该现在写([XiaozhiTtsRelay.onReplySubtitleReady]);
+     *    它接管时就只缓存,等它推进到本段再到本函数来写;
+     *  - 本函数**不再回调 relay**:是它自己叫我们写的,它已经知道这条字幕上屏了 —— 避免在同一次
+     *    推进里重入段机(也保证「先写字幕帧 → `tts_start`」这条顺序里没有第二个写者)。
+     *
+     * 让路([XiaozhiCorrectionPacer])在这里**不参与**:段界的上一次音频已经播完、本段还没开播,
+     * 没有音频会被这次写帧打断 —— 这正是「字幕本来就落在段界、让路几乎不该被触发」的含义。
+     * 段内更新([rewriteDisplayedSubtitle])仍走让路。
+     */
+    private fun writeSegmentSubtitle(text: String) {
+        val relay = xiaozhiTtsRelay
+        val ordinal = relay?.replyScreenOrdinal(XiaozhiScreenSignal.REPLY_ROLE, text) ?: 0
+        // 第 1 段 = 本轮第一条正文:上一轮万一还攒着一条待补字幕,一并作废。
+        if (ordinal <= 1) correctionPacer.onTurnStart()
+        // 只在这条**真的**是本轮正文时记时刻:服务侧用它量化「上屏 → 首帧真的写出」到底多少毫秒。
+        // 必须写在真正入队之前(relay 会在本次回调返回后紧接着下发 `tts_start`)。
+        if (::deviceTtsPush.isInitialized) deviceTtsPush.noteReplyTextOnScreen()
+        // 【取证行】
+        Log.i(TAG, XiaozhiPacingLog.line(ordinal, pacingOrNull(), relay?.sentenceStartMs(text), text.length))
+        // 只写帧、**不**回调 relay(见本函数 KDoc)。
+        writeTextFrame(XiaozhiScreenSignal.REPLY_ROLE, text, notifyRelay = false)
+        Log.i(
+            TAG,
+            "小智 TTS 直通:本段字幕已上屏(" +
+                (if (ordinal <= 1) "首次上屏" else "第 $ordinal 段上屏") +
+                ") → 允许开播" +
+                "(当前 BLE 写模式=${if (::ble.isInitialized && ble.isBulkWrite()) "无响应写(批量)" else "带响应写"})",
+        )
+    }
+
+    /**
+     * **段内更新**:本段**已在屏上**、同一句的正文又变完整 —— 由 relay 请服务侧重写一遍
+     * ([XiaozhiTtsRelay] 的 `rewriteSubtitle` 回调;真实链路上后续段的正文先于句界报文到达,
+     * 所以「下一段的首条字幕」与「已上屏那一段的更新」要到句界那一刻才能分辨)。
+     *
+     * 行为与改动前逐字一致:仍受**让路**约束([deferCorrectionWhileAudioIsTight])、仍写完
+     * 调 [notifyXiaozhiReplyOnScreen] 对账(它不会重开段 —— 段已经在屏上、`screenPassed` 已置位)。
+     */
+    private fun rewriteDisplayedSubtitle(text: String) {
+        if (deferCorrectionWhileAudioIsTight(XiaozhiScreenSignal.REPLY_ROLE, text)) return
+        writeTextFrame(XiaozhiScreenSignal.REPLY_ROLE, text)
+    }
+
+    /**
+     * **段内字幕更新**不要在音频正紧时插队([XiaozhiCorrectionPacer])。
      *
      * 为什么要拦:字幕帧与音频帧**共用一条 BLE 串行写队列**(见 [XiaozhiTtsRelay]),而且
      * 正文帧到达设备那一刻会触发一次**多行文本渲染** —— 设备的 BLE RX drain 与 LVGL 渲染在同一个
      * 应用任务里,那几十毫秒里 RX 排不空,解码队列就见底(真机 `欠载=23`)。设备侧那一半不改固件,
      * 手机侧能做的是:**别在一段音频正紧的时候去动文字**。
      *
-     * 与 relay 的**段闸门**的关系(2026-10 按段播放改动):「第 N 段字幕必须早于第 N 段音频」由 relay
-     * 保证(段的 `tts_start` 只在它的字幕已写进 BLE 写队列后才发);本函数只管「现在写还是攒一攒」——
-     * 真被攒住了也只是让那一段等一会儿:一段推完(快照 `active` 变假)或兜底时限到就放行。
+     * 与 relay 的**段界**的关系(2026-10「字幕随段推进」改动):段与段之间的**首次上屏**现在完全
+     * 不经过这里 —— 由 relay 在段界写([writeSegmentSubtitle]),那一刻上一段已播完、本段还没开播,
+     * 没有音频会被打断(所以让它“几乎不被触发”正是预期)。本函数只剩一个作用:**段内更新**
+     * (本段已在屏上、同一句的正文又变完整)别在音频正紧时插队。真被攒住了也只是让那条更新晚一点:
+     * 一段推完(快照 `active` 变假)或兜底时限到就放行([flushDeferredCorrection])。
      *
      * 只拦小智直通的正文(判定复用 [XiaozhiTtsRelay.replyScreenOrdinal],与日志里的
-     * 「首段/下一段」是**同一套规则**,不会分叉):
+     * 「首段/第 N 段」是**同一套规则**,不会分叉):
      *  - **第 1 段**(首段)是「文字先于声音」的开播信号,必须立刻上屏；
      *  - 非本轮正文(序号 0)与本轮还没交付正文(null)不进这个通道;
      *  - 其它四种网关没有直通音频在推,让路无意义 —— 一行也不改。
@@ -1078,11 +1140,15 @@ class VoiceBridgeService : Service() {
     /**
      * 真的把 TEXT 帧写进 BLE 串行写队列(上屏)。
      *
-     * 与 [sendTextFrame] 分开的原因:补正让路要在**写入之前**拦住请求([deferCorrectionWhileAudioIsTight]),
+     * 与 [sendTextFrame] 分开的原因:让路要在**写入之前**拦住请求([deferCorrectionWhileAudioIsTight]),
      * 而让路攒下的正文最终还是要走这条**同一条**写入路径([flushDeferredCorrection] / [pumpDeferredCorrection])——
      * 拆开后「写帧 + 发上屏信号」只有一份实现,不会出现「让路那条路忘了发信号」。
+     *
+     * @param notifyRelay 写完之后要不要调 [notifyXiaozhiReplyOnScreen] 通知直通 relay(默认要)。
+     *   **段界上屏**([writeSegmentSubtitle])传 false:那是 relay 自己叫我们写的,它已经知道;而正文帧
+     *   仍在 `tts_start` 之前入队(顺序不变)、仍是同一条串行写队列。
      */
-    private fun writeTextFrame(role: Char, text: String) {
+    private fun writeTextFrame(role: Char, text: String, notifyRelay: Boolean = true) {
         // TEXT 帧 payload = [role:1B]['U'=用户识别/'A'=网关回复] + UTF-8 文本。
         // 固件据此区分并入对话历史,供 UP/DOWN 翻页。
         val body = text.toByteArray(Charsets.UTF_8)
@@ -1095,7 +1161,7 @@ class VoiceBridgeService : Service() {
             val frame = vbEncodeFrame(VbFrame.TYPE_TEXT, VbFrame.FLAG_LAST, payload)
             Log.i(TAG, "sendTextFrame role=$role(空) 分片0/1${screenPhase(role, text)}")
             ble.writeBytes(frame)
-            notifyXiaozhiReplyOnScreen(role, text)
+            if (notifyRelay) notifyXiaozhiReplyOnScreen(role, text)
             return
         }
         // 分片回退到 UTF-8 边界(见 splitTextPayload),不切坏汉字/emoji
@@ -1127,7 +1193,7 @@ class VoiceBridgeService : Service() {
             Log.d(TAG, "sendTextFrame role=$role 分片$chunkIdx/$totalChunks 字节=${frame.size} flags=$flags")
             ble.writeBytes(frame)
         }
-        notifyXiaozhiReplyOnScreen(role, text)
+        if (notifyRelay) notifyXiaozhiReplyOnScreen(role, text)
     }
 
     /**
@@ -1147,20 +1213,23 @@ class VoiceBridgeService : Service() {
     }
 
     /**
-     * **「本轮正文已上屏」信号**:本条回复的 `TEXT('A')` 分片**已全部写进 BLE 串行写队列**之后调用,
-     * 告诉小智 TTS 直通([xiaozhiTtsRelay])「这条字幕已落位」—— 按段播放里它是一个**段的开播条件**
+     * **「本段正文已写进 BLE 串行写队列」的对账**:本条 `TEXT('A')` 已全部写入队列之后调用,
+     * 告诉小智 TTS 直通([xiaozhiTtsRelay])「这条字幕已落位」—— 它是一个**段的开播条件**
      * (第 N 段的 `tts_start` 只可能在它的字幕入队之后发出)。
      *
-     * **按段交付**下本函数**同一轮会被调多次**(第 1 段一条,之后每一句各一条),每条字幕都归到它
-     * 对应的那一段:第 1 段因此**立即开播**(延迟优先),后续各段则在本段字幕落位 + 上一段播完之后
-     * 才开始(段间是**自然停顿**,见 [XiaozhiTtsRelay])。开播时刻只记第一次
+     * 2026-10「**字幕随段推进**」之后,段的**首次**上屏由 relay 在段界自己写
+     * ([writeSegmentSubtitle],不回调本函数);本函数只剩两条来路:
+     *  1. **段内更新**(本段已在屏上、同一句又变完整);
+     *  2. **让路补上**(`XiaozhiCorrectionPacer` 把攒下的字幕吐出来)。
+     * 两条都是服务侧自己写的帧,写完在这里对账(不会重开段 —— `screenPassed` 已置位)。
+     * 开播时刻只记第一次
      * [deviceTtsPush.noteReplyTextOnScreen](作者要看的是「首段上屏 → 首帧」那段延迟)。
      *
      * 为什么要到这一层才发(而不是会话层收到 `tts.state=stop` 就开播):设备屏上的气泡与音频帧走的是
      * **同一个** BLE 串行写队列,而正文与音频分别在两个线程/协程里就绪 —— 只要不等这个信号,用户就会
      * 先听到声音、后看到字。正文帧与音频帧同处一条队列,所以「正文先于首帧」由构造保证。
      *
-     * **哪些上屏算信号(2026-10-05 真机修正)**:只有角色为 `'A'`、且文本与**本轮正文**逐字一致的那条
+     * **哪些文本算信号(2026-10-05 真机修正)**:只有角色为 `'A'`、且文本与**本轮正文**逐字一致的那条
      * `TEXT` 才算(判定全在 [XiaozhiTtsRelay.onReplyTextDisplayed] 与 `XiaozhiScreenSignal`)。
      * 同为 `'A'` 的版本提示、「无语音」、网关超时/失败原因、空回复兜底**不算** —— 否则本轮音频会抢在
      * 真正文前面出声;`'U'`(识别原文)与 `'R'`(系统提示)更不算。
