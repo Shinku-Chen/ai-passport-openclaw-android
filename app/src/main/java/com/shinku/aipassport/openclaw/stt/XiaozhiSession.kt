@@ -96,6 +96,15 @@ interface XiaozhiLlmSource {
 interface XiaozhiTtsObserver {
 
     /**
+     * 还有没有"没播完的段"(relay 覆盖它):打断时据此决定要不要**掐掉整条连接**。
+     *
+     * 为什么要掐连接(作者真机):打断只发 `tts_abort` 是**不够**的 —— 小智那边的 TTS 流不会停,
+     * App 与设备会一直把它收完,新的一轮要等旧流结束才开始(用户:"收完以后才把我这个打断的
+     * 语音发过去")。掐掉 socket 才能真正让服务端停流,新一轮立刻开始。
+     */
+    val hasPendingWork: Boolean get() = false
+
+    /**
      * 会话开始新一轮(设备 PTT 按下)**或本轮被取消(barge / 设备 `turn_cancel`)/链路断开**:
      * 把上一段的朗读记账作废,并**关闭直通侧的播放窗口**。
      *
@@ -783,6 +792,25 @@ class XiaozhiSession(
      *  - 每轮最多一次([sttAbortSentThisTurn]):重复收尾(如连调两次 [endTurn])不重复发;
      *  - 幂等且不抛:没有连接([stopListening] 自带判空)、或调用方判定为小智模式,都只是安静返回。
      */
+    /**
+     * 打断小智的说话(官方协议的 abort):让服务端**立刻停止**本轮 TTS 的合成与下发。
+     *
+     * 为什么必须有它:只发 `listen.stop` 只结束"识别",小智那边的 LLM/TTS 照旧跑完 ——
+     * 于是打断后旧回复还会被收完,新一轮要等它结束才开始。设备侧另发 `tts_abort`(两条路径都幂等)。
+     */
+    private fun sendAbortSpeaking() {
+        val socket = ws ?: return
+        val mySeq = turnSeq
+        runCatching {
+            val json = JsonObject().apply {
+                addProperty("type", "abort")
+                addProperty("reason", "user_interrupt")
+            }.toString()
+            if (socket.send(json)) Log.i(tag, "已发送小智 abort(打断本轮说话)")
+            else Log.w(tag, "小智 abort 发送失败(socket 队列已满)")
+        }.onFailure { e -> Log.w(tag, "小智 abort 发送异常", e) }
+    }
+
     private fun abortSttAfterTurn() {
         if (!sttAbortAfterEndTurn()) return
         if (sttAbortSentThisTurn) return
@@ -873,6 +901,11 @@ class XiaozhiSession(
         // 直通侧的播放窗口也一并关闭(barge / 设备 turn_cancel:窗口在 tts.stop 之后是开着的,
         // 不关就会把本轮的音频继续推给设备、并让设备一直停在播放态)。
         ttsObserver?.onTurnStart()
+        // 【真打断】设计文档 §7/§12 写的就是「App 发小智 `abort` + 设备 `tts_abort`」,但代码里
+        // 一直只发了 `listen.stop`(结束识别)**不是**打断说话 —— 真机表现为:打断后小智仍把旧回复
+        // 推完、App 与设备一直收,新输入要等它结束才开始(用户原话:"收完以后才把我这个打断的语音
+        // 发过去")。这里补上真正的 abort(与 `tts_abort` 幂等并列,两条路径互不替代)。
+        sendAbortSpeaking()
         if (wasListening) stopListening()
         pcmLen = 0   // 丢掉不满一帧的余量,不跨轮拼接
     }

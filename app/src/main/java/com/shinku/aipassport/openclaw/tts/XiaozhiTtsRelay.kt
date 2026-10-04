@@ -407,6 +407,16 @@ class XiaozhiTtsRelay(
     private var advanceReason = DEFAULT_ADVANCE_REASON
 
     /** 本轮是否已经声明过段(声明过就说明「本轮真的开始了」,之后的帧都是本轮的迟到帧)。 */
+    /**
+     * 打断之后、**新一轮自己的 `tts` 状态报文到达之前**,一帧音频都不收。
+     *
+     * 真机(作者):"播放很长文本时打断它,还是会把我打断前的内容回复过来"。App 这边旧轮的段与
+     * 队列在 `onTurnStart` 里都清了,但旧流的残留帧仍可能落进池子、被新一轮的第一段吸收 ——
+     * 于是听上去像"老回复又从头讲"。这里用一条**显式**规则挡死:打断/新一轮起,直到服务端自己
+     * 发出新一轮的 `tts` 状态(说明它的新流开始了)之前,音频一律丢弃。
+     * 只对**会发状态报文**的服务端生效(纯音频服务端没有这个信号,不能拿它当闸门)。
+     */
+    private var awaitingNewTurnAudio = false
     private var declaredThisTurn = false
 
     /** 本轮是否收到过 `tts` 状态报文(句界信息);与 [stateReportsSeen] 一起判定「未归属的帧」的归属。 */
@@ -501,6 +511,8 @@ class XiaozhiTtsRelay(
         advanceReason = DEFAULT_ADVANCE_REASON
         declaredThisTurn = false
         stateSeenThisTurn = false
+        // 会发状态报文的服务端:打断后先关闸,等它新一轮的 tts 状态再放行(见字段注释)。
+        awaitingNewTurnAudio = stateReportsSeen
         // 上一轮的正文记录一并作废:旧轮的迟到「上屏信号」绝不能再把新一轮的闸门打开。
         expectedReplyBodies.clear()
         screenSignals = 0
@@ -549,6 +561,7 @@ class XiaozhiTtsRelay(
         // 上一条还没归段就又来了一条(罕例:服务端没给句界报文):先把它归到当前段。
         attachPendingBody()
         pendingBody = body
+        awaitingNewTurnAudio = false
         if (!stateReportsSeen) {
             // 没有句界信息(纯音频服务端):交付就是一句 → 直接开段。
             attachPendingBody()
@@ -695,6 +708,10 @@ class XiaozhiTtsRelay(
         // 收到过一帧**可下发的**音频:本轮的句起点估计从此可用(证据/日志)。
         audioFramesSeen = true
         receivedFrames++
+        if (awaitingNewTurnAudio) {
+            drop("打断后新一轮 tts 尚未开始:丢弃旧流残留帧")
+            return
+        }
         val frame = BufferedFrame(rateKhz, frameMs, opus)
         val target = segments.lastOrNull()?.takeIf { !it.finished && !it.stopped }
         if (target == null) {
@@ -929,7 +946,7 @@ class XiaozhiTtsRelay(
     val currentTextChars: Int
         get() = segments.firstOrNull { !it.finished }?.subtitle?.length ?: 0
 
-    val hasPendingWork: Boolean
+    override val hasPendingWork: Boolean
         get() = active != null || awaitingReport != null || segments.any { !it.finished }
 
     // ---- 内部:段的收口 / 开播 / 推进 ----
