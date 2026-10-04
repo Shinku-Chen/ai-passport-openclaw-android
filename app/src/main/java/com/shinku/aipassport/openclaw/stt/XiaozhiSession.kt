@@ -413,6 +413,15 @@ class XiaozhiSession(
     @Volatile
     private var warmIdleTask: ScheduledFuture<*>? = null
 
+    /**
+     * 「这条连接还要用,别因闲置关掉」的守卫(由服务侧提供)。
+     *
+     * 真机 bug:一轮的文本先结算、设备还在播前面几段时,闲置定时器把连接关了 —— 后面几段的音频
+     * 永远收不到(设备停在中间)。服务侧用 `relay.hasPendingWork` 回答"还有段没播完吗"。
+     */
+    @Volatile
+    var holdOpenWhile: (() -> Boolean)? = null
+
     /** 本轮因热连接复用失败而自动重连的次数(最多一次,见 [WarmLink.shouldFallbackReconnect])。 */
     @Volatile
     private var warmFallbackAttempts = 0
@@ -533,7 +542,11 @@ class XiaozhiSession(
      */
     override fun prewarm() {
         if (!isAvailable) return
-        when (WarmLink.decide(warmState(), System.currentTimeMillis())) {
+        when (WarmLink.decide(
+                warmState(),
+                System.currentTimeMillis(),
+                holdOpen = holdOpenWhile?.invoke() == true,
+            )) {
             WarmLink.WarmDecision.REUSE -> return   // 已有热连接,不重复建
             WarmLink.WarmDecision.RECONNECT_IDLE_TIMEOUT -> {
                 Log.i(tag, "热连接闲置超时,已关闭")
@@ -584,7 +597,11 @@ class XiaozhiSession(
         val decision: WarmLink.WarmDecision
         val sessionReady: Boolean
         synchronized(linkLock) {
-            decision = WarmLink.decide(warmState(), System.currentTimeMillis())
+            decision = WarmLink.decide(
+                warmState(),
+                System.currentTimeMillis(),
+                holdOpen = holdOpenWhile?.invoke() == true,
+            )
             sessionReady = decision == WarmLink.WarmDecision.REUSE &&
                 WarmLink.sessionEstablished(startListening())
         }
@@ -957,7 +974,11 @@ class XiaozhiSession(
     private fun closeWarmLinkIfIdle() {
         synchronized(linkLock) {
             if (turnRunning || listening) return   // 期间被复用/正在用
-            if (WarmLink.decide(warmState(), System.currentTimeMillis()) !=
+            if (WarmLink.decide(
+                warmState(),
+                System.currentTimeMillis(),
+                holdOpen = holdOpenWhile?.invoke() == true,
+            ) !=
                 WarmLink.WarmDecision.RECONNECT_IDLE_TIMEOUT
             ) {
                 return

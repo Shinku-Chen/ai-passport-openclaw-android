@@ -73,8 +73,13 @@ object WarmLink {
         state: WarmLinkState,
         nowMs: Long,
         idleTimeoutMs: Long = IDLE_TIMEOUT_MS,
+        holdOpen: Boolean = false,
     ): WarmDecision {
         if (!state.connected) return WarmDecision.RECONNECT_DISCONNECTED
+        // holdOpen = 服务侧还要用这条连接收音频(本轮的段还没播完):**一票否决**闲置关闭。
+        // 真机 bug:一轮的文本先结算、设备还在播前面几段,空闲定时器就把连接关了 —— 后面几段的
+        // 音频再也收不到,设备停在中间(用户:"APP 收到 8 段就不再收,设备只到 6 段")。
+        if (holdOpen) return WarmDecision.REUSE
         if (idleTimeoutMs > 0 && nowMs - state.lastActiveAtMs >= idleTimeoutMs) {
             return WarmDecision.RECONNECT_IDLE_TIMEOUT
         }

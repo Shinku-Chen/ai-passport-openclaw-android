@@ -630,6 +630,9 @@ class VoiceBridgeService : Service() {
         //     设备朗读需要的是**离线中文音色**,而 setLanguage 到底选中了哪个,引擎不会告诉你。
         if (settings.ttsEnabled) scope.launch { deviceTtsPush.prewarm() }
 
+        // 热连接守卫:本轮还有段没播完时,别让闲置定时器把连接关掉(不然剩下几段的音频收不到)。
+        runCatching { stt.session.holdOpenWhile = { xiaozhiTtsRelay?.hasPendingWork == true } }
+
         // 帧重组 → 帧回调 → 流水线
         reassembler = VbFrameReassembler { frame -> pipeline.handleFrame(frame) }
 
