@@ -395,6 +395,13 @@ class VoiceBridgeService : Service() {
     /** 段机推进的独立心跳:只要 relay 还有未完成的段就一直推(不依赖 drain 循环的寿命)。 */
     private var xzSegmentPumpJob: Job? = null
 
+    /** 段字幕写进 BLE 队列的时刻:首帧音频要等 [SUBTITLE_RENDER_GAP_MS] 再发,给设备渲染留时间。 */
+    @Volatile
+    private var xzSubtitleWrittenAtMs = 0L
+
+    /** 字幕写完后到首帧音频之间的间隔(ms):设备端渲染多行字样会抢 BLE 接收,太紧会"断一下"。 */
+    private val SUBTITLE_RENDER_GAP_MS = 200L
+
     /** 空闲节能:最后一次真活动(按键/说话/播放/音频帧/链路就绪)的时刻。 */
     @Volatile
     private var idleActivityAtMs = System.currentTimeMillis()
@@ -1119,6 +1126,9 @@ class VoiceBridgeService : Service() {
         Log.i(TAG, XiaozhiPacingLog.line(ordinal, pacingOrNull(), relay?.sentenceStartMs(text), text.length))
         // 只写帧、**不**回调 relay(见本函数 KDoc)。
         writeTextFrame(XiaozhiScreenSignal.REPLY_ROLE, text, notifyRelay = false)
+        // 记下"字幕刚写进队列"的时刻:首帧音频要等 SUBTITLE_RENDER_GAP_MS 再发,
+        // 给设备把这段文字渲染出来(真机:文字上屏那一刻音频会断一下 = 渲染抢了 BLE 接收)。
+        xzSubtitleWrittenAtMs = System.currentTimeMillis()
         Log.i(
             TAG,
             "小智 TTS 直通:本段字幕已上屏(" +
@@ -2006,6 +2016,13 @@ class VoiceBridgeService : Service() {
                             // 开播瞬时先预充前 [TtsFlowControl.PRECHARGE_FRAMES] 帧(不受下限约束),
                             // 之后每帧至少隔 [TtsFlowControl.MIN_SEND_INTERVAL_MS] —— 只按领先量节流时
                             // 设备侧缓冲会十几秒贴近空转,一次写抖动就是一次 `欠载`(实测 `欠载=32`)。
+                            // 段字幕刚写下去:先给设备约 200ms 渲染时间(见 xzSubtitleWrittenAtMs)。
+                            val gapLeft = xzSubtitleWrittenAtMs + SUBTITLE_RENDER_GAP_MS -
+                                System.currentTimeMillis()
+                            if (!firstFrameWritten && gapLeft > 0) {
+                                headWaits.append("字幕渲染间隔 ${gapLeft}ms;")
+                                delay(gapLeft)
+                            }
                             val wait = TtsFlowControl.pushWaitMs(
                                 sent,
                                 System.currentTimeMillis() - xzSentAtMs,

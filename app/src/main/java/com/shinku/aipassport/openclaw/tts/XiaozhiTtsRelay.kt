@@ -57,6 +57,18 @@ object XiaozhiFrameLog {
     /** 第 [index] 帧(从 1 开始)是否该打。 */
     fun shouldLog(index: Int): Boolean = index <= HEAD || index % EVERY == 0
 }
+    /**
+     * 一段至少要有多少帧才开播(约 [MIN_START_FRAMES] x 60ms 的垫底)。
+     *
+     * 真机(作者):"第 1 句的前几个字的语音还是会丢"。日志显示第 1 段**只有 11 帧(≈660ms)就 tts_start**
+     * 了 —— 而设备起播 priming ≈450ms(≈7-8 帧)会把开头的帧吃掉,于是前几个字听不见。
+     * 所以开播前先攒够这一档(最多等 [MIN_START_WAIT_MS],到点有几帧就发几帧,不能把开播拖死)。
+     */
+    const val MIN_START_FRAMES = 16
+
+    /** 攒帧开播的最长等待(ms):超过就按手上的帧开播,避免"等音频"把延迟拖长。 */
+    const val MIN_START_WAIT_MS = 1200L
+
 
 /**
  * 小智直通**本段收尾**的判定(纯逻辑,可 JVM 单测):「本段已推空 + 设备侧静默达上限」就
@@ -85,6 +97,7 @@ object XiaozhiTailStop {
      * 不知道字数(0)时仍是 [TAIL_IDLE_MS]。
      */
     const val TAIL_IDLE_MS = 3_000L
+
 
     /** 中文语速估值:每字约多少毫秒(≈4.5 字/秒)。 */
     const val MS_PER_CHAR = 220L
@@ -333,6 +346,9 @@ class XiaozhiTtsRelay(
      * 同一轮里按 [ordinal] 顺序处理:只有「上一段已收尾」才可能开下一段。
      */
     private class Segment(val ordinal: Int) {
+
+        /** 声明时刻(给"攒够帧才开播"的门限计时用)。 */
+        var declaredAtMs: Long = 0L
 
         /** 该段的小智字幕(= 会话层交给流水线、再由服务侧写进 BLE 队列的那串文本);null = 还没交付。 */
         var subtitle: String? = null
@@ -1001,6 +1017,14 @@ class XiaozhiTtsRelay(
                 }
                 return
             }
+            // 攒够前导帧再开播:真机上第 1 段只攒到 11 帧(≈660ms)就 tts_start,而设备起播
+            // priming ≈450ms(≈7-8 帧)会把开头几个字吃掉 —— 用户听到的就是"前几个字丢失"。
+            // 最多等 MIN_START_WAIT_MS,到点按手上的帧开播(不能把开播拖死)。
+            if (!seg.sealed && seg.pending.size < MIN_START_FRAMES &&
+                nowMs() - seg.declaredAtMs < MIN_START_WAIT_MS
+            ) {
+                return
+            }
             startSegment(seg)
             if (seg.sealed) sealAndStop(seg, "本段已收口")
             return
@@ -1041,6 +1065,7 @@ class XiaozhiTtsRelay(
     /** 声明一段(段号自增);池里的帧并进这一段的开头(不丢音频)。 */
     private fun declareSegment(subtitle: String?, screenPassed: Boolean): Segment {
         val seg = Segment(segments.size + 1)
+        seg.declaredAtMs = nowMs()
         seg.subtitle = subtitle
         seg.screenPassed = screenPassed
         if (pool.isNotEmpty()) {
