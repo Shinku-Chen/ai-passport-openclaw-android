@@ -892,6 +892,16 @@ class XiaozhiTtsRelay(
         advance()
     }
 
+    /**
+     * 还有没有"未完成的段"(正在推 / 等设备回报 / 已声明但还没开播)。
+     *
+     * 服务侧用它决定"心跳还要不要继续跳":段机推进不能只靠 drain 循环 —— 真机 bug:
+     * 本轮最后一段在 `tts.stop` 之后才收到文本/帧,而那时 drain 已经退出,于是没人再
+     * [pumpSegments],那一段的字幕与音频**永远送不出去**(设备上就停在倒数第二句)。
+     */
+    val hasPendingWork: Boolean
+        get() = active != null || awaitingReport != null || segments.any { !it.finished }
+
     // ---- 内部:段的收口 / 开播 / 推进 ----
 
     /** 段机推进(所有入口都过这里,状态只在这一处改变)。 */

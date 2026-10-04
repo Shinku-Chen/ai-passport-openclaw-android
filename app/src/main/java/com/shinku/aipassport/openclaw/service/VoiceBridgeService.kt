@@ -386,6 +386,9 @@ class VoiceBridgeService : Service() {
     /** 设备能力快照(0=未上报,1=已上报;+2=支持 tts_opus):变化才落盘给设置页读。 */
     private var xzCapsSnapshot = -1
 
+    /** 段机推进的独立心跳:只要 relay 还有未完成的段就一直推(不依赖 drain 循环的寿命)。 */
+    private var xzSegmentPumpJob: Job? = null
+
     /**
      * **正文上屏让路**的纯逻辑(见 [XiaozhiCorrectionPacer]):只拦小智直通里「下一段的字幕」。
      *
@@ -1846,6 +1849,27 @@ class VoiceBridgeService : Service() {
          * (`tts_stop`,设备从播放态「接收中」回到空闲)—— 这是**不依赖设备回报**的兜底路径,
          * 也是【最后一段】唯一的收口点(它没有「下一句文本」这个天然边界)。
          */
+        /**
+         * 启动段机心跳(幂等):每 150ms 推一次 [XiaozhiTtsRelay.pumpSegments],
+         * 直到 relay 报告"没有未完成的段"。
+         *
+         * 为什么必须有它:drain 循环在本轮文本结算 + 本段推完后就会退出,而最后一段可能是
+         * **在 `tts.stop` 之后**才拿到文本/帧(小智的迟到帧很常见),那时没人再推段机 ——
+         * 真机上表现为"设备停在倒数第二句,最后一句没字也没声"。
+         */
+        private fun startSegmentPump() {
+            if (xzSegmentPumpJob?.isActive == true) return
+            xzSegmentPumpJob = scope.launch {
+                // 取消语义靠 delay 抛 CancellationException,所以这里用 while (true) + 显式 break。
+                while (true) {
+                    val relay = xiaozhiTtsRelay ?: break
+                    if (!relay.hasPendingWork) break
+                    relay.pumpSegments()
+                    delay(150)
+                }
+            }
+        }
+
         private suspend fun drainXiaozhiTts(id: Int) {
             if (!::ble.isInitialized || !ble.isConnected()) {
                 Log.d(TAG, "设备未连接,跳过小智 TTS 直通下发")
@@ -1865,6 +1889,7 @@ class VoiceBridgeService : Service() {
             // 写模式本身由 [TtsWriteMode.XIAOZHI_DIRECT] 一处定义、单测钉住,这里只取它的值。
             ble.setBulkWrite(TtsWriteMode.XIAOZHI_DIRECT.bulkWrite)
             // 本段的推送计数(lastFrames)由 [start] 归零;这里只在还没开段时兜底归零一次。
+            startSegmentPump()
             var idleMs = 0L
             var slow = false
             // 本段是否已经因「推空且静默」而主动收尾(幂等:[XiaozhiTtsRelay.onIdleTailStop] 自身也幂等)
