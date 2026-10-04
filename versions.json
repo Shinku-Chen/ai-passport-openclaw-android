@@ -1,15 +1,15 @@
 {
   "schema": 1,
-  "updated": "2026-10-03T18:25:00Z",
+  "updated": "2026-10-04T12:38:49Z",
   "app": {
-    "version": "1.13.1",
+    "version": "1.14",
     "url": "https://github.com/Shinku-Chen/ai-passport-openclaw-android/releases/latest",
-    "notes": "新增小智 AI 网关：可用小智的识别与声音；语音按句播放，字幕跟着上一句播完再出；长回答第一句就出声，不用再等整段生成"
+    "notes": ""
   },
   "firmware": {
-    "version": "1.13",
-    "tag": "v1.13-intercom",
+    "version": "1.14",
+    "tag": "v1.14-intercom",
     "url": "https://github.com/Shinku-Chen/ai-passport/releases/latest",
-    "notes": "短按 OK 只唤醒；识别零延迟；新消息停首行、末条贴底"
+    "notes": ""
   }
 }
