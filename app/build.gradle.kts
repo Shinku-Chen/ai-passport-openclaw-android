@@ -35,7 +35,7 @@ android {
         applicationId = "com.shinku.aipassport.openclaw"
         minSdk = 26          // BLE 前台 Service + 后台扫描需要
         targetSdk = 35
-        versionCode = 14
+        versionCode = 15
         // 版本号与固件/社区保持一致(硬约定,两段式):固件 tag vX.Y-intercom ↔ App versionName X.Y。
         // 1.12 = 对应固件 v1.12-intercom(固件/App 互报版本 + 不一致双向提示)。
         // 重发记录(versionName 不动,只提 versionCode;App 侧修 bug 用这种办法保持与固件/社区同号):
@@ -46,6 +46,8 @@ android {
         // 所以已装 1.12 的手机会收到「有新版本」提醒(App 内「设置 → 应用设置 → 检查更新」)。
         // 1.14.1 = App 侧修两个真机问题(非小智网关下小智回复也会上屏 / 旧版写死的朗读开关),
         // 配套固件仍是 v1.14-intercom(大版本一致即可),所以是 App 自己的小版本前进。
+        //   重发 1.14.1(versionCode 14 → 15):装上后发现本地合成那条下行音频用无响应写
+        //   会被静默丢帧 → 设备一点声都没有;改成带响应写后正常。versionName 不动。
         versionName = "1.14.1"
     }
 
