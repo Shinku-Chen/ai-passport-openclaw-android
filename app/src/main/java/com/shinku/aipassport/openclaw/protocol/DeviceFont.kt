@@ -7,7 +7,7 @@ import java.nio.charset.Charset
  *
  * 固件把整份中文界面字库编进镜像：`assets/fonts/intercom_cjk_16.c`
  * （`lv_font_intercom_cjk_16`，由固件仓库 `tools/intercom_font.py` 生成），
- * 字符集 = **GB2312 全量（6763 汉字 + 682 符号）+ ASCII**，共 **7540 个码位**。
+ * 字符集 = **GB2312 全量（6763 汉字 + 682 符号）+ ASCII**，共 **7546 个码位**(GB2312 全量 7540 + 额外补的 6 个排版字符,见 [EXTRA_RENDERABLE])。
  *
  * ⚠ 设备端**没有字体回退**：字库里没有的字符在屏幕上就是一个方块（LVGL 的
  * missing-glyph 占位框）。所以凡是会出现在设备屏上的 App 文案（TEXT 气泡、
@@ -21,9 +21,9 @@ import java.nio.charset.Charset
  * | 想写 | 码位 | GB2312 | 设备可用的替代 |
  * | --- | --- | --- | --- |
  * | `↔` | U+2194 | ✗ | `≠`(U+2260)、`vs` |
- * | `—` 长破折号 | U+2014 | ✗ | `｜`(U+FF5C)、`-` |
- * | `·` 间隔点 | U+00B7 | ✗ | `・`(U+30FB)、`,` |
- * | `✓ ✔` | U+2713/2714 | ✗ | `OK`、`√`(U+221A) |
+ * | `—` 长破折号 | U+2014 | ✗→**已补** | 现在设备能显示 ✓(字库 2026-10 补齐) |
+ * | `·` 间隔点 | U+00B7 | ✗→**已补** | 现在设备能显示 ✓ |
+ * | `✓` | U+2713 | ✗→**已补** | 现在设备能显示 ✓(`✔` 仍未补) |
  * | emoji（`👍 ⭐`…） | 1F300+ | ✗ | 文字；设备端暂无 emoji 字体 |
  * | `“ ” ‘ ’` | U+201C… | ✓ | 可用 |
  * | `…` | U+2026 | ✓ | 可用 |
@@ -48,7 +48,23 @@ object DeviceFont {
      * 个别字符会被映射成另一个字形（例：`·` 若按 GB2312 的 `・` 编码，设备上画出来的
      * 是 `・` 而不是 `·`），往返不一致就按「显示不了」处理。
      */
-    fun canRender(ch: Char): Boolean = ch.code < 0x80 || roundTrips(ch)
+    fun canRender(ch: Char): Boolean =
+        ch.code < 0x80 || ch in EXTRA_RENDERABLE || roundTrips(ch)
+
+    /**
+     * 字库里**额外补**的码位(GB2312 之外,作者 2026-10 要求)。
+     *
+     * 固件 `tools/intercom_font.py` 的 `EXTRA_CHARS` 与这里**必须一致**:
+     * 以前 `—`/`·`/`✓` 在设备上都是方块,只能靠改写文案绕过;现在字库直接带了字形。
+     */
+    private val EXTRA_RENDERABLE: Set<Char> = setOf(
+        '—',  // 破折号 ——
+        '–',  // 短破折号 –
+        '·',  // 间隔点 ·
+        '•',  // 项目符号 •
+        '‧',  // 连字点 ‧
+        '✓',  // 对勾 ✓
+    )
 
     /** 第一个显示不了的字符（测试报错时用来指出到底是哪个字）；全都能显示则为 null。 */
     fun firstUnrenderable(text: String): Char? = text.firstOrNull { !canRender(it) }

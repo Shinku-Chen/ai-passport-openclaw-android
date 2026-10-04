@@ -36,11 +36,19 @@ class DeviceFontTest {
     }
 
     @Test
-    fun common_punctuation_that_is_not_in_gb2312_is_rejected() {
-        assertFalse("长破折号 — 设备字库没有", DeviceFont.canRender("—"))
-        assertFalse("间隔点 · 设备字库没有", DeviceFont.canRender("·"))
-        assertFalse("对勾 ✓ 设备字库没有", DeviceFont.canRender("✓"))
+    fun extra_typography_added_in_2026_10_is_renderable() {
+        // 作者 2026-10 要求把这两个(及近亲)补进字库:以前设备上是方块,只能改写文案绕过。
+        // 固件 tools/intercom_font.py 的 EXTRA_CHARS 与 DeviceFont.EXTRA_RENDERABLE 必须一致。
+        assertTrue("长破折号 — 已补", DeviceFont.canRender("——"))
+        assertTrue("短破折号 – 已补", DeviceFont.canRender("–"))
+        assertTrue("间隔点 · 已补", DeviceFont.canRender("·"))
+        assertTrue("项目符号 • 已补", DeviceFont.canRender("•"))
+        assertTrue("连字点 ‧ 已补", DeviceFont.canRender("‧"))
+        assertTrue("对勾 ✓ 已补", DeviceFont.canRender("✓"))
         assertTrue("弯引号是 GB2312 里的，不能误杀", DeviceFont.canRender("“你好”"))
+        // 没补的仍然要按"显示不了"处理(否则设备屏是方块)
+        assertFalse("✔ 没补", DeviceFont.canRender("✔"))
+        assertFalse("↔ 没补", DeviceFont.canRender("↔"))
     }
 
     @Test
@@ -56,7 +64,8 @@ class DeviceFontTest {
     fun first_unrenderable_points_at_the_offending_char() {
         assertNull(DeviceFont.firstUnrenderable("全是 GB2312 里的字,还有 ASCII 123"))
         assertEquals('↔', DeviceFont.firstUnrenderable("1.12 ↔ 1.11"))
-        assertEquals('—', DeviceFont.firstUnrenderable("网关不可达 — 正在重连"))
+        assertEquals('✔', DeviceFont.firstUnrenderable("网关不可达 ✔ 正在重连"))
+        assertNull("破折号与间隔点现在能显示了", DeviceFont.firstUnrenderable("网关不可达 — 正在重连 · 稍后重试"))
         // emoji 是代理对：返回的是高位代理项（它本身也编不进 GB2312）
         val emojiFirst = DeviceFont.firstUnrenderable("你好👍再见")
         assertNotNull(emojiFirst)
