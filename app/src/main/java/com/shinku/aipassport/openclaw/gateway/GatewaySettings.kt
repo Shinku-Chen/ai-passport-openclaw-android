@@ -148,6 +148,25 @@ class GatewaySettings(context: Context) {
         set(value) = prefs.edit().putBoolean(KEY_TTS_ENABLED, value).apply()
 
     /**
+     * 用户是否**亲手**拨过朗读开关（设置页两处入口都会置位）。
+     *
+     * 它是一次性修复的判据（见下面的 `init`）：旧版本会在「本机不支持合成」探测失败时**替用户**
+     * 写 `tts_enabled=false`，而 1.14 已不再那么写 —— 但那份 false 会一直留在手机里，真机表现为
+     * 「开关是关的、一直没有声音」，而用户从没亲手关过它。
+     */
+    var ttsUserSet: Boolean
+        get() = prefs.getBoolean(KEY_TTS_ENABLED_USER_SET, false)
+        set(value) = prefs.edit().putBoolean(KEY_TTS_ENABLED_USER_SET, value).apply()
+
+    init {
+        // 一次性修复（只跑一次，写回后自己就不再触发）：把「不是用户关的」那份 false 扶回默认开。
+        // 用户亲手关的（ttsUserSet=true）一定不动 —— 否则就是替用户改设置。
+        if (!prefs.getBoolean(KEY_TTS_ENABLED, true) && !ttsUserSet) {
+            prefs.edit().putBoolean(KEY_TTS_ENABLED, true).apply()
+        }
+    }
+
+    /**
      * 设备朗读的合成引擎:`android`(系统 `TextToSpeech`,M1 唯一实现)/ `http`(骨架,服务选型待确认)。
      * 非法值退回 `android`(见 [TtsEngines.normalize])。与网关无关,**切换即落盘**。
      */
@@ -528,6 +547,9 @@ class GatewaySettings(context: Context) {
 
         // 设备朗读(下行 TTS)开关与引擎(与网关类型无关)
         private const val KEY_TTS_ENABLED = "tts_enabled"
+
+        /** 用户是否亲手拨过朗读开关（一次性修复的判据，见 [ttsUserSet]）。 */
+        private const val KEY_TTS_ENABLED_USER_SET = "tts_enabled_user_set"
         private const val KEY_TTS_ENGINE = "tts_engine"
     }
 }

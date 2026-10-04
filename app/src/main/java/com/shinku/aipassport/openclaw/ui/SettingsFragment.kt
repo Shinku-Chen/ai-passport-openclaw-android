@@ -654,6 +654,8 @@ class SettingsFragment : Fragment() {
         // 回写另一处开关触发的回调:不是用户操作,状态已经在同一个值上,直接忽略
         if (applyingTtsSwitches) return
         settings.ttsEnabled = checked
+        // 记下「是用户亲手拨的」:朗读开关的一次性修复据此不碰用户自己的选择（见 GatewaySettings.ttsUserSet）。
+        settings.ttsUserSet = true
         log("$entry(TTS)：${if (checked) "开" else "关"}（设备朗读 / 播放小智语音是同一个开关，两处已同步）")
         renderTtsSwitches()
         // 打开时立刻预热合成引擎:马上把「引擎能不能用 + 有哪些可用音色」写进日志,

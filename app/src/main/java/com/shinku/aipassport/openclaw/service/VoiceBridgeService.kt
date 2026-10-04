@@ -53,6 +53,7 @@ import com.shinku.aipassport.openclaw.tts.TtsFlowControl
 import com.shinku.aipassport.openclaw.tts.TtsFraming
 import com.shinku.aipassport.openclaw.tts.TtsPlaybackReport
 import com.shinku.aipassport.openclaw.tts.TtsPushPlan
+import com.shinku.aipassport.openclaw.gateway.XiaozhiReplyScreenPath
 import com.shinku.aipassport.openclaw.tts.TtsWriteMode
 import com.shinku.aipassport.openclaw.ui.DeviceTtsSwitches
 import com.shinku.aipassport.openclaw.tts.XiaozhiAudioPacing
@@ -1092,7 +1093,7 @@ class VoiceBridgeService : Service() {
         // 的那一刻)回调 [writeSegmentSubtitle] 把字幕写进 BLE 串行写队列 —— 于是字幕与它那一段的声音
         // 严格同段,且写帧一定排在它自己的 `tts_start` 之前(同一写队列,先写字幕后开段)。
         // 首段仍**立即**上屏(延迟优先,不变);段内更新(本段已在屏上)不在这里拦。
-        if (role == XiaozhiScreenSignal.REPLY_ROLE) {
+        if (role == XiaozhiScreenSignal.REPLY_ROLE && xiaozhiReplyScreenActive) {
             val relay = xiaozhiTtsRelay
             if (relay != null && relay.onReplySubtitleReady(role, text)) return
         }
@@ -1115,6 +1116,7 @@ class VoiceBridgeService : Service() {
      * 段内更新([rewriteDisplayedSubtitle])仍走让路。
      */
     private fun writeSegmentSubtitle(text: String) {
+        if (!xiaozhiReplyScreenActive) return
         val relay = xiaozhiTtsRelay
         val ordinal = relay?.replyScreenOrdinal(XiaozhiScreenSignal.REPLY_ROLE, text) ?: 0
         // 第 1 段 = 本轮第一条正文:上一轮万一还攒着一条待补字幕,一并作废。
@@ -1147,6 +1149,7 @@ class VoiceBridgeService : Service() {
      * 调 [notifyXiaozhiReplyOnScreen] 对账(它不会重开段 —— 段已经在屏上、`screenPassed` 已置位)。
      */
     private fun rewriteDisplayedSubtitle(text: String) {
+        if (!xiaozhiReplyScreenActive) return
         if (deferCorrectionWhileAudioIsTight(XiaozhiScreenSignal.REPLY_ROLE, text)) return
         writeTextFrame(XiaozhiScreenSignal.REPLY_ROLE, text)
     }
@@ -1204,6 +1207,7 @@ class VoiceBridgeService : Service() {
      * @param reason 触发原因(只进日志;真机靠它分辨「垫底恢复」还是「本段推完」)
      */
     private fun flushDeferredCorrection(reason: String) {
+        if (!xiaozhiReplyScreenActive) return
         val text = correctionPacer.flush(System.currentTimeMillis()) ?: return
         // 具体「垫底/在途/队列」由 [notifyXiaozhiReplyOnScreen] 的取证行在同一点打出来,这里只说原因。
         // 段号用 relay 的同一套判定取(此刻它还没被计成「已上屏」,拿到的仍是这一条的段号)。
@@ -1219,6 +1223,7 @@ class VoiceBridgeService : Service() {
      * 推空等新帧的轮询循环(每 10ms/200ms 一次)同样会调到它,所以段与段之间的停顿里也有机会补上。
      */
     private fun pumpDeferredCorrection() {
+        if (!xiaozhiReplyScreenActive) return
         if (correctionPacer.pendingBody == null) return
         val text = correctionPacer.tick(System.currentTimeMillis(), pacingOrNull()) ?: return
         // 具体「垫底/在途/队列」由 [notifyXiaozhiReplyOnScreen] 的取证行在同一点打出来,这里只说原因。
@@ -1226,6 +1231,18 @@ class VoiceBridgeService : Service() {
         Log.i(TAG, "正文上屏让路:补上第 ${ordinal ?: 0} 段字幕(垫底恢复/兜底时限到,本段 ${text.length} 字)")
         writeTextFrame(XiaozhiScreenSignal.REPLY_ROLE, text)
     }
+
+    /**
+     * 小智的**正文/字幕**通道是否生效 —— 只有「小智 AI 网关」才走这条路。
+     *
+     * 为什么必须设闸(2026-10-04 作者真机反馈):小智会话是双用途的 —— 非小智网关下它只做语音转文字,
+     * 但小智服务端并不知道 App 后面挂的是哪个后端,任何类型下它都会推自己的 `llm`/`tts`/音频。
+     * 音频已由直通门按类型挡住,而**正文**原来没挡:小智的回复会被 relay 接管、按段写进设备屏,
+     * 于是设备屏多出 App 对话列表里没有的内容。判定本身是纯函数([XiaozhiReplyScreenPath]),
+     * 由 JVM 单测钉住。
+     */
+    private val xiaozhiReplyScreenActive: Boolean
+        get() = runCatching { XiaozhiReplyScreenPath.active(settings.type) }.getOrDefault(false)
 
     /** 取音频侧快照(直通未接线/未初始化时 null;判定与日志共用同一份数据)。 */
     private fun pacingOrNull(): XiaozhiAudioPacing? =
