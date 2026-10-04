@@ -213,6 +213,12 @@ class VoiceBridgeService : Service() {
         /** 同一网关状态最短重发间隔(ms):避免进度事件多时刷屏设备屏与通知。 */
         private const val GATEWAY_STATE_MIN_INTERVAL_MS = 3_000L
 
+        /** 空闲节能:多久没有真活动就把 BLE 连接参数降到低功耗档。 */
+        private const val IDLE_LOW_POWER_AFTER_MS = 20_000L
+
+        /** 空闲节能的巡检周期。 */
+        private const val IDLE_POWER_TICK_MS = 5_000L
+
         fun start(context: Context) {
             // 用户（或开机广播 / 看门狗）希望它运行：先记意愿，看门狗后续才有"该不该拉回来"的依据
             KeepAliveState(context).bridgeWanted = true
@@ -388,6 +394,30 @@ class VoiceBridgeService : Service() {
 
     /** 段机推进的独立心跳:只要 relay 还有未完成的段就一直推(不依赖 drain 循环的寿命)。 */
     private var xzSegmentPumpJob: Job? = null
+
+    /** 空闲节能:最后一次真活动(按键/说话/播放/音频帧/链路就绪)的时刻。 */
+    @Volatile
+    private var idleActivityAtMs = System.currentTimeMillis()
+
+    /** 记一次活动:空闲计时归零。设备的 1Hz 状态帧不算活动(否则永远降不下去)。 */
+    private fun noteUserActivity() {
+        idleActivityAtMs = System.currentTimeMillis()
+    }
+
+    /** 空闲节能心跳:空闲超时降为低功耗连接参数,一有活动立刻升回高性能。 */
+    private fun startIdlePowerTicker() {
+        scope.launch {
+            while (true) {
+                delay(IDLE_POWER_TICK_MS)
+                if (!::ble.isInitialized) continue
+                val idleMs = System.currentTimeMillis() - idleActivityAtMs
+                val low = idleMs >= IDLE_LOW_POWER_AFTER_MS
+                if (ble.setIdleLowPower(low)) {
+                    Log.i(TAG, "空闲节能:" + (if (low) "降为低功耗连接参数" else "恢复高性能连接参数"))
+                }
+            }
+        }
+    }
 
     /**
      * **正文上屏让路**的纯逻辑(见 [XiaozhiCorrectionPacer]):只拦小智直通里「下一段的字幕」。
@@ -634,7 +664,12 @@ class VoiceBridgeService : Service() {
         runCatching { stt.session.holdOpenWhile = { xiaozhiTtsRelay?.hasPendingWork == true } }
 
         // 帧重组 → 帧回调 → 流水线
-        reassembler = VbFrameReassembler { frame -> pipeline.handleFrame(frame) }
+        reassembler = VbFrameReassembler { frame ->
+            // 除设备 1Hz 状态帧外的任何帧都算活动(按键事件/文本/音频/控制应答)。
+            val text = String(frame.payload, Charsets.UTF_8)
+            if (!text.contains("status")) noteUserActivity()
+            pipeline.handleFrame(frame)
+        }
 
         pipeline = VoicePipeline(
             scope = scope,
@@ -683,6 +718,8 @@ class VoiceBridgeService : Service() {
                     publishLinkStatus(LINK_ENCRYPTED, "已加密")
                 }
                 override fun onReady() {
+                    noteUserActivity()
+                    ble.setIdleLowPower(false)
                     publishLinkStatus(LINK_READY, "已就绪,长按设备 OK 说话")
                     // 向设备上报本 App 版本(设备据此检查固件/App 是否配套,不一致时设备屏会提示)
                     sendDeviceHello()
@@ -725,6 +762,7 @@ class VoiceBridgeService : Service() {
         pipeline.prewarm()
         ble.start()
         startConnectionMonitor()
+        startIdlePowerTicker()
     }
 
     /**

@@ -424,11 +424,37 @@ class BleCentral(
         connectInFlight = false
     }
 
+     * Idle power-save flag: true = LOW_POWER connection interval requested.
+     *
+     * Why (power saving, 2026-10): keeping CONNECTION_PRIORITY_HIGH (~11-15ms) while idle wakes the
+     * device 60+ times per second, so it can never enter light sleep. Idle -> LOW_POWER (wider
+     * interval + slave latency), any activity -> back to HIGH. Only connection parameters change:
+     * data path, write mode and flow control are untouched.
+     */
+    @Volatile
+    private var idleLowPower = false
+
+    /** Switch idle/performance connection parameters. Returns true when the state changed. */
+    fun setIdleLowPower(lowPower: Boolean): Boolean {
+        if (lowPower == idleLowPower) return false
+        idleLowPower = lowPower
+        val g = gatt ?: return true
+        val prio = if (lowPower) BluetoothGatt.CONNECTION_PRIORITY_LOW_POWER
+        else BluetoothGatt.CONNECTION_PRIORITY_HIGH
+        runCatching {
+            g.requestConnectionPriority(prio)
+            Log.i(tag, "conn params: " + (if (lowPower) "idle low power" else "high performance"))
+        }
+        return true
+    }
+
+    @Volatile
+
     /**
      * 协商到的 ATT MTU(null = 还没协商到或协商失败)。
      * 写分片长度由它算:`min(mtu − 3, 253)`,协商失败回退 240(见 [WriteChunking])。
      */
-    @Volatile
+
     private var negotiatedMtu: Int? = null
 
     /**
