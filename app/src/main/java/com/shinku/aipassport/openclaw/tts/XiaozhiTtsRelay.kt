@@ -77,24 +77,36 @@ object XiaozhiFrameLog {
 object XiaozhiTailStop {
 
     /**
-     * 段尾静默门槛(ms):最后一帧写进写队列之后多久没新帧就认为本段发完了。
+     * 静默多久算"本段推完"。
      *
-     * 取值理由:分句之间本来就可能隔几秒(服务端逐句生成),所以门槛不能压得太低;而设备的领先量
-     * (流控目标 1200ms / 硬上限 2000ms)决定了最后一帧写出后最多约 2s 就播完。取 3s = 上限 + 1s 余量:
-     * 既能及时把设备放回空闲(不再停在「接收中」),又不会在真的还有后续分段的可能时抢跑
-     * (真的又来帧时计数器会归零重算)。
+     * 固定 3s 在真机上出过事:小智**一句可以很长**(实测 60 字的句段),而它的音频是**断续**吐出来的 ——
+     * 中间静默超过 3s,App 就以为这段完了、发 `tts_stop`,设备提前停口(用户听到"读到一半突然停")。
+     * 所以按**该段字幕字数**估一个时长(中文 ≈4.5 字/秒)一起取大:**只放大、不缩小**;
+     * 不知道字数(0)时仍是 [TAIL_IDLE_MS]。
      */
     const val TAIL_IDLE_MS = 3_000L
 
+    /** 中文语速估值:每字约多少毫秒(≈4.5 字/秒)。 */
+    const val MS_PER_CHAR = 220L
+
+    /** 按本段字幕字数算出的静默阈值(与 [TAIL_IDLE_MS] 取大)。 */
+    fun idleThresholdMs(textChars: Int): Long =
+        maxOf(TAIL_IDLE_MS, textChars.coerceAtLeast(0).toLong() * MS_PER_CHAR)
+
     /**
-     * 现在该不该收本段。
+     * 现在该收本段吗。
      *
-     * @param framesWritten 本段已真正写入 BLE 写队列的帧数(0 = 本段从未开播,无需 `tts_stop`)
-     * @param idleMs 队列空的持续时长(每写出一帧就归零)
-     * @param alreadyStopped 本段是否已经收过尾(幂等:不重复发 `tts_stop`)
+     * @param framesWritten 本段已真写进 BLE 写队列的帧数(0 = 本段还没推出过任何帧:不收)
+     * @param idleMs 推空之后的静默时长
+     * @param alreadyStopped 本段是否已经收过(幂等)
+     * @param textChars 本段字幕字数(0 = 不知道,退回 [TAIL_IDLE_MS])
      */
-    fun shouldStop(framesWritten: Int, idleMs: Long, alreadyStopped: Boolean): Boolean =
-        framesWritten > 0 && !alreadyStopped && idleMs >= TAIL_IDLE_MS
+    fun shouldStop(
+        framesWritten: Int,
+        idleMs: Long,
+        alreadyStopped: Boolean,
+        textChars: Int = 0,
+    ): Boolean = framesWritten > 0 && !alreadyStopped && idleMs >= idleThresholdMs(textChars)
 }
 
 /**
@@ -899,6 +911,10 @@ class XiaozhiTtsRelay(
      * 本轮最后一段在 `tts.stop` 之后才收到文本/帧,而那时 drain 已经退出,于是没人再
      * [pumpSegments],那一段的字幕与音频**永远送不出去**(设备上就停在倒数第二句)。
      */
+    /** 正在播/正要播的那一段的字幕字数(给服务侧算"静默多久算推完";0 = 没有段)。 */
+    val currentTextChars: Int
+        get() = segments.firstOrNull { !it.finished }?.subtitle?.length ?: 0
+
     val hasPendingWork: Boolean
         get() = active != null || awaitingReport != null || segments.any { !it.finished }
 

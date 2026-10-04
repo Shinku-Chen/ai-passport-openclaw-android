@@ -1919,7 +1919,12 @@ class VoiceBridgeService : Service() {
                         }
                         // 【段尾收口】本段推空 + 静默达上限 → 叫 relay 收本段(它再 `tts_stop`)。
                         // 之后来的迟到帧会由 relay 续一段(自动再 `tts_start`),所以尾音不会被切。
-                        if (XiaozhiTailStop.shouldStop(sent, idleMs, tailStopped)) {
+                        if (XiaozhiTailStop.shouldStop(
+                                sent,
+                                idleMs,
+                                tailStopped,
+                                xiaozhiTtsRelay?.currentTextChars ?: 0,
+                            )) {
                             tailStopped = true
                             Log.i(
                                 TAG,
