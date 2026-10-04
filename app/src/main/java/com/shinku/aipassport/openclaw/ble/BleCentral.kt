@@ -424,6 +424,7 @@ class BleCentral(
         connectInFlight = false
     }
 
+    /**
      * Idle power-save flag: true = LOW_POWER connection interval requested.
      *
      * Why (power saving, 2026-10): keeping CONNECTION_PRIORITY_HIGH (~11-15ms) while idle wakes the
