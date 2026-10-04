@@ -1927,6 +1927,8 @@ class VoiceBridgeService : Service() {
                                 idleMs,
                                 tailStopped,
                                 xiaozhiTtsRelay?.currentTextChars ?: 0,
+                                // 已推音频时长:sent 帧 × 帧长(小智自报 60ms)。上限用它封顶,避免死等十几秒。
+                                sent.toLong() * 60L,
                             )) {
                             tailStopped = true
                             Log.i(

@@ -89,9 +89,21 @@ object XiaozhiTailStop {
     /** 中文语速估值:每字约多少毫秒(≈4.5 字/秒)。 */
     const val MS_PER_CHAR = 220L
 
-    /** 按本段字幕字数算出的静默阈值(与 [TAIL_IDLE_MS] 取大)。 */
-    fun idleThresholdMs(textChars: Int): Long =
-        maxOf(TAIL_IDLE_MS, textChars.coerceAtLeast(0).toLong() * MS_PER_CHAR)
+    /**
+     * 按本段字幕字数算出的静默阈值 —— **但不超过"我们已经推给设备的音频 + [TAIL_MARGIN_MS]"**。
+     *
+     * 为什么要这个上限(真机:"卡 5 秒才播下一段"):按字数估出的时长可能是十几秒(60 字),
+     * 而服务端可能只给了 2 秒音频就没了 —— 死等到十几秒纯属白等。而"剩余音频到了会重置空闲计时"
+     * (帧一到 idleMs 归零),所以用"已推音频 + 余量"封顶是安全的:真还有后续音频,它会自己把计时顶开。
+     */
+    fun idleThresholdMs(textChars: Int, pushedMs: Long = 0L): Long {
+        val byChars = textChars.coerceAtLeast(0).toLong() * MS_PER_CHAR
+        return if (pushedMs > 0L) maxOf(TAIL_IDLE_MS, minOf(byChars, pushedMs + TAIL_MARGIN_MS))
+        else maxOf(TAIL_IDLE_MS, byChars)
+    }
+
+    /** 收本段时允许比"已推音频"多等的余量(设备起播 priming + 最后一帧播放 + 一句内的合成间隙)。 */
+    const val TAIL_MARGIN_MS = 1_500L
 
     /**
      * 现在该收本段吗。
@@ -100,13 +112,15 @@ object XiaozhiTailStop {
      * @param idleMs 推空之后的静默时长
      * @param alreadyStopped 本段是否已经收过(幂等)
      * @param textChars 本段字幕字数(0 = 不知道,退回 [TAIL_IDLE_MS])
+     * @param pushedMs 本段已推音频时长(ms;0 = 不知道,退回按字数估)
      */
     fun shouldStop(
         framesWritten: Int,
         idleMs: Long,
         alreadyStopped: Boolean,
         textChars: Int = 0,
-    ): Boolean = framesWritten > 0 && !alreadyStopped && idleMs >= idleThresholdMs(textChars)
+        pushedMs: Long = 0L,
+    ): Boolean = framesWritten > 0 && !alreadyStopped && idleMs >= idleThresholdMs(textChars, pushedMs)
 }
 
 /**
