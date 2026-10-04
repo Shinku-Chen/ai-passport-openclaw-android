@@ -946,6 +946,14 @@ class XiaozhiTtsRelay(
     val currentTextChars: Int
         get() = segments.firstOrNull { !it.finished }?.subtitle?.length ?: 0
 
+    override fun onNewTurnStarted() {
+        // 新一轮的 listen.start 已经发出:闸门到此为止(再往后到的帧都属于本轮)。
+        if (awaitingNewTurnAudio) {
+            awaitingNewTurnAudio = false
+            Log.d(tag, "新一轮识别已开始:放行音频(闸门关闭)")
+        }
+    }
+
     override val hasPendingWork: Boolean
         get() = active != null || awaitingReport != null || segments.any { !it.finished }
 

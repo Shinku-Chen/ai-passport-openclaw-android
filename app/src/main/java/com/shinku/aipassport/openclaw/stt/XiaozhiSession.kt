@@ -105,6 +105,16 @@ interface XiaozhiTtsObserver {
     val hasPendingWork: Boolean get() = false
 
     /**
+     * 新一轮的识别**已经开始**(`listen.start` 已发出):直通侧可以放行音频了。
+     *
+     * 为什么需要这个信号:[onTurnStart] 会设一道"打断后直到新一轮 tts 状态到达前不收帧"的闸门,
+     * 用来挡旧流的残留 —— 但真机上服务端**先发音频、后发状态**,于是新回复的头几帧正好落在闸门里
+     * 被丢掉(用户:"第 1 句的前几个字的语音还是会丢")。以"我们自己发出的 listen.start"为界最准确:
+     * 它之后到达的帧就是本轮的。
+     */
+    fun onNewTurnStarted() {}
+
+    /**
      * 会话开始新一轮(设备 PTT 按下)**或本轮被取消(barge / 设备 `turn_cancel`)/链路断开**:
      * 把上一段的朗读记账作废,并**关闭直通侧的播放窗口**。
      *
@@ -1420,7 +1430,10 @@ class XiaozhiSession(
             addProperty("mode", "manual")
         }
         return try {
-            socket.send(start.toString())
+            val sent = socket.send(start.toString())
+            // 新一轮真正开始:通知直通侧放行音频(见 onNewTurnStarted 的注释)。
+            if (sent) ttsObserver?.onNewTurnStarted()
+            sent   // 保持 startListening() 的布尔返回语义
         } catch (e: Exception) {
             Log.e(tag, "listen.start 发送失败", e)
             false
