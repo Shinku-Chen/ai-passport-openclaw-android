@@ -939,14 +939,29 @@ class XiaozhiTtsRelay(
             val seg = segments.firstOrNull { !it.finished } ?: return
             // 【字幕随段推进】本段轮到(前面没有在播/在等的段)才把它的字幕写进 BLE 队列;
             // 上屏必须先于本段的 tts_start(同一写队列,顺序由构造保证)。
-            if (!seg.screenPassed && !writeSubtitleFor(seg)) return
+            if (!seg.screenPassed && !writeSubtitleFor(seg)) {
+                // 真机 bug(长回答的最后一段):那一段的音频服务端**根本没发**,段界到了也没人来"认领"它的
+                // 字幕(displayRequested=false),于是它既不上屏也不跳过 —— 设备上就永远缺最后一句。
+                // 本轮文本已结算(turnTextComplete)后不再等:直接把这段自己的字幕写出去。
+                if (!turnTextComplete || seg.subtitle == null) return
+                seg.displayRequested = true
+                if (!writeSubtitleFor(seg)) return
+            }
             if (seg.sealed && !seg.started && seg.pending.isEmpty()) {
                 // 整段没有音频(服务端没给/帧都被门拦下):跳过,不发空的一对 tts_start/tts_stop。
                 Log.i(tag, "第 ${seg.ordinal} 段没有音频(缺帧/无音频):跳过本段")
                 seg.finished = true
                 continue
             }
-            if (seg.pending.isEmpty()) return
+            if (seg.pending.isEmpty()) {
+                // 同上:本轮已结算、这段一直没等到音频 —— 不能再等(等下去设备就永远缺这一段)。
+                if (turnTextComplete && !seg.started) {
+                    Log.i(tag, "第 ${seg.ordinal} 段没有等到音频(本轮已结算):收本段(字幕已上屏)")
+                    seg.finished = true
+                    continue
+                }
+                return
+            }
             startSegment(seg)
             if (seg.sealed) sealAndStop(seg, "本段已收口")
             return
