@@ -33,11 +33,15 @@ enum class TtsWriteMode(val bulkWrite: Boolean) {
         val XIAOZHI_DIRECT: TtsWriteMode = WITH_RESPONSE
 
         /**
-         * **本机合成**下行(文本 → 本机合成 PCM → 编 Opus):仍是历史行为(**无响应写**)。
+         * **本机合成**下行(文本 → 本机合成 PCM → 编 Opus):**固定带响应写**。
          *
-         * **待真机复核**:同一手机/固件组合上,这条路很可能与小智直通一样被静默丢帧,
-         * 但本次不动机器合成的写模式(它有自己的合成/编码节奏与验收),先按现状保留并标记。
-         */
-        val LOCAL_SYNTHESIS: TtsWriteMode = NO_RESPONSE
+         * 2026-10-05 真机复核(小米 14 Pro + 本固件)落地了上面那条“很可能一样”的推测:
+         * 本地合成这条路用无响应写时,App 侧一直在写(日志里 writeBytes 稳定入队),
+         * 而设备侧 `帧到达: … TTS=0` 恒为 0、一点声音也没有 —— 与小智直通当初的症状一字不差。
+         * 改成带响应写后按同一套实测节奏推(≈18.5 帧/秒 ≥ 实时 16.7 帧/秒)。
+         *
+         * 不要再改回无响应写:这条路上同样会**静默丢帧**(无应答,丢了也不报错)。
+        */
+        val LOCAL_SYNTHESIS: TtsWriteMode = WITH_RESPONSE
     }
 }

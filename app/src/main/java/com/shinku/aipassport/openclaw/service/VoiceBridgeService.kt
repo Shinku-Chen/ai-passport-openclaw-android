@@ -2243,12 +2243,12 @@ class VoiceBridgeService : Service() {
             }
             // 先声明一段开始,再推音频:设备据此进入播放态(停采集、保持背光)
             if (!sendControlJson(TtsControl.START_JSON)) return
-            // 下行朗读切到批量写(WRITE_NO_RESPONSE)。
-            // 【待真机复核】旧的依据「带响应写串行执行只有 11 帧/秒,低于实时 16.7 帧/秒 → 设备会饿死」
-            // 已被 2026-10 真机 A/B 推翻(带响应写实测 ≈18.5 帧/秒,比实时快;见 [drainXiaozhiTts]
-            // 的写模式结论注释)。而同一台手机 + 同一固件上,无响应写会把**小智直通**的音频帧静默丢掉
-            // (设备 TTS 计数恒为 0)—— 本机合成这条路很可能一样。本次**不改**这条路的写模式
-            // (它有自己的合成/编码节奏与真机验收),先按现状保留,列入待真机复核项。
+            // 下行朗读**固定带响应写**(见 [TtsWriteMode.LOCAL_SYNTHESIS] 的 KDoc)。
+            //
+            // 2026-10-05 真机复核已完成:本地合成用无响应写时,App 侧一直在写、而设备侧
+            // `帧到达: … TTS=0` 恒为 0(一点声都没有)—— 与小智直通当初的静默丢帧一字不差。
+            // 带响应写实测 ≈18.5 帧/秒 ≥ 实时 16.7 帧/秒,而且只有它有 GATT 写回调,
+            // 在途流控才算得准。不要再改回无响应写。
             ble.setBulkWrite(TtsWriteMode.LOCAL_SYNTHESIS.bulkWrite)
             // 【诊断】推送节奏覆盖(一次性):>0 = 固定每帧间隔(慢于实时),0 = 生产节奏。
             val gapMs = ttsPacingOverrideMs.also { ttsPacingOverrideMs = 0 }
