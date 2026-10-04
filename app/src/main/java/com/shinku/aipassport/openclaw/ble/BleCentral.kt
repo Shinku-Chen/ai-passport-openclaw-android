@@ -440,7 +440,10 @@ class BleCentral(
         if (lowPower == idleLowPower) return false
         idleLowPower = lowPower
         val g = gatt ?: return true
-        val prio = if (lowPower) BluetoothGatt.CONNECTION_PRIORITY_LOW_POWER
+        // 空闲用 BALANCED 而不是 LOW_POWER:真机反馈「第一句语音的前半部分丢失 + 有延迟」——
+        // LOW_POWER(很宽的间隔 + 允许从机延迟)会让一段音频突发的**前几帧**既慢又容易丢;
+        // BALANCED(间隔约 30ms)依旧比 11-15ms 省得多,但突发不会丢头。
+        val prio = if (lowPower) BluetoothGatt.CONNECTION_PRIORITY_BALANCED
         else BluetoothGatt.CONNECTION_PRIORITY_HIGH
         runCatching {
             g.requestConnectionPriority(prio)

@@ -399,9 +399,17 @@ class VoiceBridgeService : Service() {
     @Volatile
     private var idleActivityAtMs = System.currentTimeMillis()
 
-    /** 记一次活动:空闲计时归零。设备的 1Hz 状态帧不算活动(否则永远降不下去)。 */
+    /**
+     * 记一次活动:空闲计时归零,**并且立刻升回高性能连接参数**(不等 5s 巡检)。
+     *
+     * 真机反馈「第一句语音的前半部分丢失 + 有延迟」:原来这里只记时间戳,升档要等空闲巡检,
+     * 最坏 5 秒后才提速 —— 而第一段音频往往在那之前就开始推了,于是开头既慢又丢。
+     */
     private fun noteUserActivity() {
         idleActivityAtMs = System.currentTimeMillis()
+        if (::ble.isInitialized && ble.setIdleLowPower(false)) {
+            Log.i(TAG, "空闲节能:有活动 → 立刻升回高性能连接参数")
+        }
     }
 
     /** 空闲节能心跳:空闲超时降为低功耗连接参数,一有活动立刻升回高性能。 */
