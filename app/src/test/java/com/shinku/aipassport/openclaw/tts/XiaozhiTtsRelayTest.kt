@@ -532,7 +532,6 @@ class XiaozhiTtsRelayTest {
         listOf(
             openGate(gatewayType = "openclaw"),
             openGate(ttsEnabled = false),
-            openGate(deviceTtsCapable = false),
         ).forEach { gate ->
             val link = FakeDownlink()
             val r = relay(link) { gate }
@@ -554,21 +553,23 @@ class XiaozhiTtsRelayTest {
 
         assertEquals("当前网关不是小智 AI(type=hermes)", openGate(gatewayType = "hermes").blockedReason)
         assertEquals("设备朗读开关(tts_enabled)关闭", openGate(ttsEnabled = false).blockedReason)
-        assertEquals("设备未在 hello 报 caps:[\"tts_opus\"]", openGate(deviceTtsCapable = false).blockedReason)
+        // 作者 2026-10-04 定:不再用"设备有没有上报 caps"否决 —— 没上报也放行(只记诊断日志)。
+        assertTrue("设备没上报 caps 也必须放行(重连后常发生)", openGate(deviceTtsCapable = false).allowed)
+        assertTrue("放行时没有拦截原因", openGate(deviceTtsCapable = false).blockedReason == null)
         assertTrue("非小智网关即使开关打开也不放行", !openGate(gatewayType = "echo").allowed)
     }
 
-    /** 门从拦截变放行(设备重连后补报 caps / 用户打开开关):下一段立刻能走(实时读设置)。 */
+    /** 门从拦截变放行(用户打开开关):下一段立刻能走(实时读设置)。 */
     @Test
     fun gate_opens_mid_flight_when_capability_arrives() {
-        var capable = false
+        var switchOn = false
         val link = FakeDownlink()
-        val r = relay(link) { openGate(deviceTtsCapable = capable) }
+        val r = relay(link) { openGate(ttsEnabled = switchOn) }
 
         r.onTtsAudio(opus(1), 24, 60)
         assertTrue("能力未到时报的帧一律不下发", link.events.isEmpty())
 
-        capable = true
+        switchOn = true
         r.deliver("正文")
         r.state("sentence_start", "正文")
         screen(link, r, "正文")

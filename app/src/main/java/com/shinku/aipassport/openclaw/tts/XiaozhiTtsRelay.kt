@@ -190,16 +190,23 @@ data class XiaozhiTtsGate(
     val deviceTtsCapable: Boolean,
 ) {
 
-    /** 放行 = 三项全真(与改动前的 `enabled` 逐项同义)。 */
+    /**
+     * 放行 = 网关是小智 AI 且开关打开。
+     *
+     * **不再用 `caps` 否决**(作者 2026-10-04 定):AI Passport 设备本来都支持下行语音,
+     * 而"有没有上报"这个信号**不可靠** —— 固件只在建立连接/订阅成功那一次报 hello,
+     * BLE 抖动重连后就不再报,于是 App 会把"还没说"当成"不支持"而静默不出声(真机就是这么哑的)。
+     * 老设备的风险由 App↔固件的**大版本配套检查**兜着(不配套会在两边提示)。
+     * [deviceTtsCapable] 保留**仅供诊断日志**,不参与放行。
+     */
     val allowed: Boolean
-        get() = XiaozhiIdentity.isXiaozhi(gatewayType) && ttsEnabled && deviceTtsCapable
+        get() = XiaozhiIdentity.isXiaozhi(gatewayType) && ttsEnabled
 
     /** 拦截原因(放行时为 null):按判定顺序给**第一个**不满足的条件,一句话说清为什么没发。 */
     val blockedReason: String?
         get() = when {
             !XiaozhiIdentity.isXiaozhi(gatewayType) -> "当前网关不是小智 AI(type=$gatewayType)"
             !ttsEnabled -> "设备朗读开关(tts_enabled)关闭"
-            !deviceTtsCapable -> "设备未在 hello 报 caps:[\"tts_opus\"]"
             else -> null
         }
 

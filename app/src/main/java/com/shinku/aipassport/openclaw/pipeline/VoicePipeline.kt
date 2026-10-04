@@ -868,12 +868,10 @@ class VoicePipeline(
         // 本地再合成一遍就是两种声音叠着播，也可能让设备收到两段无 bracket 的 TTS_OPUS。
         if (gateway.providesDeviceTtsAudio) return
         if (!ttsEnabled()) return
-        if (deviceTtsCapable) {
-            deviceTts.onReply(text)
-        } else {
-            Log.i(tag, "设备不支持下行朗读(未报 tts_opus),改用手机朗读")
-            speak(text)
-        }
+        // 作者 2026-10-04 定:不再用"设备有没有上报"来决定发不发 —— 设备本来都支持,
+        // 而 hello 只在连接那一刻来一次(重连后可能没有)。没上报只记一行日志,照发。
+        if (!deviceTtsCapable) Log.i(tag, "设备这条连接未报 tts_opus(可能刚重连),仍按设备朗读下发")
+        deviceTts.onReply(text)
     }
 
     private fun speak(reply: String) {

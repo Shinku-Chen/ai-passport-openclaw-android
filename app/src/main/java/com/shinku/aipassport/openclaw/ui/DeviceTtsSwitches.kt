@@ -87,17 +87,14 @@ object DeviceTtsSwitches {
     @Suppress("UNUSED_PARAMETER")
     fun switchEnabled(gatewayType: String?, ttsSupported: Boolean): Boolean = true
 
-    /** 设备迟迟没上报语音能力时的提示(放在「对话设置 → 设备朗读」下方,与小智直通门同一件事)。 */
-    fun deviceCapHint(): String =
-        "⚠️ 当前设备未上报语音播放能力，设备朗读暂不生效：" +
-            "请在设备上长按 UP，选重新配对，或重启设备后再试"
 
     /** 按运行时的两种限制拼出开关下方的提示(两者都成立就都写出来)。 */
     fun hint(gatewayType: String?, ttsSupported: Boolean, deviceCapable: Boolean, unsupportedReason: String?): String {
-        val lines = ArrayList<String>(2)
-        if (!deviceCapable) lines.add(deviceCapHint())
-        if (!ttsSupported && unsupportedReason != null) lines.add(localUnsupportedHint(unsupportedReason))
-        return lines.joinToString("\n")
+        // 只按「本机合成能不能用」给提示:设备能力不再参与判断(作者 2026-10-04 定 ——
+        // AI Passport 设备本来都支持下行语音,而"有没有上报"这个信号在重连后不可靠)。
+        @Suppress("UNUSED_PARAMETER") val unusedGateway = gatewayType
+        @Suppress("UNUSED_PARAMETER") val unusedDeviceCap = deviceCapable
+        return if (!ttsSupported && unsupportedReason != null) localUnsupportedHint(unsupportedReason) else ""
     }
 
     /** 本机合成不可用时的提示:说清「开关无需置灰、小智 AI 下照样能用」。 */
