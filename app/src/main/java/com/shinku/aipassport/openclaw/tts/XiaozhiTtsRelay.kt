@@ -1080,13 +1080,17 @@ class XiaozhiTtsRelay(
         if (segments.lastOrNull()?.let { !it.stopped } == true) return
         val owner = segments.lastOrNull { it.screenPassed && it.subtitle != null }
         if (owner == null) {
-            Log.w(
+            // 还没有任何正文上屏(典型场景:用户突然打断,新一轮的**音频先到**、正文晚到几百毫秒)。
+            // 这里**不能丢**:以前直接清空池子,于是新一轮第一段的头几帧全没了 —— 用户听到的就是
+            // "打断之后第一句没有声音"(真机日志:`第 1 段已声明(字幕 30 字,当前 0 帧)`)。
+            // 池里的帧不会抢在文字前出声:`advance()` 的段门要求"本段字幕已上屏"才可能开播。
+            // 内存有界由 trimBuffer 的帧数上限保证(超限仍然丢最旧)。
+            Log.d(
                 tag,
-                "收尾后有 ${pool.size} 帧迟到音频,但本轮没有任何正文上过屏:按「没有可上屏正文」丢弃" +
-                    "(声音不抢在文字前)",
+                "收尾后有 ${pool.size} 帧迟到音频、本轮还没有正文上屏:留在池里等第一段声明吸收" +
+                    "(不丢;段门保证不会先出声)",
             )
-            droppedFrames += pool.size
-            pool.clear()
+            trimBuffer(pool, "池")
             return
         }
         // 字幕沿用上一段(它已经在屏上):尾帧本来就是上一段的尾巴。
