@@ -1017,14 +1017,6 @@ class XiaozhiTtsRelay(
                 }
                 return
             }
-            // 攒够前导帧再开播:真机上第 1 段只攒到 11 帧(≈660ms)就 tts_start,而设备起播
-            // priming ≈450ms(≈7-8 帧)会把开头几个字吃掉 —— 用户听到的就是"前几个字丢失"。
-            // 最多等 MIN_START_WAIT_MS,到点按手上的帧开播(不能把开播拖死)。
-            if (!seg.sealed && seg.pending.size < MIN_START_FRAMES &&
-                nowMs() - seg.declaredAtMs < MIN_START_WAIT_MS
-            ) {
-                return
-            }
             startSegment(seg)
             if (seg.sealed) sealAndStop(seg, "本段已收口")
             return
