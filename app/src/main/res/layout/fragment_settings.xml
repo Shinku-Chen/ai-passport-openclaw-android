@@ -340,20 +340,12 @@
                 android:textStyle="bold"
                 android:textColor="#4FC3F7" />
 
-            <com.google.android.material.materialswitch.MaterialSwitch
-                android:id="@+id/checkXiaozhiTts"
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:layout_marginTop="6dp"
-                android:text="播放小智语音"
-                android:textColor="#DDDDDD" />
-
             <TextView
                 android:id="@+id/xzTtsHint"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
                 android:layout_marginTop="4dp"
-                android:text="用小智的声音在设备上朗读；与「对话设置 → 设备朗读」是同一个开关；音频由小智下发，不需要本机合成"
+                android:text="朗读开关在「对话设置 → 设备朗读」；小智模式下播放的是小智自己的声音，不需要本机合成。"
                 android:textColor="#9E9E9E"
                 android:textSize="12sp" />
         </LinearLayout>

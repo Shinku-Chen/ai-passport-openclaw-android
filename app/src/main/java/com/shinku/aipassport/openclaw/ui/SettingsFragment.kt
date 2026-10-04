@@ -596,28 +596,31 @@ class SettingsFragment : Fragment() {
      */
     private fun applyTtsAvailability() {
         val appContext = context?.applicationContext ?: return
-        val normalHint = binding.ttsHint.text
-        // 探测期间两处开关都置灰(同一个设置,不能一处可点一处不可点);值不动
+        // 探测本机合成能力:只用来决定**提示文案**(开关永远可点,见 bindTtsSwitches 的注释)。
         ttsAvailable = false
         renderTtsSwitches()
         scope.launch {
             val reason = TtsSupport.unsupportedReason(appContext)
             val b = _binding ?: return@launch
-            if (reason == null) {
-                ttsAvailable = true
-                b.ttsHint.text = normalHint
-                b.xzTtsHint.text = DeviceTtsSwitches.xiaozhiHint(null)
-                renderTtsSwitches()
-                return@launch
-            }
-            ttsAvailable = false
-            // 只置灰、**不写** tts_enabled:本机合不成语音不等于用户关掉了朗读
-            // (小智 AI 的音源来自云端,压根不走本机合成)。
-            b.ttsHint.text = DeviceTtsSwitches.unsupportedHint(reason)
-            b.xzTtsHint.text = DeviceTtsSwitches.xiaozhiHint(reason)
+            ttsAvailable = reason == null
+            b.ttsHint.text = DeviceTtsSwitches.hint(
+                gatewayType = selectedType(),
+                ttsSupported = ttsAvailable,
+                deviceCapable = deviceTtsCapableSnapshot(),
+                unsupportedReason = reason,
+            )
             renderTtsSwitches()
-            log("本机不支持合成语音：$reason（仅置灰本机朗读；小智 AI 下仍可开启）")
+            if (reason != null) log("本机不支持合成语音：$reason（开关不置灰；小智 AI 下由小智的声音朗读）")
         }
+    }
+
+    /** 服务侧落盘的"设备这一条连接上报过什么能力"(见 DeviceTtsSwitches.PREFS_DEVICE_CAPS)。 */
+    private fun deviceTtsCapableSnapshot(): Boolean {
+        val ctx = context?.applicationContext ?: return true
+        val p = ctx.getSharedPreferences(DeviceTtsSwitches.PREFS_DEVICE_CAPS, android.content.Context.MODE_PRIVATE)
+        // 从没上报过 → 视为"未知",给提示(与服务侧直通门的拦截理由同一件事)
+        return if (!p.getBoolean(DeviceTtsSwitches.KEY_CAPS_SEEN, false)) false
+        else p.getBoolean(DeviceTtsSwitches.KEY_TTS_CAPABLE, false)
     }
 
     // ---- 两处「朗读」开关(设备朗读 ⇄ 播放小智语音,同一个设置)----
@@ -630,14 +633,10 @@ class SettingsFragment : Fragment() {
      * 这里只回填一次,用户手动关掉后 prefs 里就是 false,不会再被改写回 true。
      */
     private fun bindTtsSwitches() {
-        // 标题/说明来自纯逻辑常量(单测钉住「写明与设备朗读是同一个开关」),不在布局里再写一份
-        binding.checkXiaozhiTts.text = DeviceTtsSwitches.XIAOZHI_TITLE
-        binding.xzTtsHint.text = DeviceTtsSwitches.xiaozhiHint(null)
+        // 小智分组里的开关已按作者要求移除,那里只留一行说明指向本开关。
+        binding.xzTtsHint.text = DeviceTtsSwitches.XIAOZHI_CARD_LINE
         binding.checkTtsEnabled.setOnCheckedChangeListener { _, checked ->
             onTtsSwitchToggled(checked, DeviceTtsSwitches.ENTRY_CHAT)
-        }
-        binding.checkXiaozhiTts.setOnCheckedChangeListener { _, checked ->
-            onTtsSwitchToggled(checked, DeviceTtsSwitches.ENTRY_XIAOZHI)
         }
         renderTtsSwitches()
     }
@@ -687,9 +686,8 @@ class SettingsFragment : Fragment() {
             // 在这里拨会把它漏到别的 section 上(比如在「对话设置」里拨一下设备朗读)。
             // 只在真的不一致时才写:既少一次回调,也不把正在拖动的开关打断
             if (b.checkTtsEnabled.isChecked != view.checked) b.checkTtsEnabled.isChecked = view.checked
-            if (b.checkXiaozhiTts.isChecked != view.checked) b.checkXiaozhiTts.isChecked = view.checked
-            b.checkTtsEnabled.isEnabled = view.enabled
-            b.checkXiaozhiTts.isEnabled = view.enabled
+            // 作者 2026-10-04 定:这个开关**永不置灰** —— 能不能出声由运行时决定,用户随时能开关。
+            b.checkTtsEnabled.isEnabled = true
         } finally {
             applyingTtsSwitches = false
         }

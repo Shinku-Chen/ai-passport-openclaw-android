@@ -33,6 +33,11 @@ object DeviceTtsSwitches {
         "用小智的声音在设备上朗读；与「对话设置 → 设备朗读」是同一个开关；" +
             "音频由小智下发，不需要本机合成"
 
+    /** 服务侧把"设备这一条连接上报过什么能力"落盘,设置页只读:这两个键是服务与 UI 之间的契约。 */
+    const val PREFS_DEVICE_CAPS = "device_caps"
+    const val KEY_CAPS_SEEN = "caps_seen"
+    const val KEY_TTS_CAPABLE = "tts_capable"
+
     /** 入口名(只进日志):用户拨的是哪一处,日志里要能对照「两处是同一个设置」。 */
     const val ENTRY_CHAT = "设备朗读"
     const val ENTRY_XIAOZHI = "播放小智语音"
@@ -43,12 +48,7 @@ object DeviceTtsSwitches {
         val checked: Boolean,
         /** 「网关设置 → 小智 AI」那一行是否出现。 */
         val xiaozhiRowVisible: Boolean,
-        /**
-         * 两处开关是否可点(两处同值)。**只由「本机合成能不能用」与「是否小智 AI」决定**,
-         * 与勾选状态完全解耦:本机合成不可用 → 置灰;当前网关是小智 AI → 一定可点
-         * (小智的音频由云端下发,不需要本机合成)。
-         */
-        val enabled: Boolean,
+
     )
 
     /**
@@ -75,16 +75,39 @@ object DeviceTtsSwitches {
     ): View = View(
         checked = ttsEnabled,
         xiaozhiRowVisible = xiaozhiRowVisible(gatewayType),
-        enabled = switchEnabled(gatewayType, ttsSupported),
     )
 
     /**
-     * 开关能不能点:本机合成可用 → 可点;否则**只有小智 AI 可点**(它的音频来自小智,不经本机合成)。
+     * 开关能不能点 —— **永远能点**。
      *
-     * 与 [View.checked] 完全解耦:置灰只是「这里点了也白点」的信息性提示,不改用户/默认的设置值。
+     * 作者 2026-10-04 定的规则:这个开关不再因为「本机合成不可用」而置灰 ——
+     * 能不能出声由**运行时的实际情况**决定(设备是否上报能力、本机有没有引擎),
+     * 用户永远可以按自己的意愿开关它,提示文案负责解释现状。保留形参只为兼容调用点与单测。
      */
-    fun switchEnabled(gatewayType: String?, ttsSupported: Boolean): Boolean =
-        ttsSupported || xiaozhiRowVisible(gatewayType)
+    @Suppress("UNUSED_PARAMETER")
+    fun switchEnabled(gatewayType: String?, ttsSupported: Boolean): Boolean = true
+
+    /** 设备迟迟没上报语音能力时的提示(放在「对话设置 → 设备朗读」下方,与小智直通门同一件事)。 */
+    fun deviceCapHint(): String =
+        "⚠️ 当前设备未上报语音播放能力，设备朗读暂不生效：" +
+            "请在设备上长按 UP，选重新配对，或重启设备后再试"
+
+    /** 按运行时的两种限制拼出开关下方的提示(两者都成立就都写出来)。 */
+    fun hint(gatewayType: String?, ttsSupported: Boolean, deviceCapable: Boolean, unsupportedReason: String?): String {
+        val lines = ArrayList<String>(2)
+        if (!deviceCapable) lines.add(deviceCapHint())
+        if (!ttsSupported && unsupportedReason != null) lines.add(localUnsupportedHint(unsupportedReason))
+        return lines.joinToString("\n")
+    }
+
+    /** 本机合成不可用时的提示:说清「开关无需置灰、小智 AI 下照样能用」。 */
+    fun localUnsupportedHint(reason: String): String =
+        "⚠️ 本机不支持合成语音：$reason。这个开关不会被禁用，你可以随时开关它；" +
+            "用「小智 AI」时由小智的声音朗读，不需要本机合成。"
+
+    /** 「网关设置 → 小智 AI」卡片里的说明(那里的开关已移除,只留这行指向「设备朗读」)。 */
+    const val XIAOZHI_CARD_LINE =
+        "朗读开关在「对话设置 → 设备朗读」；小智模式下播放的是小智自己的声音，不需要本机合成。" 
 
     /**
      * 本机合成不可用时开关下方的提示文案(放在「对话设置 → 设备朗读」那一行下)。

@@ -62,14 +62,17 @@ class DeviceTtsSwitchesTest {
             ttsEnabled = true,
             ttsSupported = false,
         )
-        assertTrue("小智 AI 下即使本机合不成语音也必须可点", xiaozhi.enabled)
         assertTrue("开关的值只由 tts_enabled 决定:默认开就是开", xiaozhi.checked)
         assertTrue(DeviceTtsSwitches.switchEnabled(GatewaySettings.TYPE_XIAOZHI, ttsSupported = false))
+        // 作者 2026-10-04 定:这个开关**永不置灰** —— 原因在提示里说,禁用与否不再参与。
+        assertTrue("非小智 + 本机合不成语音也必须可点", DeviceTtsSwitches.switchEnabled(null, ttsSupported = false))
+        assertTrue("未知类型同样可点", DeviceTtsSwitches.switchEnabled("", ttsSupported = false))
+        assertTrue("设备未上报能力时也不置灰(提示改为按运行时情况给)",
+            DeviceTtsSwitches.hint(null, ttsSupported = false, deviceCapable = false, unsupportedReason = "无").isNotBlank())
 
         // ② 本机合成不可用 + 非小智:置灰,但**仍然是开**(灰 ≠ 关,不再把用户的值写成 false)
         listOf(GatewaySettings.TYPE_OPENCLAW, GatewaySettings.TYPE_HERMES, null).forEach { type ->
             val grey = DeviceTtsSwitches.view(type, ttsEnabled = true, ttsSupported = false)
-            assertFalse("非小智 + 本机合不成语音 → 置灰", grey.enabled)
             assertTrue("置灰不改值:checked 仍取自 tts_enabled", grey.checked)
         }
 
@@ -79,7 +82,6 @@ class DeviceTtsSwitchesTest {
             ttsEnabled = false,
             ttsSupported = false,
         )
-        assertFalse(closed.enabled)
         assertFalse(closed.checked)
     }
 
@@ -89,7 +91,6 @@ class DeviceTtsSwitchesTest {
         listOf(GatewaySettings.TYPE_XIAOZHI, GatewaySettings.TYPE_OPENCLAW, null).forEach { type ->
             listOf(true, false).forEach { on ->
                 val v = DeviceTtsSwitches.view(type, ttsEnabled = on, ttsSupported = true)
-                assertTrue("本机合成可用时处处可点", v.enabled)
                 assertEquals("可点与否不影响值", on, v.checked)
             }
         }

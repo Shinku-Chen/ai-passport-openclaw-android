@@ -54,6 +54,7 @@ import com.shinku.aipassport.openclaw.tts.TtsFraming
 import com.shinku.aipassport.openclaw.tts.TtsPlaybackReport
 import com.shinku.aipassport.openclaw.tts.TtsPushPlan
 import com.shinku.aipassport.openclaw.tts.TtsWriteMode
+import com.shinku.aipassport.openclaw.ui.DeviceTtsSwitches
 import com.shinku.aipassport.openclaw.tts.XiaozhiAudioPacing
 import com.shinku.aipassport.openclaw.tts.XiaozhiCorrectionPacer
 import com.shinku.aipassport.openclaw.tts.XiaozhiFrameLog
@@ -382,6 +383,9 @@ class VoiceBridgeService : Service() {
     /** 「设备未上报语音能力」这条可读提示是否已经提示过(能力恢复后复位)。 */
     private var xzCapsHintShown = false
 
+    /** 设备能力快照(0=未上报,1=已上报;+2=支持 tts_opus):变化才落盘给设置页读。 */
+    private var xzCapsSnapshot = -1
+
     /**
      * **正文上屏让路**的纯逻辑(见 [XiaozhiCorrectionPacer]):只拦小智直通里「下一段的字幕」。
      *
@@ -576,6 +580,18 @@ class VoiceBridgeService : Service() {
         XiaozhiTtsRelay(
             gate = {
                 val capable = !::pipeline.isInitialized || pipeline.deviceTtsSupported
+                // 把「这条连接里设备说过什么能力」落盘:设置页据此给提示(与小智直通门同一件事)
+                runCatching {
+                    val seen = ::pipeline.isInitialized && pipeline.deviceCapsSeen
+                    val snap = (if (seen) 1 else 0) + (if (capable) 2 else 0)
+                    if (snap != xzCapsSnapshot) {
+                        xzCapsSnapshot = snap
+                        getSharedPreferences(DeviceTtsSwitches.PREFS_DEVICE_CAPS, MODE_PRIVATE).edit()
+                            .putBoolean(DeviceTtsSwitches.KEY_CAPS_SEEN, seen)
+                            .putBoolean(DeviceTtsSwitches.KEY_TTS_CAPABLE, capable)
+                            .apply()
+                    }
+                }
                 // 【可见性】设备没上报语音能力时**不能静默**:真机排查过一次
                 // "从开机到现在一句声音都没有" —— 根因是 BLE 抖动重连后设备没重发 hello,
                 // 而 App 一句提示都没有。这里只提示一次,能力恢复后允许再次提示。
