@@ -159,6 +159,8 @@ class VoicePipeline(
      */
     @Volatile
     private var deviceTtsCapable = false
+    var deviceCapsSeen: Boolean = false
+        private set
 
     /**
      * 设备上报的固件版本（`hello.fw`）；未上报为 null。
@@ -176,6 +178,15 @@ class VoicePipeline(
      */
     val deviceTtsSupported: Boolean get() = deviceTtsCapable
 
+    /**
+     * 设备**这一条连接里**有没有上报过 hello 的 caps。
+     *
+     * 为什么要单独记:设备只在「订阅成功」那一次事件里发 hello(协议:once per subscription)。
+     * BLE 抖动重连后它可能不再发,于是 [deviceTtsCapable] 会一直停在 false —— 这时
+     * 「不支持」和「还没说」是两件事,前者设备确实放不了,后者只要让它重发一次就行。
+     * 断开时两个一起清零,由上层据此给出可读提示(别静默)。
+
+     */
     /**
      * 处理设备的 hello:核对固件/App 版本是否配套。
      *
@@ -196,6 +207,7 @@ class VoicePipeline(
         // 设备能力:hello 的 caps 里有没有 tts_opus(固件只在解码器就绪时报,见协议文档)
         val caps = obj?.get("caps")?.takeIf { it.isJsonArray }?.asJsonArray
         deviceTtsCapable = caps?.any { it.isJsonPrimitive && it.asString == CAP_TTS_OPUS } == true
+        deviceCapsSeen = true
         Log.i(
             tag,
             "设备能力: 下行朗读=${if (deviceTtsCapable) "支持(tts_opus)" else "不支持"}" +
@@ -299,6 +311,10 @@ class VoicePipeline(
 
     /** BLE 断开:终止一切在途状态,并让识别引擎立刻关闭常驻热连接(设备没了,留着 socket 无用)。 */
     fun onDisconnected() {
+        // 断开即视为「能力未知」:设备重连后不一定重发 hello(实测抖动重连后就没发),
+        // 留着旧值会让上层把「还没说」当成「不支持」而静默不出声。
+        deviceTtsCapable = false
+        deviceCapsSeen = false
         turnId++
         turnActive = false
         tts.stop()

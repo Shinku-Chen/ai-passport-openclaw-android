@@ -379,6 +379,9 @@ class VoiceBridgeService : Service() {
     @Volatile
     private var xiaozhiTtsRelay: XiaozhiTtsRelay? = null
 
+    /** 「设备未上报语音能力」这条可读提示是否已经提示过(能力恢复后复位)。 */
+    private var xzCapsHintShown = false
+
     /**
      * **正文上屏让路**的纯逻辑(见 [XiaozhiCorrectionPacer]):只拦小智直通里「下一段的字幕」。
      *
@@ -572,10 +575,23 @@ class VoiceBridgeService : Service() {
         //     连带丢掉后面一帧),与本地合成那条路的设备能力门控同一语义。
         XiaozhiTtsRelay(
             gate = {
+                val capable = !::pipeline.isInitialized || pipeline.deviceTtsSupported
+                // 【可见性】设备没上报语音能力时**不能静默**:真机排查过一次
+                // "从开机到现在一句声音都没有" —— 根因是 BLE 抖动重连后设备没重发 hello,
+                // 而 App 一句提示都没有。这里只提示一次,能力恢复后允许再次提示。
+                if (capable) {
+                    xzCapsHintShown = false
+                } else if (!xzCapsHintShown) {
+                    xzCapsHintShown = true
+                    val seen = ::pipeline.isInitialized && pipeline.deviceCapsSeen
+                    val why = if (seen) "设备未声明支持语音播放" else "设备还没有上报语音能力（可能刚重连）"
+                    Log.w(TAG, "小智语音暂不播放:$why → 已提示用户")
+                    publishStatus("$why，小智语音暂不播放。请在设备上长按 UP，选重新配对，或重启设备后再试")
+                }
                 XiaozhiTtsGate(
                     gatewayType = this.settings.type,
                     ttsEnabled = this.settings.ttsEnabled,
-                    deviceTtsCapable = !::pipeline.isInitialized || pipeline.deviceTtsSupported,
+                    deviceTtsCapable = capable,
                 )
             },
             downlink = deviceTtsPush,
